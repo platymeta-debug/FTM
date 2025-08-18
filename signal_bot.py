@@ -5255,7 +5255,6 @@ async def send_timed_reports():
                         continue
 
                     symbol_eth = 'ETH/USDT'
-                    current_price_eth = fetch_live_price(symbol_eth)
 
                     # === Closed-candle snapshot (ETH) ===
                     # (use closed candle to avoid intra-candle spikes)
@@ -5292,9 +5291,7 @@ async def send_timed_reports():
 
                     snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
                     live_price = snap.get("mid") or snap.get("last")
-                    display_price = live_price if isinstance(live_price, (int, float)) else (
-                        current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
-                    )
+                    display_price = live_price if isinstance(live_price, (int, float)) else closed_price
                     # [ANCHOR: daily_change_unify_eth_alt]
                     daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
 
@@ -5321,7 +5318,9 @@ async def send_timed_reports():
                         daily_change_pct=daily_change_pct,
                         score_history=score_history.get(tf),
                         recent_scores=score_history.get(tf),
-                        live_price=live_price,
+
+                        live_price=display_price,
+
                         show_risk=False
                     )
 
@@ -5344,9 +5343,7 @@ async def send_timed_reports():
 
 
                     snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
-                    display_price = snap.get("mid") or snap.get("last") or (
-                        current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
-                    )
+                    display_price = snap.get("mid") or snap.get("last") or closed_price
 
 
                     pdf_path = generate_pdf_report(
@@ -5415,7 +5412,6 @@ async def send_timed_reports():
                     symbol_btc = 'BTC/USDT'
 
                     # 1) 데이터/지표
-                    current_price_btc = fetch_live_price(symbol_btc)
                     df = await safe_get_ohlcv(symbol_btc, tf, limit=300)
                     df = await safe_add_indicators(df)
 
@@ -5436,9 +5432,7 @@ async def send_timed_reports():
 
                     snap = await get_price_snapshot(symbol_btc)  # BTC/USDT
                     live_price = snap.get("mid") or snap.get("last")
-                    display_price = live_price if isinstance(live_price, (int, float)) else (
-                        current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
-                    )
+                    display_price = live_price if isinstance(live_price, (int, float)) else c_c
                     # [ANCHOR: daily_change_unify_btc]
                     daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
 
@@ -5465,7 +5459,9 @@ async def send_timed_reports():
                         recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
                         daily_change_pct=daily_change_pct,
                         symbol=symbol_btc,
-                        live_price=live_price,
+
+                        live_price=display_price,
+
                         show_risk=False
                     )
 
@@ -5978,7 +5974,8 @@ async def on_ready():
                     ),
 
 
-                    live_price=live_price,  # reuse ticker for consistent short/long pricing
+                    live_price=display_price,  # reuse ticker for consistent short/long pricing
+
                     show_risk=False
                 )
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
@@ -6370,9 +6367,7 @@ async def on_ready():
                     entry_time=_entry_time,
                     entry_price=_entry_price,
                     recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-
-                    live_price=live_price,  # reuse ticker for consistent short/long pricing
-
+                    live_price=display_price,  # reuse ticker for consistent short/long pricing
                     show_risk=False
                 )
 
@@ -6534,6 +6529,30 @@ async def on_message(message):
             await message.channel.send("❌ PDF 모듈 임포트에 실패했습니다. (generate_pdf_report=None)")
             return
 
+        # [ANCHOR: REPORT_PRICE_SNAPSHOT_BEGIN]
+        # 리포트에서도 전 TF와 동일한 '현재가 스냅샷'을 사용
+        try:
+            snap = await get_price_snapshot(symbol)
+            report_price = snap.get("mid") or snap.get("last")
+        except Exception:
+            report_price = None
+        # 마지막 보루: 스냅샷 실패 시 실시간/종가로 대체
+        if not isinstance(report_price, (int, float)):
+            try:
+                report_price = fetch_live_price(symbol)
+            except Exception:
+                report_price = None
+        if not isinstance(report_price, (int, float)):
+            # df가 있으면 마지막 종가로
+            try:
+                _df_tmp = get_ohlcv(symbol, tf, limit=2)
+                if _df_tmp is not None and len(_df_tmp) > 0:
+                    report_price = float(_df_tmp['close'].iloc[-1])
+            except Exception:
+                pass
+        # [ANCHOR: REPORT_PRICE_SNAPSHOT_END]
+        log(f"[REPORT] {symbol} tf={tf} report_price={report_price}")
+
         df = get_ohlcv(symbol, tf, limit=300)
         df = add_indicators(df)
 
@@ -6541,17 +6560,12 @@ async def on_message(message):
         chart_files   = save_chart_groups(df, symbol, tf)
         ichimoku_file = save_ichimoku_chart(df, symbol, tf)
 
-
         df_1d = get_ohlcv(symbol, '1d', limit=300)
         signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol)
 
         # 일봉 변동률 계산
-        price_now = fetch_live_price(symbol)
 
-        snap = await get_price_snapshot(symbol)
-        display_price = snap.get("mid") or snap.get("last") or (
-            price_now if isinstance(price_now, (int, float)) else price
-        )
+        display_price = report_price
         # [ANCHOR: daily_change_unify_eth_alt]
         daily_change_pct = calc_daily_change_pct(symbol, display_price)
 
@@ -6573,7 +6587,7 @@ async def on_message(message):
             agree_long=agree_long,
             agree_short=agree_short,
             daily_change_pct=daily_change_pct,
-            live_price=display_price,
+            live_price=report_price,
             show_risk=False
         )
         msg_for_pdf = f"{main_msg_pdf}\n\n{summary_msg_pdf}"
@@ -6591,7 +6605,7 @@ async def on_message(message):
             tf=tf,
             symbol=symbol,
             signal=signal,
-            price=display_price,
+            price=report_price,
             score=score,
             reasons=reasons,
             weights=weights,
@@ -6606,7 +6620,8 @@ async def on_message(message):
 
 
         # 심볼별 로그 저장
-        log_to_csv(symbol, tf, signal, display_price, rsi, macd, None, None, None, score, reasons, weights)
+
+        log_to_csv(symbol, tf, signal, report_price, rsi, macd, None, None, None, score, reasons, weights)
 
         # 빈 메시지 가드 적용
         # 보고서 안내 문구
