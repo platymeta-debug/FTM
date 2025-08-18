@@ -171,7 +171,8 @@ def generate_pdf_report(
     agree_long, agree_short, now=None,
     output_path=None, chart_imgs=None, chart_img=None, ichimoku_img=None,
     daily_change_pct=None, discord_message=None,
-    symbol=None
+    symbol=None,
+    entry_price=None, entry_time=None
 ):
 
     logs_df = _load_logs(tf, symbol=symbol)
@@ -203,6 +204,8 @@ def generate_pdf_report(
     tf_kor = {"15m":"15분봉","1h":"1시간봉","4h":"4시간봉","1d":"일봉"}.get(tf, tf)
     title = f"■ {symbol or 'ETH/USDT'} {tf_kor} 리포트 - {ts.replace('_',' ')}"
     elements.append(_para(title, size=16, bold=True, space_after=10))
+    if entry_price is not None and entry_time:
+        elements.append(_para(f"진입 시점: {entry_time} ({_safe_num(entry_price)})"))
 
     # ✅ 디스코드 메세지 형태 추가
     if discord_message:
