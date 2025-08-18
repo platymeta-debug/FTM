@@ -1027,6 +1027,23 @@ def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
     return df
 
 
+# === [UTIL] calc_daily_change_pct — 퍼포먼스 스냅샷과 동일식 ===
+def calc_daily_change_pct(symbol: str, current_price: float | None) -> float | None:
+    """
+    퍼포먼스 스냅샷과 동일한 방식으로 1일 변동률을 계산한다.
+    식: (현재가 - 전일 종가) / 전일 종가 * 100
+    """
+    try:
+        d1 = get_ohlcv(symbol, '1d', limit=3)
+        if d1 is None or len(d1) < 2:
+            return None
+        prev_close = float(d1['close'].iloc[-2])   # 전일 종가
+        curr = float(current_price) if isinstance(current_price, (int, float)) else float(d1['close'].iloc[-1])
+        return ((curr - prev_close) / prev_close) * 100.0 if prev_close else None
+    except Exception:
+        return None
+
+
 def add_indicators(df):
 
     # ✅ 이동평균선 (SMA)
@@ -2694,6 +2711,10 @@ def log_to_csv(symbol, tf, signal, price, rsi, macd,
             if tf in PAPER_POS_TF:
                 PAPER_POS_TF.pop(tf, None)
                 _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+            k = f"{symbol}|{tf}"
+            if k in PAPER_POS:
+                PAPER_POS.pop(k, None)
+                _save_json(PAPER_POS_FILE, PAPER_POS)
     except Exception:
         pass
     price = sanitize_price_for_tf(symbol, tf, price)
@@ -2924,6 +2945,26 @@ def _min_notional_ok(ex, symbol, price, amount):
         # 정보가 없으면 보수적으로 MIN_NOTIONAL 사용
         return (price * amount) >= MIN_NOTIONAL
 
+
+
+def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
+    tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
+    sl_pct = float((HARD_STOP_PCT or {}).get(tf, 0.0))
+    if not entry or not price:
+        return False, ""
+    if side == "LONG":
+        if tp_pct and price >= entry * (1 + tp_pct/100):
+            return True, "TP"
+        if sl_pct and price <= entry * (1 - sl_pct/100):
+            return True, "SL"
+    else:
+        if tp_pct and price <= entry * (1 - tp_pct/100):
+            return True, "TP"
+        if sl_pct and price >= entry * (1 + sl_pct/100):
+            return True, "SL"
+    return False, ""
+
+
 async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, entry_map):
     key = (symbol, tf)
     state = TRIGGER_STATE.get(key, 'FLAT')
@@ -3067,6 +3108,16 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts= None):
         # ④ 페이퍼 점유 상태 기록(동시 진입 방지)
         PAPER_POS_TF[tf] = symbol
         _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+
+        key = f"{symbol}|{tf}"
+        PAPER_POS[key] = {
+            "side": ("LONG" if signal == "BUY" else "SHORT"),
+            "entry": float(last_price),
+            "opened_ts": int((candle_ts or 0) * 1000) or int(time.time()*1000),
+            "high": float(last_price),
+            "low":  float(last_price)
+        }
+        _save_json(PAPER_POS_FILE, PAPER_POS)
 
         # ⑤ 로깅
         os.makedirs("logs", exist_ok=True)
@@ -3564,6 +3615,9 @@ def _idem_prune(max_keep: int = 5000):
 
 PAPER_POS_TF_FILE = "logs/paper_positions_tf.json"
 PAPER_POS_TF = _load_json(PAPER_POS_TF_FILE, {})   # key: tf -> symbol (paper 전용)
+
+PAPER_POS_FILE = "logs/paper_positions.json"
+PAPER_POS = _load_json(PAPER_POS_FILE, {})   # key: f"{symbol}|{tf}" -> {side, entry, opened_ts, high, low}
 
 IDEMP_KEYS = _load_json(IDEMP_FILE, {"keys": []})
 FUT_POS    = _load_json(OPEN_POS_FILE, {})         # symbol -> {'side','qty','entry'}
@@ -4619,6 +4673,23 @@ except Exception as e:
     log(f"[FUT] exchange init fail: {e}")
     FUT_EXCHANGE = None
 
+
+async def _sync_open_state_on_ready():
+    # 페이퍼: 파일 로드로 충분 (이미 상단에서 로드됨)
+    # 선물: 거래소 포지션 동기화
+    try:
+        ex = FUT_EXCHANGE
+        if ex:
+            for sym in ("BTC/USDT","ETH/USDT"):
+                qty, side, entry = await _fetch_pos_qty(ex, sym)
+                if side and abs(qty) > 0:
+                    FUT_POS[sym] = {"side": side, "qty": float(qty), "entry": float(entry), "opened_ts": int(time.time()*1000)}
+                    FUT_POS_TF.setdefault("15m", None)
+            _save_json(OPEN_POS_FILE, FUT_POS)
+            _save_json(OPEN_TF_FILE, FUT_POS_TF)
+    except Exception as e:
+        log(f"[SYNC] warn: {e}")
+
 # === Hedge mode & TF-level overrides ===
 HEDGE_MODE   = os.getenv("HEDGE_MODE", "1") == "1"
 
@@ -5179,9 +5250,13 @@ async def send_timed_reports():
                     if _len(df) == 0:
                         log(f"⏭️ {symbol_eth} {tf} 보고서 생략: 데이터 없음")
                         continue
-                    price_now = closed_price  # 📌 라이브틱 대신 닫힌 15m 종가 사용
+
+                    display_price = sanitize_price_for_tf(symbol_eth, tf,
+                        (current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price)
+                    )
                     # [ANCHOR: daily_change_unify_eth_alt]
-                    daily_change_pct = await compute_daily_change_pct(symbol_eth, price_now)
+                    daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
+
 
                     
                     # 📍 ETH 진입 정보 주입
@@ -5317,10 +5392,9 @@ async def send_timed_reports():
                     display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
                     display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
                     # [ANCHOR: daily_change_unify_btc]
-                    daily_change_pct = await compute_daily_change_pct(
-                        symbol_btc,
-                        display_price
-                    )
+
+                    daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
+
 
                     # 4) 진입 정보 (없으면 None)
                     _epb = entry_data_btc.get(tf)  # (entry_price, entry_time)
@@ -5465,6 +5539,7 @@ async def on_ready():
         return
     client.startup_done = True
 
+    await _sync_open_state_on_ready()
     asyncio.create_task(init_analysis_tasks())
     
    # ✅ 채널별 시작 메시지 전송 (ETH)
@@ -5559,10 +5634,25 @@ async def on_ready():
                 display_price = eth_live if isinstance(eth_live, (int, float)) else c_c
                 display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
                 # [ANCHOR: daily_change_unify_eth]
-                daily_change_pct = await compute_daily_change_pct(
-                    symbol_eth,
-                    display_price
-                )
+
+                daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
+
+                # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
+                k = f"{symbol_eth}|{tf}"
+                pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_eth) if TRADE_MODE == "futures" else None)
+                if pos:
+                    side = pos.get("side")
+                    entry = float(pos.get("entry") or 0)
+                    hit, reason = _eval_tp_sl(side, entry, float(display_price), tf)
+                    if hit:
+                        if TRADE_MODE == "paper":
+                            await _notify_trade_exit(symbol_eth, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
+                            PAPER_POS.pop(k, None); _save_json(PAPER_POS_FILE, PAPER_POS)
+                            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                        elif TRADE_MODE == "futures":
+                            await futures_close_all(symbol_eth, tf, exit_price=float(display_price), reason=reason)
+                        continue
+
 
                 # 현재가가를 차해가면 최고/최저가 갱신
                 if highest_price[tf] is None:
@@ -5956,10 +6046,25 @@ async def on_ready():
                 display_price = btc_live if isinstance(btc_live, (int, float)) else price
                 display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
                 # [ANCHOR: daily_change_unify_btc]
-                daily_change_pct = await compute_daily_change_pct(
-                    symbol_btc,
-                    display_price
-                )
+
+                daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
+
+                # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
+                k = f"{symbol_btc}|{tf}"
+                pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_btc) if TRADE_MODE == "futures" else None)
+                if pos:
+                    side = pos.get("side")
+                    entry = float(pos.get("entry") or 0)
+                    hit, reason = _eval_tp_sl(side, entry, float(display_price), tf)
+                    if hit:
+                        if TRADE_MODE == "paper":
+                            await _notify_trade_exit(symbol_btc, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
+                            PAPER_POS.pop(k, None); _save_json(PAPER_POS_FILE, PAPER_POS)
+                            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                        elif TRADE_MODE == "futures":
+                            await futures_close_all(symbol_btc, tf, exit_price=float(display_price), reason=reason)
+                        continue
+
 
                 # 🔽 BTC 심볼+타임프레임별 리포트/이미지 경로 생성
                 score_file = plot_score_history(symbol_btc, tf)
@@ -6376,8 +6481,13 @@ async def on_message(message):
 
         # 일봉 변동률 계산
         price_now = fetch_live_price(symbol)
+
+        display_price = sanitize_price_for_tf(symbol, tf,
+            (price_now if isinstance(price_now, (int, float)) else price)
+        )
         # [ANCHOR: daily_change_unify_eth_alt]
-        daily_change_pct = await compute_daily_change_pct(symbol, price_now)
+        daily_change_pct = calc_daily_change_pct(symbol, display_price)
+
 
 
         main_msg_pdf, summary_msg_pdf, _short_msg_pdf = format_signal_message(
@@ -6396,7 +6506,9 @@ async def on_message(message):
             agree_long=agree_long,
             agree_short=agree_short,
             daily_change_pct=daily_change_pct,
-            live_price=current_price_eth,
+
+            live_price=price_now,
+
             show_risk=False
         )
         msg_for_pdf = f"{main_msg_pdf}\n\n{summary_msg_pdf}"
@@ -6423,7 +6535,8 @@ async def on_message(message):
             now=datetime.now(),
             chart_imgs=chart_files,                 # ✅ 분할차트 리스트
             ichimoku_img=ichimoku_file,             # ✅ 이치모쿠
-            discord_message=msg_for_pdf
+            discord_message=msg_for_pdf,
+            daily_change_pct=daily_change_pct
         )
 
 
