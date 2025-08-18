@@ -293,6 +293,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
                         FRAME_GATE.pop(tf, None)
                         return False
 
+            log(f"[GK] {tf}: OBS passed single-candidate → {g['cand'][0].get('symbol')}")
             g["winner"] = g["cand"][0].get("symbol")
             return payload.get("symbol") == g["winner"]
 
@@ -3218,13 +3219,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
 
-    # [PATCH A: ROUTE_BEFORE_GATEKEEPER]
+    # ① 라우팅 검사 (먼저)
     if not _route_allows(symbol, tf):
         log(f"⏭ {symbol} {tf}: skip reason=ROUTE")
         return
 
+    # ② 게이트키퍼
     cand = {"symbol": symbol, "dir": signal, "score": EXEC_STATE.get(('score', symbol, tf))}
-    allowed = gatekeeper_offer(tf, int(candle_ts_ms), cand)
+    allowed = gatekeeper_offer(tf, candle_ts_ms, cand)
     if not allowed:
         log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
