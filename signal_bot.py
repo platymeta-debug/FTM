@@ -491,6 +491,44 @@ def detect_market_regime(tf='1h'):
     return label, ctx
 
 # === 실시간 가격(티커) 유틸 ===
+ # === [ANCHOR: PRICE_SNAPSHOT_UTIL] 심볼별 라이브 프라이스 스냅샷 (공통 현재가) ===
+PRICE_SNAPSHOT = {}  # {symbol: {"ts": ms, "last": float|None, "bid": float|None, "ask": float|None, "mid": float|None, "chosen": float|None}}
+PRICE_SNAPSHOT_TTL_MS = 500  # 동일 틱 처리용 짧은 TTL
+
+async def get_price_snapshot(symbol: str) -> dict:
+    """
+    전 TF(15m/1h/4h/1d)에서 동일하게 쓸 '현재가 스냅샷'을 만든다.
+    chosen = mid(가능) 또는 last(대체). 실패 시 None.
+    """
+    now_ms = int(time.time() * 1000)
+    rec = PRICE_SNAPSHOT.get(symbol)
+    if rec and (now_ms - rec.get("ts", 0) < PRICE_SNAPSHOT_TTL_MS):
+        return rec
+
+    # 1) 선물 모드면 선물 인스턴스 우선, 2) 아니면 스팟 티커
+    last = bid = ask = mid = chosen = None
+    try:
+        ex = FUT_EXCHANGE if (TRADE_MODE == "futures" and FUT_EXCHANGE) else None
+        if ex:
+            t = await _post(ex.fetch_ticker, symbol)
+            last = float(t.get('last') or 0) or None
+            bid  = float(t.get('bid')  or 0) or None
+            ask  = float(t.get('ask')  or 0) or None
+        else:
+            last = float(fetch_live_price(symbol) or 0) or None
+    except Exception:
+        pass
+
+    if bid and ask:
+        try:
+            mid = (bid + ask) / 2.0
+        except Exception:
+            mid = None
+
+    chosen = mid or last
+    PRICE_SNAPSHOT[symbol] = {"ts": now_ms, "last": last, "bid": bid, "ask": ask, "mid": mid, "chosen": chosen}
+    return PRICE_SNAPSHOT[symbol]
+
 def fetch_live_price(symbol: str) -> float | None:
     try:
         ex = ccxt.binance({
@@ -2717,7 +2755,8 @@ def log_to_csv(symbol, tf, signal, price, rsi, macd,
                 _save_json(PAPER_POS_FILE, PAPER_POS)
     except Exception:
         pass
-    price = sanitize_price_for_tf(symbol, tf, price)
+    if os.getenv("SANITIZE_LOG_PRICE","0") == "1":
+        price = sanitize_price_for_tf(symbol, tf, price)
 
 
 
@@ -5251,8 +5290,10 @@ async def send_timed_reports():
                         log(f"⏭️ {symbol_eth} {tf} 보고서 생략: 데이터 없음")
                         continue
 
-                    display_price = sanitize_price_for_tf(symbol_eth, tf,
-                        (current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price)
+                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
+                    live_price = snap.get("mid") or snap.get("last")
+                    display_price = live_price if isinstance(live_price, (int, float)) else (
+                        current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
                     )
                     # [ANCHOR: daily_change_unify_eth_alt]
                     daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
@@ -5280,7 +5321,7 @@ async def send_timed_reports():
                         daily_change_pct=daily_change_pct,
                         score_history=score_history.get(tf),
                         recent_scores=score_history.get(tf),
-                        live_price=current_price_eth,
+                        live_price=live_price,
                         show_risk=False
                     )
 
@@ -5302,8 +5343,11 @@ async def send_timed_reports():
                     summary_msg_pdf = addon + "\n" + summary_msg_pdf
 
 
-                    display_price = current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
-                    display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
+                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
+                    display_price = snap.get("mid") or snap.get("last") or (
+                        current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
+                    )
+
 
                     pdf_path = generate_pdf_report(
                         df=df, tf=tf, symbol=symbol_eth,
@@ -5389,10 +5433,13 @@ async def send_timed_reports():
                     signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = \
                         calculate_signal(df, tf, symbol_btc)
 
-                    display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
-                    display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
-                    # [ANCHOR: daily_change_unify_btc]
 
+                    snap = await get_price_snapshot(symbol_btc)  # BTC/USDT
+                    live_price = snap.get("mid") or snap.get("last")
+                    display_price = live_price if isinstance(live_price, (int, float)) else (
+                        current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
+                    )
+                    # [ANCHOR: daily_change_unify_btc]
                     daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
 
 
@@ -5418,7 +5465,7 @@ async def send_timed_reports():
                         recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
                         daily_change_pct=daily_change_pct,
                         symbol=symbol_btc,
-                        live_price=current_price_btc,
+                        live_price=live_price,
                         show_risk=False
                     )
 
@@ -5491,7 +5538,9 @@ async def send_timed_reports():
 
                     # 10) (자동매매) — 트리거 모드별 처리
                     trigger_mode = trigger_mode_for(tf)
-                    log(f"[DEBUG] {symbol_btc} live={current_price_btc} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+
+                    log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+
                     await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
 
                 except Exception as e:
@@ -5572,8 +5621,9 @@ async def on_ready():
 
     while True:
         try:
-            # ✅ 루프 1회마다 실시간 가격 1번만 조회해 TF 전부에 동일 적용
-            eth_live = fetch_live_price(symbol_eth)
+
+            # ✅ 루프 1회마다 실시간 가격 스냅샷 활용 (TF 공통)
+
 
             for tf in timeframes:
                 ch_id = CHANNEL_IDS.get(tf)
@@ -5631,8 +5681,10 @@ async def on_ready():
 
                 now_str = datetime.now().strftime("%m월 %d일 %H:%M")
                 previous = previous_signal.get(tf)
-                display_price = eth_live if isinstance(eth_live, (int, float)) else c_c
-                display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
+
+                snap = await get_price_snapshot(symbol_eth)
+                live_price = snap.get("mid") or snap.get("last")
+                display_price = live_price if isinstance(live_price, (int, float)) else c_c
                 # [ANCHOR: daily_change_unify_eth]
 
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
@@ -5925,7 +5977,8 @@ async def on_ready():
                         ([] if (score_history[tf] and round(score,1)==score_history[tf][-1]) else [round(score,1)])
                     ),
 
-                    live_price=eth_live,  # reuse ticker for consistent short/long pricing
+
+                    live_price=live_price,  # reuse ticker for consistent short/long pricing
                     show_risk=False
                 )
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
@@ -5940,7 +5993,8 @@ async def on_ready():
 
 
                 trigger_mode = trigger_mode_for(tf)
-                log(f"[DEBUG] {symbol_eth} live={eth_live} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                log(f"[DEBUG] {symbol_eth} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+
                 await handle_trigger(symbol_eth, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 channel = _get_channel_or_skip('ETH', tf)
@@ -6008,7 +6062,9 @@ async def on_ready():
                 previous_score[tf] = score
 
             # ===== BTC 실시간 루프 (1h/4h/1d) =====
-            btc_live = fetch_live_price(symbol_btc)
+
+            # ✅ 루프 1회마다 실시간 가격 스냅샷 활용 (TF 공통)
+
 
             for tf in TIMEFRAMES_BTC:
                 ch_id = CHANNEL_BTC.get(tf)
@@ -6043,8 +6099,10 @@ async def on_ready():
                 LATEST_WEIGHTS[(symbol_btc, tf)] = dict(weights) if isinstance(weights, dict) else {}
                 LATEST_WEIGHTS_DETAIL[(symbol_btc, tf)] = dict(weights_detail) if isinstance(weights_detail, dict) else {}
                 
-                display_price = btc_live if isinstance(btc_live, (int, float)) else price
-                display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
+
+                snap = await get_price_snapshot(symbol_btc)
+                live_price = snap.get("mid") or snap.get("last")
+                display_price = live_price if isinstance(live_price, (int, float)) else c_c
                 # [ANCHOR: daily_change_unify_btc]
 
                 daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
@@ -6312,7 +6370,9 @@ async def on_ready():
                     entry_time=_entry_time,
                     entry_price=_entry_price,
                     recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-                    live_price=btc_live,  # reuse ticker for consistent short/long pricing
+
+                    live_price=live_price,  # reuse ticker for consistent short/long pricing
+
                     show_risk=False
                 )
 
@@ -6358,7 +6418,9 @@ async def on_ready():
                     neutral_info_btc[tf] = None
 
                 trigger_mode = trigger_mode_for(tf)
-                log(f"[DEBUG] {symbol_btc} live={btc_live} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+
+                log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+
                 await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
 
                 # 상태 업데이트(손절/익절 분기에서 이미 continue 되므로 여기선 순수 신호 상태만 기록)
@@ -6391,10 +6453,10 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    parts = message.content.split()
+    parts = message.content.strip().split()
 
         # ===== PnL 리포트 생성 =====
-    if message.content.strip().startswith("!리포트") or message.content.strip().lower().startswith("!report"):
+    if (parts and parts[0] in ("!리포트","!report")) and (len(parts) == 1):
         try:
             path = await generate_pnl_pdf()
             if not path:
@@ -6421,6 +6483,10 @@ async def on_message(message):
         signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol)
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+        snap = await get_price_snapshot(symbol)
+        live_price_val = snap.get("mid") or snap.get("last")
+        display_price = live_price_val if isinstance(live_price_val, (int, float)) else price
+
         main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
             tf=tf,
             signal=signal,
@@ -6437,7 +6503,7 @@ async def on_message(message):
             agree_long=agree_long,
             agree_short=agree_short,
             symbol=symbol,
-            live_price=current_price_eth,
+            live_price=display_price,
             show_risk=False
             )
         
@@ -6482,8 +6548,9 @@ async def on_message(message):
         # 일봉 변동률 계산
         price_now = fetch_live_price(symbol)
 
-        display_price = sanitize_price_for_tf(symbol, tf,
-            (price_now if isinstance(price_now, (int, float)) else price)
+        snap = await get_price_snapshot(symbol)
+        display_price = snap.get("mid") or snap.get("last") or (
+            price_now if isinstance(price_now, (int, float)) else price
         )
         # [ANCHOR: daily_change_unify_eth_alt]
         daily_change_pct = calc_daily_change_pct(symbol, display_price)
@@ -6506,9 +6573,7 @@ async def on_message(message):
             agree_long=agree_long,
             agree_short=agree_short,
             daily_change_pct=daily_change_pct,
-
-            live_price=price_now,
-
+            live_price=display_price,
             show_risk=False
         )
         msg_for_pdf = f"{main_msg_pdf}\n\n{summary_msg_pdf}"
