@@ -5697,7 +5697,10 @@ async def on_ready():
                         list(score_history[tf]) +
                         ([] if (score_history[tf] and round(score,1)==score_history[tf][-1]) else [round(score,1)])
                     ),
+
                     live_price=eth_live  # reuse ticker for consistent short/long pricing
+
+
                 )
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
                 candle_ts = None
