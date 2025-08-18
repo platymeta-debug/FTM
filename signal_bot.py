@@ -219,96 +219,104 @@ def _score_bucket(score, cfg):
     except Exception:
         return None
 
-# [ANCHOR: GATEKEEPER_LOGIC]
-# [PATCH B1: GATEKEEPER_OBS_PARSER]
-def _obs_ms_for(tf: str) -> int:
-    """
-    GATEKEEPER_OBS_SEC="15m:15,1h:25,4h:40,1d:60" 형식 파싱 → ms 반환
-    없으면 TF별 기본값 사용(15m:20,1h:25,4h:40,1d:60)
-    """
-    import os
-    raw = os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60")
-    try:
-        parts = [p.strip() for p in raw.split(",") if ":" in p]
-        kv = {k.strip(): int(v) for k, v in (p.split(":", 1) for p in parts)}
-    except Exception:
-        kv = {}
-    default = {"15m": 20, "1h": 25, "4h": 40, "1d": 60}
-    sec = kv.get(tf, default.get(tf, 20))
-    return int(sec) * 1000
+# [ANCHOR: NORMALIZE_EXEC_SIGNAL]
+def _normalize_exec_signal(sig: str) -> str:
+    s = (sig or "").strip().upper()
+    if s in ("BUY", "STRONG BUY", "LONG", "STRONG LONG"):
+        return "BUY"
+    if s in ("SELL", "STRONG SELL", "SHORT", "STRONG SHORT"):
+        return "SELL"
+    return "NEUTRAL"
 
-# [PATCH B2: GATEKEEPER_OBS_LOGIC]
+# [ANCHOR: GATEKEEPER_LOGIC]
+def _candidate_score(payload: dict) -> float:
+    for k in ("total_score", "score", "strength", "coefficient"):
+        if k in payload and isinstance(payload[k], (int, float)):
+            return float(payload[k])
+    return 0.0
+
 def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     """
-    동일 TF·동일 캔들(ts)에서 후보를 수집·선별한다.
-    - 첫 후보만 있는 상태로 관찰시간(OBS) 경과 → 단일 후보 승자 확정(True)
-    - 두 후보가 들어오면 점수 비교(abs)로 승자 1개만 True
-    - winner 확정 후에는 해당 심볼만 True
+    동일 TF·동일 캔들(ts)에서 ETH/BTC 등 다수 후보가 들어와도
+    - 관찰윈도우(OBS) 동안은 비교 대기
+    - 단일 후보만 존재해도 OBS 경과 시 자동 통과
+    - (옵션) 강한 신호는 즉시 통과
+    - (옵션) 목표점수 대기(소프트/하드)
     """
-    import time
-    now_ms = int(time.time() * 1000)
-    ts = int(candle_ts_ms)
+    now = time.monotonic()
+
+    # ENV 파라미터
+    obs_map = parse_tf_map(os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60"))
+    obs_sec = float(obs_map.get(tf, 0) or 0)
+
+    wait_enable = str(os.getenv("WAIT_TARGET_ENABLE", "0")) == "1"
+    target_map = parse_tf_map(os.getenv("TARGET_SCORE_BY_TF", "15m:0,1h:0,4h:0,1d:0"))
+    wait_map = parse_tf_map(os.getenv("WAIT_TARGET_SEC", "15m:0,1h:0,4h:0,1d:0"))
+    mode = (os.getenv("TARGET_WAIT_MODE", "SOFT") or "SOFT").upper()  # SOFT|HARD
+
+    strong_bypass = float(os.getenv("STRONG_BYPASS_SCORE", "0") or 0.0)
 
     g = FRAME_GATE.get(tf)
-    if (not g) or g.get("ts") != ts:
-        # 새 캔들 프레임 시작
-
-        flat = not ((PAPER_POS_TF.get(tf) if 'PAPER_POS_TF' in globals() else None) or (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None))
-        target_wait = float(WAIT_TARGET_SEC.get(tf, 0.0))
+    # 새 캔들 시작 → 게이트 초기화
+    if not g or int(g.get("ts", -1)) != int(candle_ts_ms):
         g = {
-            "ts": ts,
+            "ts": int(candle_ts_ms),
             "cand": [payload],
             "winner": None,
-            "first_seen_ms": now_ms,
-            "flat": flat,
-            "target_until": (time.time() + target_wait) if (flat and target_wait > 0) else 0.0,
+            "obs_until": (now + obs_sec) if obs_sec > 0 else now,  # obs_sec=0이면 즉시 만료
+            "target_until": 0.0,
         }
-
         FRAME_GATE[tf] = g
-        # 첫 후보는 일단 보류
+        # 첫 후보라도 강한 신호면 우선 통과
+        if strong_bypass and abs(_candidate_score(payload)) >= strong_bypass:
+            g["winner"] = payload.get("symbol")
+            return True
+        # 관찰윈도우 동안은 보류
         return False
 
-    # 같은 캔들에서 후속 호출
-    # 1) 단일 후보로 OBS 경과 시 → 단일 후보 승자 확정
-    if len(g["cand"]) == 1 and not g.get("winner"):
-        if (now_ms - int(g.get("first_seen_ms") or now_ms)) >= _obs_ms_for(tf):
-
-            # [ANCHOR: TARGET_SCORE_WAIT]
-            if WAIT_TARGET_ENABLE and g.get("flat", False):
-                target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
-                if target > 0.0:
-                    best = 0.0
-                    for c in g["cand"]:
-                        s = float(c.get("score") or 0.0)
-                        diru = str(c.get("dir"," ")).upper()
-                        ds = s if diru in ("BUY","LONG") else (-s)
-                        if ds > best:
-                            best = ds
-                    now = time.time()
-                    if now < float(g.get("target_until") or 0.0) and best < target:
-                        log(f"⏳ {tf}: target-wait (best={best:.2f} < target={target:.2f})")
-                        return False
-                    if TARGET_WAIT_MODE == "HARD" and best < target:
-                        log(f"⛔ {tf}: target-not-met (best={best:.2f} < target={target:.2f})")
-                        FRAME_GATE.pop(tf, None)
-                        return False
-
-            g["winner"] = g["cand"][0].get("symbol")
-            return payload.get("symbol") == g["winner"]
-
-    # 2) 후보 추가
+    # 같은 캔들 → 후보 누적
     g["cand"].append(payload)
 
-    # 3) 이미 승자 있으면 그 심볼만 통과
+    # 이미 승자 결정됨 → 해당 심볼만 True
     if g.get("winner"):
         return payload.get("symbol") == g["winner"]
 
-    # 4) 두 후보 비교로 승자 결정 (점수 절댓값 큰 쪽)
-    a, b = g["cand"][0], g["cand"][1] if len(g["cand"]) > 1 else g["cand"][0]
-    sa = abs(float(a.get("score") or 0.0))
-    sb = abs(float(b.get("score") or 0.0))
-    g["winner"] = (a if sa >= sb else b).get("symbol")
+    # 관찰윈도우 진행 중
+    if now < float(g.get("obs_until") or 0):
+        # 도중에 강한 신호 들어오면 즉시 우선 통과
+        if strong_bypass:
+            best = max(g["cand"], key=lambda c: abs(_candidate_score(c)))
+            if abs(_candidate_score(best)) >= strong_bypass:
+                g["winner"] = best.get("symbol")
+                return payload.get("symbol") == g["winner"]
+        return False
 
+    # 관찰윈도우 종료 → 현재까지 최고 점수 승자 선정
+    best = max(g["cand"], key=lambda c: abs(_candidate_score(c)))
+    best_score = abs(_candidate_score(best))
+
+    # (옵션) 목표 점수 대기
+    if wait_enable and mode in ("SOFT", "HARD"):
+        target = float(target_map.get(tf, 0) or 0.0)
+        wsec = float(wait_map.get(tf, 0) or 0.0)
+        # 최초 진입 대기 타이머 설정
+        if (wsec > 0) and (g.get("target_until", 0) == 0):
+            g["target_until"] = now + wsec
+
+        # 하드 모드: 목표 미달이면 타이머 내내 보류
+        if mode == "HARD" and target > 0 and best_score < target and now < g["target_until"]:
+            return False
+
+        # 소프트 모드: 목표 미달이더라도 타이머 만료 시 통과
+        # (그 전에 STRONG_BYPASS에 걸리면 즉시 통과)
+        if mode == "SOFT" and target > 0 and best_score < target and now < g["target_until"]:
+            if strong_bypass and best_score >= strong_bypass:
+                g["winner"] = best.get("symbol")
+                return payload.get("symbol") == g["winner"]
+            return False
+
+    # 최종 승자 확정
+    g["winner"] = best.get("symbol")
     return payload.get("symbol") == g["winner"]
 
 # [ANCHOR: EVAL_PROTECTIVE_EXITS_STD]
@@ -3181,18 +3189,19 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
                 TRIGGER_STATE[key] = 'FLAT'
                 ARMED_SIGNAL.pop(key, None)
                 ARMED_TS.pop(key, None)
-# signal_bot.py
 async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if candle_ts is None:
         log(f"⏭ {symbol} {tf}: skip reason=DATA")
 
         return
-    candle_ts_ms = int(candle_ts)
-    if idem_hit(symbol, tf, candle_ts_ms):
+    candle_ts = int(candle_ts)
+    if idem_hit(symbol, tf, candle_ts):
         log(f"⏭ {symbol} {tf}: skip (already executed this candle)")
         log(f"⏭ {symbol} {tf}: skip reason=IDEMP")
         return
-    if signal not in ("BUY", "SELL"):
+    # [ANCHOR: NORMALIZE_EXEC_SIGNAL_CALL]
+    exec_signal = _normalize_exec_signal(signal)
+    if exec_signal not in ("BUY", "SELL"):
         log(f"⏭ {symbol} {tf}: skip (signal={signal})")
         log(f"⏭ {symbol} {tf}: skip reason=NEUTRAL")
         return
@@ -3218,13 +3227,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
 
-    # [PATCH A: ROUTE_BEFORE_GATEKEEPER]
+    # ① 라우팅 검사 (먼저)
     if not _route_allows(symbol, tf):
         log(f"⏭ {symbol} {tf}: skip reason=ROUTE")
         return
 
-    cand = {"symbol": symbol, "dir": signal, "score": EXEC_STATE.get(('score', symbol, tf))}
-    allowed = gatekeeper_offer(tf, int(candle_ts_ms), cand)
+    # ② 게이트키퍼
+    cand = {"symbol": symbol, "dir": exec_signal, "score": EXEC_STATE.get(('score', symbol, tf))}
+    allowed = gatekeeper_offer(tf, candle_ts, cand)
     if not allowed:
         log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
@@ -3251,16 +3261,16 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
 
     PAPER_POS[key] = {
-        "side": ("LONG" if signal == "BUY" else "SHORT"),
+        "side": ("LONG" if exec_signal == "BUY" else "SHORT"),
         "entry": float(last_price),
-        "opened_ts": candle_ts_ms*1000,
+        "opened_ts": candle_ts*1000,
         "high": float(last_price),
         "low": float(last_price)
     }
     _save_json(PAPER_POS_FILE, PAPER_POS)
 
     await _notify_trade_entry(
-        symbol, tf, signal,
+        symbol, tf, exec_signal,
         mode="paper", price=float(last_price),
         qty=0.0,
         base_margin=0, eff_margin=0,
@@ -3269,7 +3279,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     )
 
     # [ANCHOR: IDEMP_MARK_BEFORE_RETURN]
-    idem_mark(symbol, tf, candle_ts_ms)
+    idem_mark(symbol, tf, candle_ts)
 
 # 모듈 로드 시점에 한 번 생성 (라이브 모드에서만 의미 있음)
 try:
@@ -3647,18 +3657,18 @@ def _save_json(path, obj):
 IDEMP_FILE = "logs/idempotence.json"
 _IDEMP = _load_json(IDEMP_FILE, {})  # dict: key -> 1
 
-def _idem_key(symbol: str, tf: str, candle_ts_ms: int) -> str:
-    return f"{symbol}|{tf}|{int(candle_ts_ms)}"
+def _idem_key(symbol: str, tf: str, candle_ts: int) -> str:
+    return f"{symbol}|{tf}|{int(candle_ts)}"
 
-def idem_hit(symbol: str, tf: str, candle_ts_ms: int) -> bool:
+def idem_hit(symbol: str, tf: str, candle_ts: int) -> bool:
     try:
-        return _IDEMP.get(_idem_key(symbol, tf, candle_ts_ms), 0) == 1
+        return _IDEMP.get(_idem_key(symbol, tf, candle_ts), 0) == 1
     except Exception:
         return False
 
-def idem_mark(symbol: str, tf: str, candle_ts_ms: int):
+def idem_mark(symbol: str, tf: str, candle_ts: int):
     try:
-        _IDEMP[_idem_key(symbol, tf, candle_ts_ms)] = 1
+        _IDEMP[_idem_key(symbol, tf, candle_ts)] = 1
         _save_json(IDEMP_FILE, _IDEMP)
     except Exception:
         pass
@@ -6508,9 +6518,20 @@ async def on_message(message):
                       (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None)
                 gate = FRAME_GATE.get(tf, {})
                 cd   = COOLDOWN_UNTIL.get(tf, 0)
+                obs_left = 0
+                target_left = 0
+                try:
+                    import time
+                    if gate.get("obs_until"):
+                        obs_left = max(0, int(gate["obs_until"] - time.monotonic()))
+                    if gate.get("target_until"):
+                        target_left = max(0, int(gate["target_until"] - time.monotonic()))
+                except Exception:
+                    pass
                 lines.append(
                     f"· {tf}: occ={occ or '-'} | cooldown={(max(0,int(cd-time.time())) if cd else 0)}s "
-                    f"| gate(ts={gate.get('ts','-')}, cand={len(gate.get('cand',[]))}, winner={gate.get('winner','-')})"
+                    f"| gate(ts={gate.get('ts','-')}, cand={len(gate.get('cand',[]))}, winner={gate.get('winner','-')}, "
+                    f"obs={obs_left}s, tgt={target_left}s)"
                 )
             await message.channel.send("\n".join(lines))
         except Exception as e:
