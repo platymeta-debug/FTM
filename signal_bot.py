@@ -5150,6 +5150,7 @@ async def send_timed_reports():
                     main_msg_pdf = addon + "\n" + main_msg_pdf
                     summary_msg_pdf = addon + "\n" + summary_msg_pdf
 
+
                     display_price = current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
                     display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
 
@@ -5278,6 +5279,8 @@ async def send_timed_reports():
 
                     # (선택) PDF 생성 — 파일 목록에 같이 첨부
                     try:
+                        display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
+                        display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
                         pdf_path = generate_pdf_report(
                             df=df, tf=tf, symbol=symbol_btc,
                             signal=signal, price=display_price, score=score,
@@ -6112,6 +6115,7 @@ async def on_ready():
                 _epb = entry_data_btc.get(tf)
                 _entry_price = _epb[0] if _epb else None
                 _entry_time  = _epb[1] if _epb else None
+
 
                 display_price = btc_live if isinstance(btc_live, (int, float)) else price
                 display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
