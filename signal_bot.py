@@ -314,19 +314,25 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
 
     return payload.get("symbol") == g["winner"]
 
-# [ANCHOR: EVAL_PROTECTIVE_EXITS]
-def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> str | None:
-    tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
-    sl_pct = float((HARD_STOP_PCT   or {}).get(tf, 0.0))
-    if not entry or not price:
-        return None
-    if side.upper() in ("LONG", "BUY"):
-        if tp_pct and price >= entry * (1 + tp_pct/100): return "TP"
-        if sl_pct and price <= entry * (1 - sl_pct/100): return "SL"
-    else:
-        if tp_pct and price <= entry * (1 - tp_pct/100): return "TP"
-        if sl_pct and price >= entry * (1 + sl_pct/100): return "SL"
-    return None
+# [ANCHOR: EVAL_PROTECTIVE_EXITS_STD]
+def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
+    """TP/SL 충족 여부를 판단하여 (hit, reason)를 반환한다. hit=True면 reason∈{'TP','SL'}"""
+    try:
+        tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
+        sl_pct = float((HARD_STOP_PCT   or {}).get(tf, 0.0))
+        if not (isinstance(entry, (int, float)) and isinstance(price, (int, float))):
+            return False, ""
+        side_u = str(side).upper()
+        if side_u in ("LONG", "BUY"):
+            if tp_pct and price >= entry * (1 + tp_pct/100.0): return True, "TP"
+            if sl_pct and price <= entry * (1 - sl_pct/100.0): return True, "SL"
+        else:
+            if tp_pct and price <= entry * (1 - tp_pct/100.0): return True, "TP"
+            if sl_pct and price >= entry * (1 + sl_pct/100.0): return True, "SL"
+        return False, ""
+    except Exception:
+        return False, ""
+
 
 def _should_notify(tf: str, score: float, price: float, curr_bucket: str, last_candle_ts: int,
                    last_sent_ts_map: dict, last_sent_bucket_map: dict,
@@ -3133,24 +3139,6 @@ def _min_notional_ok(ex, symbol, price, amount):
 
 
 
-def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
-    tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
-    sl_pct = float((HARD_STOP_PCT or {}).get(tf, 0.0))
-    if not entry or not price:
-        return False, ""
-    if side == "LONG":
-        if tp_pct and price >= entry * (1 + tp_pct/100):
-            return True, "TP"
-        if sl_pct and price <= entry * (1 - sl_pct/100):
-            return True, "SL"
-    else:
-        if tp_pct and price <= entry * (1 - tp_pct/100):
-            return True, "TP"
-        if sl_pct and price >= entry * (1 + sl_pct/100):
-            return True, "SL"
-    return False, ""
-
-
 async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, entry_map):
     key = (symbol, tf)
     state = TRIGGER_STATE.get(key, 'FLAT')
@@ -3193,6 +3181,7 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
 async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if candle_ts is None:
         log(f"⏭ {symbol} {tf}: skip reason=DATA")
+
         return
     candle_ts_ms = int(candle_ts)
     if idem_hit(symbol, tf, candle_ts_ms):
@@ -3210,19 +3199,18 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if pos:
         side  = str(pos.get("side", "")).upper()
         entry = float(pos.get("entry") or 0)
-        hit = _eval_tp_sl(side, float(entry), float(last_price), tf)
+        hit, reason = _eval_tp_sl(side, float(entry), float(last_price), tf)
         if hit:
-            await _notify_trade_exit(symbol, tf, side=side, entry_price=entry, exit_price=float(last_price), reason=hit, mode=("paper" if TRADE_MODE!="futures" else "futures"))
+            await _notify_trade_exit(symbol, tf, side=side, entry_price=entry, exit_price=float(last_price), reason=(reason or "TP/SL"), mode=("paper" if TRADE_MODE!="futures" else "futures"))
             PAPER_POS.pop(key, None); _save_json(PAPER_POS_FILE, PAPER_POS)
             PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
-            log(f"⏭ {symbol} {tf}: exited by {hit}, skip new entry this tick")
-            log(f"⏭ {symbol} {tf}: skip reason=IDEMP")
+            log(f"⏭ {symbol} {tf}: exited by {reason}, skip new entry this tick")
+            log(f"⏭ {symbol} {tf}: skip reason=PROTECT")
             return
         else:
             log(f"⏭ {symbol} {tf}: open pos exists → skip new entry")
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
-
 
     cand = {"symbol": symbol, "dir": signal, "score": float(EXEC_STATE.get(('score', symbol, tf)) or 0.0)}
     allowed = gatekeeper_offer(tf, candle_ts_ms, cand)
@@ -3230,7 +3218,6 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         import time
         why = "cooldown" if time.time() < float(COOLDOWN_UNTIL.get(tf, 0.0) or 0.0) else ("observe" if FRAME_GATE.get(tf, {}).get("flat") else "hold-ttl")
         log(f"⏸ {symbol} {tf}: pending gatekeeper ({why})")
-
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
@@ -3256,6 +3243,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             pass
         log(f"⏭ {symbol} {tf}: open pos exists → avoid overwrite")
         return
+
 
     PAPER_POS[key] = {
         "side": ("LONG" if signal == "BUY" else "SHORT"),
