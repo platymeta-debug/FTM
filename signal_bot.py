@@ -11,7 +11,7 @@ import platform
 import os, sys
 import discord
 from dotenv import load_dotenv
-load_dotenv("key.env,token.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
+load_dotenv("key.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
 import traceback
@@ -252,6 +252,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     g = FRAME_GATE.get(tf)
     if (not g) or g.get("ts") != ts:
         # 새 캔들 프레임 시작
+
         flat = not ((PAPER_POS_TF.get(tf) if 'PAPER_POS_TF' in globals() else None) or (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None))
         target_wait = float(WAIT_TARGET_SEC.get(tf, 0.0))
         g = {
@@ -262,6 +263,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
             "flat": flat,
             "target_until": (time.time() + target_wait) if (flat and target_wait > 0) else 0.0,
         }
+
         FRAME_GATE[tf] = g
         # 첫 후보는 일단 보류
         return False
@@ -270,6 +272,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     # 1) 단일 후보로 OBS 경과 시 → 단일 후보 승자 확정
     if len(g["cand"]) == 1 and not g.get("winner"):
         if (now_ms - int(g.get("first_seen_ms") or now_ms)) >= _obs_ms_for(tf):
+
             # [ANCHOR: TARGET_SCORE_WAIT]
             if WAIT_TARGET_ENABLE and g.get("flat", False):
                 target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
@@ -289,6 +292,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
                         log(f"⛔ {tf}: target-not-met (best={best:.2f} < target={target:.2f})")
                         FRAME_GATE.pop(tf, None)
                         return False
+
             g["winner"] = g["cand"][0].get("symbol")
             return payload.get("symbol") == g["winner"]
 
