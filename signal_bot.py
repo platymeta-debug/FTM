@@ -11,7 +11,7 @@ import platform
 import os, sys
 import discord
 from dotenv import load_dotenv
-load_dotenv("key.env,token.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
+load_dotenv("key.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
 import traceback
