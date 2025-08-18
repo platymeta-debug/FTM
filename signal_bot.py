@@ -252,7 +252,18 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     g = FRAME_GATE.get(tf)
     if (not g) or g.get("ts") != ts:
         # 새 캔들 프레임 시작
-        g = {"ts": ts, "cand": [payload], "winner": None, "first_seen_ms": now_ms}
+
+        flat = not ((PAPER_POS_TF.get(tf) if 'PAPER_POS_TF' in globals() else None) or (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None))
+        target_wait = float(WAIT_TARGET_SEC.get(tf, 0.0))
+        g = {
+            "ts": ts,
+            "cand": [payload],
+            "winner": None,
+            "first_seen_ms": now_ms,
+            "flat": flat,
+            "target_until": (time.time() + target_wait) if (flat and target_wait > 0) else 0.0,
+        }
+
         FRAME_GATE[tf] = g
         # 첫 후보는 일단 보류
         return False
@@ -261,6 +272,27 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     # 1) 단일 후보로 OBS 경과 시 → 단일 후보 승자 확정
     if len(g["cand"]) == 1 and not g.get("winner"):
         if (now_ms - int(g.get("first_seen_ms") or now_ms)) >= _obs_ms_for(tf):
+
+            # [ANCHOR: TARGET_SCORE_WAIT]
+            if WAIT_TARGET_ENABLE and g.get("flat", False):
+                target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
+                if target > 0.0:
+                    best = 0.0
+                    for c in g["cand"]:
+                        s = float(c.get("score") or 0.0)
+                        diru = str(c.get("dir"," ")).upper()
+                        ds = s if diru in ("BUY","LONG") else (-s)
+                        if ds > best:
+                            best = ds
+                    now = time.time()
+                    if now < float(g.get("target_until") or 0.0) and best < target:
+                        log(f"⏳ {tf}: target-wait (best={best:.2f} < target={target:.2f})")
+                        return False
+                    if TARGET_WAIT_MODE == "HARD" and best < target:
+                        log(f"⛔ {tf}: target-not-met (best={best:.2f} < target={target:.2f})")
+                        FRAME_GATE.pop(tf, None)
+                        return False
+
             g["winner"] = g["cand"][0].get("symbol")
             return payload.get("symbol") == g["winner"]
 
@@ -624,7 +656,7 @@ async def get_price_snapshot(symbol: str) -> dict:
         return rec
 
     # 1) 선물 모드면 선물 인스턴스 우선, 2) 아니면 스팟 티커
-    last = bid = ask = mid = chosen = None
+    last = bid = ask = mid = mark = chosen = None
     try:
         ex = FUT_EXCHANGE if (TRADE_MODE == "futures" and FUT_EXCHANGE) else None
         if ex:
@@ -632,6 +664,13 @@ async def get_price_snapshot(symbol: str) -> dict:
             last = float(t.get('last') or 0) or None
             bid  = float(t.get('bid')  or 0) or None
             ask  = float(t.get('ask')  or 0) or None
+            try:
+                mark = float(
+                    t.get('markPrice')
+                    or (t.get('info', {}).get('markPrice') if isinstance(t.get('info'), dict) else 0)
+                ) or None
+            except Exception:
+                mark = None
         else:
             last = float(fetch_live_price(symbol) or 0) or None
     except Exception:
@@ -644,7 +683,7 @@ async def get_price_snapshot(symbol: str) -> dict:
             mid = None
 
     chosen = mid or last
-    PRICE_SNAPSHOT[symbol] = {"ts": now_ms, "last": last, "bid": bid, "ask": ask, "mid": mid, "chosen": chosen}
+    PRICE_SNAPSHOT[symbol] = {"ts": now_ms, "last": last, "bid": bid, "ask": ask, "mid": mid, "mark": mark, "chosen": chosen}
     return PRICE_SNAPSHOT[symbol]
 
 def fetch_live_price(symbol: str) -> float | None:
@@ -3164,7 +3203,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if pos:
         side  = str(pos.get("side", "")).upper()
         entry = float(pos.get("entry") or 0)
-        hit, reason = _eval_tp_sl(side, float(entry), float(last_price), tf)
+        snap_curr = await get_price_snapshot(symbol)
+        curr = snap_curr.get("mark") or snap_curr.get("mid") or snap_curr.get("last") or last_price
+        hit, reason = _eval_tp_sl(side, float(entry), float(curr), tf)
         if hit:
             await _notify_trade_exit(symbol, tf, side=side, entry_price=entry, exit_price=float(last_price), reason=(reason or "TP/SL"), mode=("paper" if TRADE_MODE!="futures" else "futures"))
             PAPER_POS.pop(key, None); _save_json(PAPER_POS_FILE, PAPER_POS)
@@ -5669,7 +5710,7 @@ async def on_ready():
                 if pos:
                     side = pos.get("side")
                     entry = float(pos.get("entry") or 0)
-                    hit, reason = _eval_tp_sl(side, entry, float(display_price), tf)
+                    hit, reason = _eval_tp_sl(side, entry, float(snap.get("mark") or display_price), tf)
                     if hit:
                         if TRADE_MODE == "paper":
                             await _notify_trade_exit(symbol_eth, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
@@ -6088,7 +6129,7 @@ async def on_ready():
                 if pos:
                     side = pos.get("side")
                     entry = float(pos.get("entry") or 0)
-                    hit, reason = _eval_tp_sl(side, entry, float(display_price), tf)
+                    hit, reason = _eval_tp_sl(side, entry, float(snap.get("mark") or display_price), tf)
                     if hit:
                         if TRADE_MODE == "paper":
                             await _notify_trade_exit(symbol_btc, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
@@ -6422,13 +6463,61 @@ async def init_analysis_tasks():
         
 @client.event
 async def on_message(message):
-    global os 
+    global os
     if message.author == client.user:
         return
 
-    parts = message.content.strip().split()
+    content = message.content.strip()
+    parts = content.split()
 
-        # ===== PnL 리포트 생성 =====
+    # [ANCHOR: DIAG_CMD_CONFIG]
+    if content.startswith("!config"):
+        try:
+            def _kv(s): 
+                return {k.strip(): v.strip() for k,v in 
+                        (p.split(":",1) for p in str(s or "").split(",") if ":" in p)}
+            cfg = {
+                "ENABLE_OBSERVE": os.getenv("ENABLE_OBSERVE","1"),
+                "ENABLE_COOLDOWN": os.getenv("ENABLE_COOLDOWN","1"),
+                "STRONG_BYPASS_SCORE": os.getenv("STRONG_BYPASS_SCORE","0.8"),
+                "GK_TTL_HOLD_SEC": os.getenv("GK_TTL_HOLD_SEC","0.8"),
+                "GATEKEEPER_OBS_SEC": os.getenv("GATEKEEPER_OBS_SEC","15m:20,1h:25,4h:40,1d:60"),
+                "WAIT_TARGET_ENABLE": os.getenv("WAIT_TARGET_ENABLE","0"),
+                "TARGET_SCORE_BY_TF": _kv(os.getenv("TARGET_SCORE_BY_TF","")),
+                "WAIT_TARGET_SEC": _kv(os.getenv("WAIT_TARGET_SEC","")),
+                "TARGET_WAIT_MODE": os.getenv("TARGET_WAIT_MODE","SOFT"),
+                "IGNORE_OCCUPANCY_TFS": os.getenv("IGNORE_OCCUPANCY_TFS",""),
+                "TRADE_MODE": os.getenv("TRADE_MODE","paper"),
+                "ROUTE_ALLOW": os.getenv("ROUTE_ALLOW","*"),
+                "ROUTE_DENY": os.getenv("ROUTE_DENY",""),
+            }
+            txt = "\n".join([f"• {k}: {v}" for k,v in cfg.items()])
+            await message.channel.send(f"**CONFIG**\n{txt}")
+        except Exception as e:
+            await message.channel.send(f"config error: {e}")
+        return
+
+    # [ANCHOR: DIAG_CMD_HEALTH]
+    if content.startswith("!health"):
+        try:
+            import time
+            tfs = ["15m","1h","4h","1d"]
+            lines = [f"**HEALTH ({time.strftime('%H:%M:%S')})**"]
+            for tf in tfs:
+                occ = (PAPER_POS_TF.get(tf) if 'PAPER_POS_TF' in globals() else None) or \
+                      (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None)
+                gate = FRAME_GATE.get(tf, {})
+                cd   = COOLDOWN_UNTIL.get(tf, 0)
+                lines.append(
+                    f"· {tf}: occ={occ or '-'} | cooldown={(max(0,int(cd-time.time())) if cd else 0)}s "
+                    f"| gate(ts={gate.get('ts','-')}, cand={len(gate.get('cand',[]))}, winner={gate.get('winner','-')})"
+                )
+            await message.channel.send("\n".join(lines))
+        except Exception as e:
+            await message.channel.send(f"health error: {e}")
+        return
+
+    # ===== PnL 리포트 생성 =====
     if (parts and parts[0] in ("!리포트","!report")) and (len(parts) == 1):
         try:
             path = await generate_pnl_pdf()
@@ -6514,22 +6603,26 @@ async def on_message(message):
             report_price = snap.get("mid") or snap.get("last")
         except Exception:
             report_price = None
+        try_live = None
+        try_close = None
         # 마지막 보루: 스냅샷 실패 시 실시간/종가로 대체
         if not isinstance(report_price, (int, float)):
             try:
-                report_price = fetch_live_price(symbol)
+                try_live = fetch_live_price(symbol)
+                report_price = try_live
             except Exception:
-                report_price = None
+                try_live = None
         if not isinstance(report_price, (int, float)):
             # df가 있으면 마지막 종가로
             try:
                 _df_tmp = get_ohlcv(symbol, tf, limit=2)
                 if _df_tmp is not None and len(_df_tmp) > 0:
-                    report_price = float(_df_tmp['close'].iloc[-1])
+                    try_close = float(_df_tmp['close'].iloc[-1])
+                    report_price = try_close
             except Exception:
                 pass
         # [ANCHOR: REPORT_PRICE_SNAPSHOT_END]
-        log(f"[REPORT] {symbol} tf={tf} report_price={report_price}")
+        log(f"[REPORT] {symbol} {tf} price(report/live/close)={report_price}/{try_live}/{try_close}")
 
         df = get_ohlcv(symbol, tf, limit=300)
         df = add_indicators(df)
@@ -6670,6 +6763,20 @@ async def on_message(message):
 
 
 if __name__ == "__main__":
+    # [ANCHOR: BOOT_ENV_SUMMARY]
+    try:
+        log("[BOOT] ENV SUMMARY: "
+            f"OBS={os.getenv('GATEKEEPER_OBS_SEC','-')}, "
+            f"COOLDOWN={os.getenv('POST_EXIT_COOLDOWN_SEC','-')}, "
+            f"WAIT_TARGET={os.getenv('WAIT_TARGET_ENABLE','0')}/"
+            f"{os.getenv('TARGET_SCORE_BY_TF','-')}/"
+            f"{os.getenv('WAIT_TARGET_SEC','-')}/"
+            f"{os.getenv('TARGET_WAIT_MODE','-')}, "
+            f"IGNORE_OCCUPANCY_TFS={os.getenv('IGNORE_OCCUPANCY_TFS','')}, "
+            f"TRADE_MODE={os.getenv('TRADE_MODE','paper')}"
+        )
+    except Exception as _e:
+        log(f"[BOOT] ENV SUMMARY warn: {_e}")
     import time
     while True:
         try:
