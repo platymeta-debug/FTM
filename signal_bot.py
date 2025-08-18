@@ -1652,7 +1652,7 @@ def ichimoku_analysis(df):
 
 # ==== 퍼포먼스 스냅샷 빌더 ====
 def build_performance_snapshot(
-    tf, symbol, price, *,
+    tf, symbol, display_price, *,
     daily_change_pct=None,      # format_signal_message에서 넘겨줌
     recent_scores=None          # 최근 점수 리스트(예: [2.1, 2.4, ...])
 ) -> str:
@@ -1679,7 +1679,7 @@ def build_performance_snapshot(
             if d1 is None or len(d1) <= (k+1): 
                 return None
             prev = float(d1['close'].iloc[-(k+1)])
-            curr = float(price) if isinstance(price, (int, float)) else float(d1['close'].iloc[-1])
+            curr = float(display_price) if isinstance(display_price, (int, float)) else float(d1['close'].iloc[-1])
             return ((curr - prev) / prev) * 100.0 if prev else None
         except Exception:
             return None
@@ -1706,8 +1706,8 @@ def build_performance_snapshot(
     # 본문 구성
     sym = (symbol or "ETH/USDT").split('/')[0].upper()
     tf_tag = tf.upper()
-    usd_str = _fmt_usd(price) if isinstance(price, (int, float)) else "$-"
-    krw_str = usd_to_krw(price) if isinstance(price, (int, float)) else "₩-"
+    usd_str = _fmt_usd(display_price) if isinstance(display_price, (int, float)) else "$-"
+    krw_str = usd_to_krw(display_price) if isinstance(display_price, (int, float)) else "₩-"
 
     lines = []
     lines.append("## 📈 **퍼포먼스 스냅샷**")
@@ -2544,7 +2544,7 @@ def format_signal_message(
             summary_msg = build_performance_snapshot(
                 tf=tf,
                 symbol=symbol,
-                price=price,
+                display_price=display_price,
                 daily_change_pct=daily_change_pct,
                 recent_scores=recent_scores
             )
@@ -2930,19 +2930,22 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts= None):
     if TRADE_MODE == "paper" or not GLOBAL_EXCHANGE:
         # ① 라우팅 가드 (ETH/ BTC 제한)
         if not _route_allows(symbol, tf):
+            log(f"[PAPER] block {symbol} {tf}: route disallow")
             return
-        
+
         # --- TF 후보 선정: 같은 TF에서 더 우수한 심볼만 허용 (페이퍼/현물) ---
-        if not ALLOW_BOTH_PER_TF:
+        if tf not in IGNORE_OCCUPANCY_TFS and not ALLOW_BOTH_PER_TF:
             if not PAPER_POS_TF.get(tf) and not FUT_POS_TF.get(tf):
                 if not _is_best_candidate(symbol, tf, signal):
                     log(f"[PAPER] skip {symbol} {tf} {signal}: better candidate exists")
                     ENTERED_CANDLE[(symbol, tf)] = candle_ts
                     return
 
-        # ② 같은 TF 단일점유(옵션) — 같은 심볼이어도 '점유 중이면' 무조건 차단
-        if not ALLOW_BOTH_PER_TF:
-            other = PAPER_POS_TF.get(tf) or FUT_POS_TF.get(tf)
+        # ② 같은 TF 단일점유(옵션)
+        if tf not in IGNORE_OCCUPANCY_TFS and not ALLOW_BOTH_PER_TF:
+            other_paper = PAPER_POS_TF.get(tf)
+            other_fut   = FUT_POS_TF.get(tf)
+            other = next((x for x in (other_paper, other_fut) if x and x != symbol), None)
             if other:
                 log(f"[PAPER] skip {symbol} {tf}: TF already occupied by {other}")
                 ENTERED_CANDLE[(symbol, tf)] = candle_ts
@@ -3363,6 +3366,7 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
 # === 라우팅(ETH/BTC) & 동시 TF 제한 ===
 ROUTE_BY_TF_RAW   = os.getenv("ROUTE_BY_TF", "")  # 예: "15m:ETH,1h:BTC,4h:AUTO,1d:AUTO"
 ALLOW_BOTH_PER_TF = os.getenv("ALLOW_BOTH_PER_TF", "0") == "1"
+IGNORE_OCCUPANCY_TFS = {'1d'}
 
 def _parse_route_map(raw):
     m = {}
@@ -4225,6 +4229,7 @@ async def _auto_close_and_notify_eth(
 
 
     # CSV/상태 정리 (ETH는 접미사 없이 공통 변수 사용)
+    exit_price = sanitize_price_for_tf(symbol_eth, tf, exit_price)
     log_to_csv(
         symbol_eth, tf, action, exit_price,
         rsi, macd, pnl,
@@ -4286,6 +4291,7 @@ async def _auto_close_and_notify_btc(
         log(f"[NOTIFY] btc exit send warn {symbol} {tf}: {ne}")
 
     # CSV/상태 정리
+    xp = sanitize_price_for_tf(symbol, tf, xp)
     log_to_csv(
         symbol, tf, action, xp,
         rsi, macd, None,
@@ -5095,9 +5101,13 @@ async def send_timed_reports():
                     summary_msg_pdf = addon + "\n" + summary_msg_pdf
 
 
+                    display_price = current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
+                    display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
+
                     pdf_path = generate_pdf_report(
                         df=df, tf=tf, symbol=symbol_eth,
-                        signal=signal, price=closed_price, score=score,
+                        signal=signal, price=display_price, score=score,
+
                         reasons=reasons, weights=weights,
                         agree_long=agree_long, agree_short=agree_short,
                         now=datetime.now(),
@@ -5217,9 +5227,11 @@ async def send_timed_reports():
 
                     # (선택) PDF 생성 — 파일 목록에 같이 첨부
                     try:
+                        display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
+                        display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
                         pdf_path = generate_pdf_report(
                             df=df, tf=tf, symbol=symbol_btc,
-                            signal=signal, price=c_c, score=score,
+                            signal=signal, price=display_price, score=score,
                             reasons=reasons, weights=weights,
                             agree_long=agree_long, agree_short=agree_short,
                             now=datetime.now(),
@@ -5768,7 +5780,10 @@ async def on_ready():
                 else:
                     neutral_info[tf] = None
 
-                log_to_csv(symbol_eth, tf, signal, price, rsi, macd, pnl,
+                display_price = eth_live if isinstance(eth_live, (int, float)) else price
+                display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
+
+                log_to_csv(symbol_eth, tf, signal, display_price, rsi, macd, pnl,
                         entry_price=entry_price,
                         entry_time=entry_time,
                         score=score,
@@ -6048,11 +6063,15 @@ async def on_ready():
                 _entry_price = _epb[0] if _epb else None
                 _entry_time  = _epb[1] if _epb else None
 
+
+                display_price = btc_live if isinstance(btc_live, (int, float)) else price
+                display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
+
                 log_to_csv(
                     symbol_btc,
                     tf,
                     signal,
-                    price,
+                    display_price,
                     rsi,
                     macd,
                     pnl=None,
@@ -6273,12 +6292,15 @@ async def on_message(message):
         perf_file  = analyze_performance_for(symbol, tf)
         performance_file = generate_performance_stats(tf, symbol=symbol)
 
+        display_price = current_price_eth if isinstance(current_price_eth, (int, float)) else price
+        display_price = sanitize_price_for_tf(symbol, tf, display_price)
+
         pdf_path = generate_pdf_report(
             df=df,
             tf=tf,
             symbol=symbol,
             signal=signal,
-            price=price,
+            price=display_price,
             score=score,
             reasons=reasons,
             weights=weights,
@@ -6292,7 +6314,7 @@ async def on_message(message):
 
 
         # 심볼별 로그 저장
-        log_to_csv(symbol, tf, signal, price, rsi, macd, None, None, None, score, reasons, weights)
+        log_to_csv(symbol, tf, signal, display_price, rsi, macd, None, None, None, score, reasons, weights)
 
         # 빈 메시지 가드 적용
         # 보고서 안내 문구
