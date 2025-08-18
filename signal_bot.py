@@ -5095,21 +5095,16 @@ async def send_timed_reports():
                     summary_msg_pdf = addon + "\n" + summary_msg_pdf
 
 
-                    msg_for_pdf = {
-                        'main': main_msg_pdf,
-                        'summary': summary_msg_pdf,
-                        'short': None
-                    }
-
                     pdf_path = generate_pdf_report(
-                        symbol_eth, tf,
-                        main_txt=msg_for_pdf['main'],
-                        summary_txt=msg_for_pdf['summary'],
-                        short_txt=msg_for_pdf['short'],
-                        img_groups=chart_files,
-                        ichimoku_img=ichimoku_file,
-                        score_img=score_file,
-                        perf_img=perf_file
+                        df=df, tf=tf, symbol=symbol_eth,
+                        signal=signal, price=closed_price, score=score,
+                        reasons=reasons, weights=weights,
+                        agree_long=agree_long, agree_short=agree_short,
+                        now=datetime.now(),
+                        chart_imgs=chart_files, ichimoku_img=ichimoku_file,
+                        daily_change_pct=daily_change_pct,
+                        discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
+                        entry_price=entry_price_local, entry_time=entry_time_local
                     )
                     
 
@@ -5230,7 +5225,8 @@ async def send_timed_reports():
                             now=datetime.now(),
                             chart_imgs=chart_files, ichimoku_img=ichimoku_file,
                             daily_change_pct=daily_change_pct,
-                            discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf)
+                            discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
+                            entry_price=entry_price_local, entry_time=entry_time_local
                         )
                     except Exception as e:
                         log(f"PDF 생성 경고: {e}")
@@ -5266,8 +5262,9 @@ async def send_timed_reports():
                         log(f"❌ BTC 전송 오류: {e}")
 
                     # 9) 상태 업데이트(‘발송 성공’ 시점)
-                    if not score_history_btc[tf] or round(score, 1) != score_history_btc[tf][-1]:
-                        score_history_btc[tf].append(round(score, 1))
+                    hist = score_history_btc.setdefault(tf, deque(maxlen=4))
+                    if not hist or round(score, 1) != hist[-1]:
+                        hist.append(round(score, 1))
 
                     previous_signal_btc[tf] = signal
                     previous_score_btc[tf]  = score
@@ -5839,8 +5836,12 @@ async def on_ready():
 
 
                 # === (BTC) 자동 손절 / 트레일링 스탑 처리 ===
-                if previous in ['BUY', 'SELL'] and entry_data_btc[tf]:
-                    entry_price, entry_time = entry_data_btc[tf]
+                if previous in ['BUY', 'SELL']:
+                    _ep = entry_data_btc.get(tf) or (None, None)
+                    entry_price = _ep[0]
+                    entry_time  = _ep[1]
+                    if entry_price is None:
+                        continue
 
                     ref_close = float(df['close'].iloc[-1])
                     curr_price = float(price) if isinstance(price, (int, float)) else ref_close
@@ -5853,11 +5854,11 @@ async def on_ready():
                     # 트레일링 기준 갱신
                     if previous == 'BUY':
                         highest_price_btc.setdefault(tf, entry_price)
-                        if curr_high > highest_price_btc[tf]:
+                        if curr_high > highest_price_btc.get(tf, entry_price):
                             highest_price_btc[tf] = curr_high
                     elif previous == 'SELL':
                         lowest_price_btc.setdefault(tf, entry_price)
-                        if curr_low < lowest_price_btc[tf]:
+                        if curr_low < lowest_price_btc.get(tf, entry_price):
                             lowest_price_btc[tf] = curr_low
 
                     # MA 스탑 체크 함수 (ETH 예시)
@@ -5908,7 +5909,7 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 - hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 + tp_pct / 100)
-                        trail_price       = ((highest_price_btc[tf] or entry_price) * (1 - ts / 100)) if use_trail else None
+                        trail_price       = ((highest_price_btc.get(tf, entry_price) or entry_price) * (1 - ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price <= stop_price)        if stop_price else False
                         trail_hit = (curr_price <= trail_price)       if trail_price is not None else False
@@ -5947,7 +5948,7 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 + hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 - tp_pct / 100)
-                        trail_price       = ((lowest_price_btc[tf] or entry_price) * (1 + ts / 100)) if use_trail else None
+                        trail_price       = ((lowest_price_btc.get(tf, entry_price) or entry_price) * (1 + ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price >= stop_price)        if stop_price else False
                         trail_hit = (curr_price >= trail_price)       if trail_price is not None else False
@@ -5996,7 +5997,7 @@ async def on_ready():
                 now_str_btc = datetime.now().strftime("%m월 %d일 %H:%M")
                 if str(signal).startswith('BUY') or str(signal).startswith('SELL'):
                     update_entry = False
-                    prev_entry = entry_data_btc[tf]
+                    prev_entry = entry_data_btc.get(tf)
                     if previous != signal or prev_entry is None:
                         update_entry = True
                     else:
@@ -6007,14 +6008,12 @@ async def on_ready():
                             update_entry = True
                     if update_entry:
                         entry_data_btc[tf] = (price, now_str_btc)
-                        # 트레일링 기준도 같이 초기화
-                        if str(signal).startswith('BUY'):
-                            highest_price_btc[tf] = price
-                        else:
-                            lowest_price_btc[tf]  = price
+                        highest_price_btc[tf] = price
+                        lowest_price_btc[tf]  = price
 
-                if signal == previous and entry_data_btc[tf]:
-                    prev_price, _ = entry_data_btc[tf]
+                prev_entry2 = entry_data_btc.get(tf)
+                if signal == previous and prev_entry2:
+                    prev_price, _ = prev_entry2
                     prev_score = previous_score_btc.get(tf, None)
                     if prev_score is not None:
                         if signal == 'BUY':
@@ -6044,37 +6043,33 @@ async def on_ready():
                     previous_price_btc[tf]  = float(price) if isinstance(price,(int,float)) else None
                     last_candle_ts_btc[tf]  = c_ts
                     continue
-                
 
-                # BTC 로그 저장 추가
+                _epb = entry_data_btc.get(tf)
+                _entry_price = _epb[0] if _epb else None
+                _entry_time  = _epb[1] if _epb else None
+
                 log_to_csv(
-                    symbol_btc,  # ← 심볼 구분
+                    symbol_btc,
                     tf,
                     signal,
                     price,
                     rsi,
                     macd,
-                    pnl=None,  # 필요하면 계산
-                    entry_price=None,
-                    entry_time=None,
+                    pnl=None,
+                    entry_price=_entry_price,
+                    entry_time=_entry_time,
                     score=score,
                     reasons=reasons,
                     weights=weights
                 )
 
-                # 호출부 바로 위에 추가
-                _epb = entry_data_btc.get(tf)
-                _entry_time  = _epb[1] if _epb else None
-                _entry_price = _epb[0] if _epb else None
-
-                # 그리고 호출부는 이렇게 정리
                 main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
                     tf=tf, signal=signal, price=price, pnl=None, strength=reasons, df=df,
                     score=score, weights=weights, weights_detail=weights_detail, prev_score_value=previous_score_btc.get(tf),
                     agree_long=agree_long, agree_short=agree_short, daily_change_pct=daily_change_pct,
                     symbol=symbol_btc,
-                    entry_time=_entry_time,                # ✅ 지역변수로 전달
-                    entry_price=_entry_price,              # ✅ 지역변수로 전달
+                    entry_time=_entry_time,
+                    entry_price=_entry_price,
                     recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
                     live_price=btc_live  # reuse ticker for consistent short/long pricing
                 )
@@ -6101,8 +6096,9 @@ async def on_ready():
                 await channel.send(summary_msg_pdf, silent=True)
 
                 # 점수기록: 실제 발송시에만
-                if not score_history_btc[tf] or round(score,1) != score_history_btc[tf][-1]:
-                    score_history_btc[tf].append(round(score,1))
+                hist = score_history_btc.setdefault(tf, deque(maxlen=4))
+                if not hist or round(score,1) != hist[-1]:
+                    hist.append(round(score,1))
 
                 # 발송 기록 갱신
                 last_sent_ts_btc[tf]     = c_ts
