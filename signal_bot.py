@@ -229,6 +229,7 @@ def _normalize_exec_signal(sig: str) -> str:
     return "NEUTRAL"
 
 # [ANCHOR: GATEKEEPER_LOGIC]
+
 def _candidate_score(payload: dict) -> float:
     for k in ("total_score", "score", "strength", "coefficient"):
         if k in payload and isinstance(payload[k], (int, float)):
@@ -259,10 +260,12 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     g = FRAME_GATE.get(tf)
     # 새 캔들 시작 → 게이트 초기화
     if not g or int(g.get("ts", -1)) != int(candle_ts_ms):
+
         g = {
             "ts": int(candle_ts_ms),
             "cand": [payload],
             "winner": None,
+
             "obs_until": (now + obs_sec) if obs_sec > 0 else now,  # obs_sec=0이면 즉시 만료
             "target_until": 0.0,
         }
@@ -318,6 +321,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     # 최종 승자 확정
     g["winner"] = best.get("symbol")
     return payload.get("symbol") == g["winner"]
+
 
 # [ANCHOR: EVAL_PROTECTIVE_EXITS_STD]
 def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
@@ -3233,8 +3237,10 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         return
 
     # ② 게이트키퍼
+
     cand = {"symbol": symbol, "dir": exec_signal, "score": EXEC_STATE.get(('score', symbol, tf))}
     allowed = gatekeeper_offer(tf, candle_ts, cand)
+
     if not allowed:
         log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
