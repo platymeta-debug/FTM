@@ -28,6 +28,7 @@ symbol_btc = 'BTC/USDT'
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
 
+
 # === [ANCHOR: OBS_COOLDOWN_CFG] Gatekeeper/Observe/Cooldown Config ===
 def _parse_kv_numbers(val: str | None, default: dict[str, float]) -> dict[str, float]:
     d = {}
@@ -63,6 +64,7 @@ TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
 FRAME_GATE = {}       # {tf: {"ts": int, "cand": [payload...], "winner": str|None, "t0": float, "observe_until": float, "target_until": float, "flat": bool}}
 LAST_EXIT_TS = {}     # {tf: epoch_sec}
 COOLDOWN_UNTIL = {}   # {tf: epoch_sec}
+
 
 # === Console/File logging (UTF-8 safe for Windows) ===
 import logging, sys, os
@@ -227,6 +229,7 @@ def _candidate_score(payload: dict) -> float:
 
 def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     """
+
     동일 TF·동일 캔들(ts)에서 후보를 수집·선별한다.
     - 보유중(포지션 존재): 빠른 동시성 조정만(TTL=GK_TTL_HOLD_SEC)
     - 비보유(Flat): 짧은 관찰창(OBS_WINDOW_SEC[tf]) 동안 후보 수집 후 최고점수 1개만 채택
@@ -308,6 +311,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
                 top, top_s = c, s
         g["winner"] = top.get("symbol") if top else payload.get("symbol")
 
+
     return payload.get("symbol") == g["winner"]
 
 # [ANCHOR: EVAL_PROTECTIVE_EXITS_STD]
@@ -328,6 +332,7 @@ def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, s
         return False, ""
     except Exception:
         return False, ""
+
 
 def _should_notify(tf: str, score: float, price: float, curr_bucket: str, last_candle_ts: int,
                    last_sent_ts_map: dict, last_sent_bucket_map: dict,
@@ -3176,6 +3181,7 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
 async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if candle_ts is None:
         log(f"⏭ {symbol} {tf}: skip reason=DATA")
+
         return
     candle_ts_ms = int(candle_ts)
     if idem_hit(symbol, tf, candle_ts_ms):
@@ -3237,6 +3243,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             pass
         log(f"⏭ {symbol} {tf}: open pos exists → avoid overwrite")
         return
+
 
     PAPER_POS[key] = {
         "side": ("LONG" if signal == "BUY" else "SHORT"),
