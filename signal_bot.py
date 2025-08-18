@@ -51,6 +51,7 @@ ENABLE_OBSERVE = os.getenv("ENABLE_OBSERVE", "1") == "1"
 ENABLE_COOLDOWN = os.getenv("ENABLE_COOLDOWN", "1") == "1"
 STRONG_BYPASS_SCORE = float(os.getenv("STRONG_BYPASS_SCORE", "0.80"))
 GK_TTL_HOLD_SEC = float(os.getenv("GK_TTL_HOLD_SEC", "0.8"))
+GATEKEEPER_OBS_SEC = _parse_kv_numbers(os.getenv("GATEKEEPER_OBS_SEC"), {"15m": 20.0, "1h": 25.0, "4h": 40.0, "1d": 60.0})
 
 OBS_WINDOW_SEC = _parse_kv_numbers(os.getenv("OBS_WINDOW_SEC"), {"15m": 1.5, "1h": 2.0, "4h": 2.5, "1d": 3.0})
 POST_EXIT_COOLDOWN_SEC = _parse_kv_numbers(os.getenv("POST_EXIT_COOLDOWN_SEC"), {"15m": 10.0, "1h": 30.0, "4h": 60.0, "1d": 120.0})
@@ -61,7 +62,7 @@ WAIT_TARGET_SEC = _parse_kv_numbers(os.getenv("WAIT_TARGET_SEC"), {"15m": 0.0, "
 TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
-FRAME_GATE = {}       # {tf: {"ts": int, "cand": [payload...], "winner": str|None, "t0": float, "observe_until": float, "target_until": float, "flat": bool}}
+FRAME_GATE = {}       # {tf: {"ts": int, "first_seen_ms": int, "obs_until_ms": int, "target_until_ms": int, "cand": [payload...], "winner": tuple|None}}
 LAST_EXIT_TS = {}     # {tf: epoch_sec}
 COOLDOWN_UNTIL = {}   # {tf: epoch_sec}
 
@@ -237,90 +238,67 @@ def _candidate_score(payload: dict) -> float:
     return 0.0
 
 def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
-    """
-    동일 TF·동일 캔들(ts)에서 ETH/BTC 등 다수 후보가 들어와도
-    - 관찰윈도우(OBS) 동안은 비교 대기
-    - 단일 후보만 존재해도 OBS 경과 시 자동 통과
-    - (옵션) 강한 신호는 즉시 통과
-    - (옵션) 목표점수 대기(소프트/하드)
-    """
-    now = time.monotonic()
-
-    # ENV 파라미터
-    obs_map = parse_tf_map(os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60"))
-    obs_sec = float(obs_map.get(tf, 0) or 0)
-
-    wait_enable = str(os.getenv("WAIT_TARGET_ENABLE", "0")) == "1"
-    target_map = parse_tf_map(os.getenv("TARGET_SCORE_BY_TF", "15m:0,1h:0,4h:0,1d:0"))
-    wait_map = parse_tf_map(os.getenv("WAIT_TARGET_SEC", "15m:0,1h:0,4h:0,1d:0"))
-    mode = (os.getenv("TARGET_WAIT_MODE", "SOFT") or "SOFT").upper()  # SOFT|HARD
-
-    strong_bypass = float(os.getenv("STRONG_BYPASS_SCORE", "0") or 0.0)
+    """게이트키퍼 V3: 동일 TF·캔들 내 후보 경쟁/관찰"""
+    now_ms = int(time.time() * 1000)
+    score = float(payload.get("score") or 0.0)
 
     g = FRAME_GATE.get(tf)
-    # 새 캔들 시작 → 게이트 초기화
     if not g or int(g.get("ts", -1)) != int(candle_ts_ms):
-
         g = {
             "ts": int(candle_ts_ms),
+            "first_seen_ms": now_ms,
+            "obs_until_ms": now_ms + int(float(GATEKEEPER_OBS_SEC.get(tf, 0.0)) * 1000),
+            "target_until_ms": (
+                now_ms + int(float(WAIT_TARGET_SEC.get(tf, 0.0)) * 1000)
+                if WAIT_TARGET_ENABLE else 0
+            ),
             "cand": [payload],
             "winner": None,
-
-            "obs_until": (now + obs_sec) if obs_sec > 0 else now,  # obs_sec=0이면 즉시 만료
-            "target_until": 0.0,
         }
         FRAME_GATE[tf] = g
-        # 첫 후보라도 강한 신호면 우선 통과
-        if strong_bypass and abs(_candidate_score(payload)) >= strong_bypass:
-            g["winner"] = payload.get("symbol")
+        if STRONG_BYPASS_SCORE and abs(score) >= STRONG_BYPASS_SCORE:
+            g["winner"] = (payload.get("symbol"), payload.get("dir"))
             return True
-        # 관찰윈도우 동안은 보류
         return False
 
-    # 같은 캔들 → 후보 누적
+    if g.get("winner"):
+        return (payload.get("symbol"), payload.get("dir")) == g["winner"]
+
     g["cand"].append(payload)
 
-    # 이미 승자 결정됨 → 해당 심볼만 True
-    if g.get("winner"):
-        return payload.get("symbol") == g["winner"]
+    if STRONG_BYPASS_SCORE:
+        best = max(g["cand"], key=lambda c: abs(float(c.get("score") or 0)))
+        if abs(float(best.get("score") or 0)) >= STRONG_BYPASS_SCORE:
+            g["winner"] = (best.get("symbol"), best.get("dir"))
+            return (payload.get("symbol"), payload.get("dir")) == g["winner"]
 
-    # 관찰윈도우 진행 중
-    if now < float(g.get("obs_until") or 0):
-        # 도중에 강한 신호 들어오면 즉시 우선 통과
-        if strong_bypass:
-            best = max(g["cand"], key=lambda c: abs(_candidate_score(c)))
-            if abs(_candidate_score(best)) >= strong_bypass:
-                g["winner"] = best.get("symbol")
-                return payload.get("symbol") == g["winner"]
-        return False
+    if len(g["cand"]) >= 2:
+        best = max(g["cand"], key=lambda c: abs(float(c.get("score") or 0)))
+        g["winner"] = (best.get("symbol"), best.get("dir"))
+        log(f"[GATE] {tf} decide winner={best.get('symbol')} by score")
+        return (payload.get("symbol"), payload.get("dir")) == g["winner"]
 
-    # 관찰윈도우 종료 → 현재까지 최고 점수 승자 선정
-    best = max(g["cand"], key=lambda c: abs(_candidate_score(c)))
-    best_score = abs(_candidate_score(best))
+    if now_ms >= g.get("obs_until_ms", 0):
+        target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
+        if WAIT_TARGET_ENABLE:
+            if TARGET_WAIT_MODE == "HARD":
+                if score >= target:
+                    g["winner"] = (payload.get("symbol"), payload.get("dir"))
+                    log(f"[GATE] {tf} single-candidate release (obs passed, mode=HARD, score={score:.2f})")
+                    return True
+                return False
+            else:  # SOFT
+                if score >= target or now_ms >= g.get("target_until_ms", 0):
+                    if score < target:
+                        log(f"[GATE] {tf} single-candidate release (obs passed, mode=SOFT, score={score:.2f})")
+                    g["winner"] = (payload.get("symbol"), payload.get("dir"))
+                    return True
+                return False
+        g["winner"] = (payload.get("symbol"), payload.get("dir"))
+        log(f"[GATE] {tf} single-candidate release (obs passed, mode={TARGET_WAIT_MODE}, score={score:.2f})")
+        return True
 
-    # (옵션) 목표 점수 대기
-    if wait_enable and mode in ("SOFT", "HARD"):
-        target = float(target_map.get(tf, 0) or 0.0)
-        wsec = float(wait_map.get(tf, 0) or 0.0)
-        # 최초 진입 대기 타이머 설정
-        if (wsec > 0) and (g.get("target_until", 0) == 0):
-            g["target_until"] = now + wsec
-
-        # 하드 모드: 목표 미달이면 타이머 내내 보류
-        if mode == "HARD" and target > 0 and best_score < target and now < g["target_until"]:
-            return False
-
-        # 소프트 모드: 목표 미달이더라도 타이머 만료 시 통과
-        # (그 전에 STRONG_BYPASS에 걸리면 즉시 통과)
-        if mode == "SOFT" and target > 0 and best_score < target and now < g["target_until"]:
-            if strong_bypass and best_score >= strong_bypass:
-                g["winner"] = best.get("symbol")
-                return payload.get("symbol") == g["winner"]
-            return False
-
-    # 최종 승자 확정
-    g["winner"] = best.get("symbol")
-    return payload.get("symbol") == g["winner"]
+    return False
 
 
 # [ANCHOR: EVAL_PROTECTIVE_EXITS_STD]
@@ -3194,18 +3172,21 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
                 ARMED_SIGNAL.pop(key, None)
                 ARMED_TS.pop(key, None)
 async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
+    # [ANCHOR: ENTRY_CORE_V3_BEGIN]
+    log(f"[ENTRY_V3] {symbol} {tf} state=pre")
     if candle_ts is None:
         log(f"⏭ {symbol} {tf}: skip reason=DATA")
-
         return
     candle_ts = int(candle_ts)
     if idem_hit(symbol, tf, candle_ts):
         log(f"⏭ {symbol} {tf}: skip (already executed this candle)")
         log(f"⏭ {symbol} {tf}: skip reason=IDEMP")
         return
-    # [ANCHOR: NORMALIZE_EXEC_SIGNAL_CALL]
-    exec_signal = _normalize_exec_signal(signal)
-    if exec_signal not in ("BUY", "SELL"):
+    # --- normalize strong/weak signals ---
+    _BUY_SET = {"BUY", "STRONG BUY", "WEAK BUY"}
+    _SELL_SET = {"SELL", "STRONG SELL", "WEAK SELL"}
+    exec_signal = "BUY" if signal in _BUY_SET else ("SELL" if signal in _SELL_SET else None)
+    if exec_signal is None:
         log(f"⏭ {symbol} {tf}: skip (signal={signal})")
         log(f"⏭ {symbol} {tf}: skip reason=NEUTRAL")
         return
@@ -3286,6 +3267,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
     # [ANCHOR: IDEMP_MARK_BEFORE_RETURN]
     idem_mark(symbol, tf, candle_ts)
+    # [ANCHOR: ENTRY_CORE_V3_END]
 
 # 모듈 로드 시점에 한 번 생성 (라이브 모드에서만 의미 있음)
 try:
@@ -4419,7 +4401,6 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
                 reason=str(reason or "CLOSE"),
                 mode="futures",
                 pnl_pct=pnl_pct,
-                status="✅ 선물 청산"
             )
 
         except Exception as ne:
@@ -4462,6 +4443,7 @@ async def _auto_close_and_notify_eth(
 
     pnl = None
 
+    ep = float(entry_price or 0.0)
 
     # 선물 청산 먼저
     executed = await futures_close_all(symbol_eth, tf, exit_price=exit_price, reason=action_reason)
@@ -4481,12 +4463,11 @@ async def _auto_close_and_notify_eth(
         await _notify_trade_exit(
             symbol_eth, tf,
             side=side_guess,
-            entry_price=float(ep),
+            entry_price=ep,
             exit_price=float(exit_price),
             reason=str(action_reason),
             mode=("futures" if status.startswith("✅") else "paper"),
-            pnl_pct=float(pnl),
-            status=status
+            pnl_pct=float(pnl)
         )
     except Exception as e:
         log(f"[NOTIFY] paper/fut exit (ETH) warn {symbol_eth} {tf}: {e}")
@@ -4549,7 +4530,7 @@ async def _auto_close_and_notify_btc(
             side=previous_signal_btc.get(tf, ""),  # 있으면 사용
             entry_price=ep, exit_price=xp,
             reason=action_reason, mode="futures",
-            pnl_pct=pnl_pct, status=status
+            pnl_pct=pnl_pct
         )
     except Exception as ne:
         log(f"[NOTIFY] btc exit send warn {symbol} {tf}: {ne}")
@@ -4580,15 +4561,18 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
 
     if not (AUTO_TRADE and TRADE_MODE == "futures"):
         return
-    if signal not in ("BUY", "SELL"):
+    _BUY_SET = {"BUY", "STRONG BUY", "WEAK BUY"}
+    _SELL_SET = {"SELL", "STRONG SELL", "WEAK SELL"}
+    exec_signal = "BUY" if signal in _BUY_SET else ("SELL" if signal in _SELL_SET else None)
+    if exec_signal is None:
         return
     
     # --- TF 후보 선정: 같은 TF에서 더 우수한 심볼만 허용 ---
     if not ALLOW_BOTH_PER_TF:
         # 아직 해당 TF에 열린 포지션이 없다면, 후보비교로 더 좋은 쪽만 통과
         if not FUT_POS_TF.get(tf) and not PAPER_POS_TF.get(tf):
-            if not _is_best_candidate(symbol, tf, signal):
-                log(f"[FUT] skip {symbol} {tf} {signal}: better candidate exists")
+            if not _is_best_candidate(symbol, tf, exec_signal):
+                log(f"[FUT] skip {symbol} {tf} {exec_signal}: better candidate exists")
                 return
 
     ex = FUT_EXCHANGE
@@ -4597,8 +4581,8 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     
     # --- 헤지(듀얼) 모드 신호 정책: LONG_ONLY/SHORT_ONLY/BOTH ---
     try:
-        if not _hedge_side_allowed(symbol, tf, signal):
-            log(f"[FUT] skip {symbol} {tf} {signal}: hedge side policy")
+        if not _hedge_side_allowed(symbol, tf, exec_signal):
+            log(f"[FUT] skip {symbol} {tf} {exec_signal}: hedge side policy")
             return
     except Exception as e:
         log(f"[FUT] hedge policy warn {symbol} {tf}: {e}")
@@ -4629,7 +4613,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     if sig > 0:
         diff_pct = abs(cur - sig) / sig * 100.0
         if diff_pct > float(limit_pct):
-            log(f"[FUT] skip {symbol} {tf} {signal}: slippage {diff_pct:.2f}% > {limit_pct:.2f}%")
+            log(f"[FUT] skip {symbol} {tf} {exec_signal}: slippage {diff_pct:.2f}% > {limit_pct:.2f}%")
             return
 
 
@@ -4642,16 +4626,16 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         local_score = EXEC_STATE.get(('score', symbol, tf))
     except Exception:
         pass
-    _record_signal(symbol, tf, signal, local_score)
+    _record_signal(symbol, tf, exec_signal, local_score)
 
     # 2) 기본 증거금(총자본 × TF배분)
     base_margin = _margin_for_tf(tf)  # TOTAL_CAPITAL_USDT * ALLOC_TF[tf] or fallback(FUT_MGN_USDT)
 
     # 3) 강도 가중
-    sf = _strength_factor(signal, local_score)
+    sf = _strength_factor(exec_signal, local_score)
 
     # 4) 상위 TF 바이어스
-    mf, all_align = _mtf_factor(symbol, tf, signal)
+    mf, all_align = _mtf_factor(symbol, tf, exec_signal)
 
     # 5) 최종 증거금 비율
     frac = min(1.0, sf * mf)
@@ -4669,7 +4653,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             f"• MTF계수: ×{mf:.2f} (all_align={all_align})\n"
             f"• 최종 증거금: ${eff_margin:.2f}"
         )
-        log(f"[ALLOC-DEBUG] {symbol} {tf} {signal} req_lev={req_lev} limits={limits} -> qty≈{qty:.6f}")
+        log(f"[ALLOC-DEBUG] {symbol} {tf} {exec_signal} req_lev={req_lev} limits={limits} -> qty≈{qty:.6f}")
 
     # 6) 수량 계산(레버리지 상한 반영) → 정밀도/최소노치오날 체크
     qty_raw = _qty_from_margin_eff2(ex, symbol, last, eff_margin, tf)
@@ -4683,12 +4667,12 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     pos_qty, pos_side, pos_entry = await _fetch_pos_qty(ex, symbol)
 
     # 반대면 청산
-    if pos_side and ((signal == "BUY" and pos_side == "SHORT") or (signal == "SELL" and pos_side == "LONG")):
+    if pos_side and ((exec_signal == "BUY" and pos_side == "SHORT") or (exec_signal == "SELL" and pos_side == "LONG")):
         await futures_close_all(symbol, tf, exit_price=last, reason="REVERSE")
 
     # 진입
     try:
-        if signal == "BUY":
+        if exec_signal == "BUY":
             ord_ = await _market(ex, symbol, 'buy', qty, reduceOnly=False)
             # LONG
             FUT_POS[symbol] = {'side': 'LONG', 'qty': float(qty), 'entry': float(last), 'opened_ts': int(time.time()*1000)}
@@ -4716,7 +4700,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             limits  = _market_limits(ex, symbol)
             lev_used = int(_clamp(req_lev, 1, int(limits.get('max_lev') or 125)))
             await _notify_trade_entry(
-                symbol, tf, signal, mode="futures",
+                symbol, tf, exec_signal, mode="futures",
                 price=float(last), qty=float(qty),
                 base_margin=float(base_margin),
                 eff_margin=float(
@@ -6528,10 +6512,11 @@ async def on_message(message):
                 target_left = 0
                 try:
                     import time
-                    if gate.get("obs_until"):
-                        obs_left = max(0, int(gate["obs_until"] - time.monotonic()))
-                    if gate.get("target_until"):
-                        target_left = max(0, int(gate["target_until"] - time.monotonic()))
+                    now_ms = int(time.time() * 1000)
+                    if gate.get("obs_until_ms"):
+                        obs_left = max(0, int((gate["obs_until_ms"] - now_ms) / 1000))
+                    if gate.get("target_until_ms"):
+                        target_left = max(0, int((gate["target_until_ms"] - now_ms) / 1000))
                 except Exception:
                     pass
                 lines.append(
