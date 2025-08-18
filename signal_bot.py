@@ -28,6 +28,42 @@ symbol_btc = 'BTC/USDT'
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
 
+# === [ANCHOR: OBS_COOLDOWN_CFG] Gatekeeper/Observe/Cooldown Config ===
+def _parse_kv_numbers(val: str | None, default: dict[str, float]) -> dict[str, float]:
+    d = {}
+    try:
+        for part in str(val or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            d[k] = float(v)
+    except Exception:
+        pass
+    return d or default
+
+ENABLE_OBSERVE = os.getenv("ENABLE_OBSERVE", "1") == "1"
+ENABLE_COOLDOWN = os.getenv("ENABLE_COOLDOWN", "1") == "1"
+STRONG_BYPASS_SCORE = float(os.getenv("STRONG_BYPASS_SCORE", "0.80"))
+GK_TTL_HOLD_SEC = float(os.getenv("GK_TTL_HOLD_SEC", "0.8"))
+
+OBS_WINDOW_SEC = _parse_kv_numbers(os.getenv("OBS_WINDOW_SEC"), {"15m": 1.5, "1h": 2.0, "4h": 2.5, "1d": 3.0})
+POST_EXIT_COOLDOWN_SEC = _parse_kv_numbers(os.getenv("POST_EXIT_COOLDOWN_SEC"), {"15m": 10.0, "1h": 30.0, "4h": 60.0, "1d": 120.0})
+
+WAIT_TARGET_ENABLE = os.getenv("WAIT_TARGET_ENABLE", "1") == "1"
+TARGET_SCORE_BY_TF = _parse_kv_numbers(os.getenv("TARGET_SCORE_BY_TF"), {"15m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0})
+WAIT_TARGET_SEC = _parse_kv_numbers(os.getenv("WAIT_TARGET_SEC"), {"15m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0})
+TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
+
+# === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
+FRAME_GATE = {}       # {tf: {"ts": int, "cand": [payload...], "winner": str|None, "t0": float, "observe_until": float, "target_until": float, "flat": bool}}
+LAST_EXIT_TS = {}     # {tf: epoch_sec}
+COOLDOWN_UNTIL = {}   # {tf: epoch_sec}
+
 # === Console/File logging (UTF-8 safe for Windows) ===
 import logging, sys, os
 
@@ -180,6 +216,118 @@ def _score_bucket(score, cfg):
         return "NEUTRAL"
     except Exception:
         return None
+
+# [ANCHOR: GATEKEEPER_LOGIC]
+def _candidate_score(payload: dict) -> float:
+    # score 우선순위: 'total_score' > 'strength' > 'coefficient' > 0
+    for k in ("total_score","score","strength","coefficient"):
+        if k in payload and isinstance(payload[k], (int,float)):
+            return float(payload[k])
+    return 0.0
+
+def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
+    """
+    동일 TF·동일 캔들(ts)에서 후보를 수집·선별한다.
+    - 보유중(포지션 존재): 빠른 동시성 조정만(TTL=GK_TTL_HOLD_SEC)
+    - 비보유(Flat): 짧은 관찰창(OBS_WINDOW_SEC[tf]) 동안 후보 수집 후 최고점수 1개만 채택
+    - 청산 직후: COOLDOWN_UNTIL[tf] 이전엔 진입 금지
+    - 강한 신호(|score|>=STRONG_BYPASS_SCORE): 관찰/쿨다운을 무시하고 즉시 통과
+    (PART 2의 '목표 점수 대기'는 아래에서 함께 처리)
+    """
+    import time
+    now = time.time()
+    ts = int(candle_ts_ms)
+
+    # 포지션 보유 여부 계산(해당 TF에 어떤 심볼이든 점유 중인지)
+    holding = bool((PAPER_POS_TF and PAPER_POS_TF.get(tf)) or (FUT_POS_TF and FUT_POS_TF.get(tf)))
+    flat = not holding
+
+    # 청산 직후 쿨다운
+    if ENABLE_COOLDOWN and (now < float(COOLDOWN_UNTIL.get(tf, 0.0))):
+        log(f"⏭ {payload.get('symbol')} {tf}: skip (cooldown)")
+        return False
+
+    # 강한 신호 바이패스
+    score = float(payload.get("score") or 0.0)
+    if abs(score) >= float(STRONG_BYPASS_SCORE):
+        return True
+
+    # 프레임/관찰창 초기화
+    g = FRAME_GATE.get(tf)
+    ttl = float(GK_TTL_HOLD_SEC if holding else (OBS_WINDOW_SEC.get(tf, GK_TTL_HOLD_SEC) if ENABLE_OBSERVE else 0.0))
+    if (not g) or g.get("ts") != ts:
+        g = {"ts": ts, "cand": [payload], "winner": None, "t0": now,
+             "observe_until": now + ttl, "target_until": now + float(WAIT_TARGET_SEC.get(tf, 0.0)),
+             "flat": flat}
+        FRAME_GATE[tf] = g
+        # 보유 중이면 첫 후보도 바로 True(빠른 처리)
+        if holding:
+            return True
+        # 비보유면 관찰창 시작: 첫 후보는 일단 보류
+        if not ENABLE_OBSERVE:
+            g["winner"] = payload.get("symbol")
+            return True
+        return False
+
+    # 같은 캔들 → 후보 추가
+    g["cand"].append(payload)
+
+    # 보유 중(holding): 짧은 TTL 후 승자 결정(대개 True)
+    if holding:
+        if not g.get("winner") and (now - float(g["t0"])) >= GK_TTL_HOLD_SEC:
+            a, b = g["cand"][0], g["cand"][1] if len(g["cand"]) > 1 else g["cand"][0]
+            sa = abs(float(a.get("score") or 0.0)); sb = abs(float(b.get("score") or 0.0))
+            g["winner"] = (a if sa >= sb else b).get("symbol")
+        return payload.get("symbol") == g.get("winner", payload.get("symbol"))
+
+    # 비보유(flat): 관찰창 종료 시점까지 두 후보 수집
+    if ENABLE_OBSERVE and now < float(g.get("observe_until") or now):
+        return False  # 관찰 중
+
+    # 관찰창 종료 → 후보 결정
+    if not g.get("winner"):
+
+        # === [ANCHOR: TARGET_SCORE_WAIT] 목표 점수 충족 대기 ===
+        if WAIT_TARGET_ENABLE and g.get("flat", False):
+            target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
+            if target > 0.0:
+                top_curr = max([abs(float(c.get("score") or 0.0)) for c in g["cand"]] or [0.0])
+                if time.time() < float(g.get("target_until") or 0.0) and top_curr < target:
+                    log(f"⏳ {tf}: target-wait (best={top_curr:.2f} < target={target:.2f})")
+                    return False
+                if TARGET_WAIT_MODE == "HARD" and top_curr < target:
+                    log(f"⛔ {tf}: target-not-met (best={top_curr:.2f} < target={target:.2f})")
+                    FRAME_GATE.pop(tf, None)
+                    return False
+                # SOFT 모드: 관찰창/대기 종료 시점에 best 후보로 진행
+
+        top = None; top_s = -1
+        for c in g["cand"]:
+            s = abs(float(c.get("score") or 0.0))
+            if s > top_s:
+                top, top_s = c, s
+        g["winner"] = top.get("symbol") if top else payload.get("symbol")
+
+    return payload.get("symbol") == g["winner"]
+
+# [ANCHOR: EVAL_PROTECTIVE_EXITS_STD]
+def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
+    """TP/SL 충족 여부를 판단하여 (hit, reason)를 반환한다. hit=True면 reason∈{'TP','SL'}"""
+    try:
+        tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
+        sl_pct = float((HARD_STOP_PCT   or {}).get(tf, 0.0))
+        if not (isinstance(entry, (int, float)) and isinstance(price, (int, float))):
+            return False, ""
+        side_u = str(side).upper()
+        if side_u in ("LONG", "BUY"):
+            if tp_pct and price >= entry * (1 + tp_pct/100.0): return True, "TP"
+            if sl_pct and price <= entry * (1 - sl_pct/100.0): return True, "SL"
+        else:
+            if tp_pct and price <= entry * (1 - tp_pct/100.0): return True, "TP"
+            if sl_pct and price >= entry * (1 + sl_pct/100.0): return True, "SL"
+        return False, ""
+    except Exception:
+        return False, ""
 
 def _should_notify(tf: str, score: float, price: float, curr_bucket: str, last_candle_ts: int,
                    last_sent_ts_map: dict, last_sent_bucket_map: dict,
@@ -2986,24 +3134,6 @@ def _min_notional_ok(ex, symbol, price, amount):
 
 
 
-def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
-    tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
-    sl_pct = float((HARD_STOP_PCT or {}).get(tf, 0.0))
-    if not entry or not price:
-        return False, ""
-    if side == "LONG":
-        if tp_pct and price >= entry * (1 + tp_pct/100):
-            return True, "TP"
-        if sl_pct and price <= entry * (1 - sl_pct/100):
-            return True, "SL"
-    else:
-        if tp_pct and price <= entry * (1 - tp_pct/100):
-            return True, "TP"
-        if sl_pct and price >= entry * (1 + sl_pct/100):
-            return True, "SL"
-    return False, ""
-
-
 async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, entry_map):
     key = (symbol, tf)
     state = TRIGGER_STATE.get(key, 'FLAT')
@@ -3043,198 +3173,91 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
                 ARMED_SIGNAL.pop(key, None)
                 ARMED_TS.pop(key, None)
 # signal_bot.py
-async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts= None):
-
-    # --- same-candle re-entry guard (symbol+tf+closed-candle) ---
-    effective_ts = candle_ts if candle_ts is not None else candle_ts
-    if effective_ts is None:
-        log(f"[IDEMP] {symbol} {tf} {signal} missing candle_ts → skip for safety")
-        return
-
-    # ms로 들어왔으면 초 단위로 변환
-    if effective_ts > 10_000_000_000:
-        effective_ts = int(effective_ts // 1000)
-
-    key = (symbol, tf)
-    if ENTERED_CANDLE.get(key) == effective_ts:
-        log(f"[SKIP] duplicate in same candle {symbol} {tf} {effective_ts}")
-        return
-
-    # 같은 캔들 재진입 가드 (paper/spot/futures 공통)
-    if candle_ts is not None:
-        if ENTERED_CANDLE.get((symbol, tf)) == candle_ts:
-            log(f"[SKIP] duplicate in same candle {symbol} {tf} {candle_ts}")
-            return
-
-    # === [PATCH] 캔들 시각 단위 중복 진입 방지 ===============================
+async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if candle_ts is None:
-        log(f"[IDEMP] {symbol} {tf} {signal} missing candle_ts → skip for safety")
+        log(f"⏭ {symbol} {tf}: skip reason=DATA")
         return
-    if _idem_seen(symbol, tf, candle_ts, signal):
-        log(f"[IDEMP] skip {symbol} {tf} {signal} @ {candle_ts} (already executed)")
-        return
-    # ========================================================================
-
-    
-    # [PATCH-③] 같은 캔들에서 중복 진입 금지 (분봉 시작시간 기준)
-    import time
-    def _tf_secs(tf_):
-        return {'15m':900,'1h':3600,'4h':14400,'1d':86400}.get(tf_, 3600)
-    now_ms = int(time.time()*1000)
-    open_ms = (now_ms // (_tf_secs(tf)*1000)) * (_tf_secs(tf)*1000)
-    k = (symbol, tf)
-    if ENTERED_CANDLE.get(k) == open_ms:
-        log(f"[PAPER] skip {symbol} {tf}: duplicate entry in the same candle")
-        ENTERED_CANDLE[(symbol, tf)] = candle_ts
-        return
-
-    # ✅ 페이퍼 모드는 AUTO_TRADE=0 이어도 동작하도록 허용
-    if TRADE_MODE != "paper" and not AUTO_TRADE:
+    candle_ts_ms = int(candle_ts)
+    if idem_hit(symbol, tf, candle_ts_ms):
+        log(f"⏭ {symbol} {tf}: skip (already executed this candle)")
+        log(f"⏭ {symbol} {tf}: skip reason=IDEMP")
         return
     if signal not in ("BUY", "SELL"):
+        log(f"⏭ {symbol} {tf}: skip (signal={signal})")
+        log(f"⏭ {symbol} {tf}: skip reason=NEUTRAL")
         return
 
-    key = (symbol, tf)
-    last_done = EXEC_STATE.get(key, {}).get('last_signal')
-    if last_done == signal:
-        return
-
-    # Paper mode or no exchange -> just log
-    if TRADE_MODE == "paper" or not GLOBAL_EXCHANGE:
-        # ① 라우팅 가드 (ETH/ BTC 제한)
-        if not _route_allows(symbol, tf):
-            log(f"[PAPER] block {symbol} {tf}: route disallow")
+    # [ANCHOR: PROTECTIVE_CHECK_BEFORE_ENTRY]
+    key = f"{symbol}|{tf}"
+    pos = (PAPER_POS or {}).get(key)
+    if pos:
+        side  = str(pos.get("side", "")).upper()
+        entry = float(pos.get("entry") or 0)
+        hit, reason = _eval_tp_sl(side, float(entry), float(last_price), tf)
+        if hit:
+            await _notify_trade_exit(symbol, tf, side=side, entry_price=entry, exit_price=float(last_price), reason=(reason or "TP/SL"), mode=("paper" if TRADE_MODE!="futures" else "futures"))
+            PAPER_POS.pop(key, None); _save_json(PAPER_POS_FILE, PAPER_POS)
+            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+            log(f"⏭ {symbol} {tf}: exited by {reason}, skip new entry this tick")
+            log(f"⏭ {symbol} {tf}: skip reason=PROTECT")
+            return
+        else:
+            log(f"⏭ {symbol} {tf}: open pos exists → skip new entry")
+            log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
 
-        # --- TF 후보 선정: 같은 TF에서 더 우수한 심볼만 허용 (페이퍼/현물) ---
-        if tf not in IGNORE_OCCUPANCY_TFS and not ALLOW_BOTH_PER_TF:
-            if not PAPER_POS_TF.get(tf) and not FUT_POS_TF.get(tf):
-                if not _is_best_candidate(symbol, tf, signal):
-                    log(f"[PAPER] skip {symbol} {tf} {signal}: better candidate exists")
-                    ENTERED_CANDLE[(symbol, tf)] = candle_ts
-                    return
-
-        # ② 같은 TF 단일점유(옵션)
-        if tf not in IGNORE_OCCUPANCY_TFS and not ALLOW_BOTH_PER_TF:
-            other_paper = PAPER_POS_TF.get(tf)
-            other_fut   = FUT_POS_TF.get(tf)
-            other = next((x for x in (other_paper, other_fut) if x and x != symbol), None)
-            if other:
-                log(f"[PAPER] skip {symbol} {tf}: TF already occupied by {other}")
-                ENTERED_CANDLE[(symbol, tf)] = candle_ts
-                return
-
-
-        # ③ 알림 프리뷰 & 전송
-        try:
-            prev = _preview_allocation_and_qty(symbol, tf, signal, float(last_price), ex=None)
-            await _notify_trade_entry(
-                symbol, tf, signal,
-                mode="spot", price=float(last_price),
-                qty=float(prev.get('qty', 0.0)),
-                base_margin=prev['base_margin'], eff_margin=prev['eff_margin'],
-                lev_used=prev['lev_used'],
-                score=EXEC_STATE.get(('score', symbol, tf))
-            )
-            # 🔒 같은 캔들 재진입 방지 플래그
-            if candle_ts is not None:
-                ENTERED_CANDLE[(symbol, tf)] = int(candle_ts)
-
-        except Exception as e:
-            log(f"[NOTIFY] paper entry warn {symbol} {tf}: {e}")
-
-
-        # ④ 페이퍼 점유 상태 기록(동시 진입 방지)
-        PAPER_POS_TF[tf] = symbol
-        _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
-
-        key = f"{symbol}|{tf}"
-        PAPER_POS[key] = {
-            "side": ("LONG" if signal == "BUY" else "SHORT"),
-            "entry": float(last_price),
-            "opened_ts": int((candle_ts or 0) * 1000) or int(time.time()*1000),
-            "high": float(last_price),
-            "low":  float(last_price)
-        }
-        _save_json(PAPER_POS_FILE, PAPER_POS)
-
-        # ⑤ 로깅
-        os.makedirs("logs", exist_ok=True)
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        with open("logs/paper_trades.csv", "a", encoding="utf-8") as f:
-            f.write(f"{now},{symbol},{tf},{signal},{last_price}\n")
-        EXEC_STATE[(symbol, tf)] = {'last_signal': signal, 'ts': datetime.now().isoformat()}
-        log(f"[PAPER] {symbol} {tf} {signal} @ {last_price}")
-        ENTERED_CANDLE[(symbol, tf)] = candle_ts
+    cand = {"symbol": symbol, "dir": signal, "score": float(EXEC_STATE.get(('score', symbol, tf)) or 0.0)}
+    allowed = gatekeeper_offer(tf, candle_ts_ms, cand)
+    if not allowed:
+        import time
+        why = "cooldown" if time.time() < float(COOLDOWN_UNTIL.get(tf, 0.0) or 0.0) else ("observe" if FRAME_GATE.get(tf, {}).get("flat") else "hold-ttl")
+        log(f"⏸ {symbol} {tf}: pending gatekeeper ({why})")
+        log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
-    
-    # 최종적으로 진입이 확정된 시점에서 마킹
-    _idem_mark(symbol, tf, candle_ts, signal)
-    _idem_prune(5000)
 
+    if not _route_allows(symbol, tf):
+        log(f"⏭ {symbol} {tf}: skip reason=ROUTE")
+        return
 
-    ex = GLOBAL_EXCHANGE
-    try:
-        bal = await _fetch_balance_safe(ex)
-        base, quote = symbol.split("/")[0], symbol.split("/")[1]
+    if tf not in IGNORE_OCCUPANCY_TFS and PAPER_POS_TF.get(tf):
+        log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
+        return
 
-        if signal == "BUY":
-            usdt_free = float(bal.get('free', {}).get(quote, 0.0))
-            use_usdt  = min(usdt_free, RISK_USDT)
-            if use_usdt < MIN_NOTIONAL:
-                log(f"[SKIP] {symbol} {tf} BUY: free_{quote}={usdt_free:.2f} < min_notional={MIN_NOTIONAL}")
-                return
-            raw_amount = use_usdt / float(last_price)
-            amount     = _amount_to_precision(ex, symbol, raw_amount)
-            if not _min_notional_ok(ex, symbol, float(last_price), amount):
-                log(f"[SKIP] {symbol} {tf} BUY: notional below min")
-                return
-            order = await _market_buy(ex, symbol, amount)
-            log(f"[FILLED] BUY {symbol} {tf}: {order}")
-            ENTERED_CANDLE[(symbol, tf)] = candle_ts
-        else:
-            base_free = float(bal.get('free', {}).get(base, 0.0))
-            if base_free <= 0:
-                log(f"[SKIP] {symbol} {tf} SELL: free_{base}=0")
-                return
-            amount = _amount_to_precision(ex, symbol, base_free)
-            if not _min_notional_ok(ex, symbol, float(last_price), amount):
-                log(f"[SKIP] {symbol} {tf} SELL: notional below min")
-                return
-            order = await _market_sell(ex, symbol, amount)
-            log(f"[FILLED] SELL {symbol} {tf}: {order}")
-            ENTERED_CANDLE[(symbol, tf)] = candle_ts
+    PAPER_POS_TF[tf] = symbol
+    _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
 
-        # 최종적으로 진입이 확정된 시점에서 마킹
-        _idem_mark(symbol, tf, candle_ts, signal)
-        _idem_prune(5000)
+    # [ANCHOR: AVOID_OVERWRITE_OPEN_POS]
+    existing = (PAPER_POS or {}).get(key)
+    if existing:
+        try:
+            existing["high"] = max(float(existing.get("high") or 0), float(last_price))
+            existing["low"]  = min(float(existing.get("low")  or 1e30), float(last_price))
+            _save_json(PAPER_POS_FILE, PAPER_POS)
+        except Exception:
+            pass
+        log(f"⏭ {symbol} {tf}: open pos exists → avoid overwrite")
+        return
 
+    PAPER_POS[key] = {
+        "side": ("LONG" if signal == "BUY" else "SHORT"),
+        "entry": float(last_price),
+        "opened_ts": candle_ts_ms*1000,
+        "high": float(last_price),
+        "low": float(last_price)
+    }
+    _save_json(PAPER_POS_FILE, PAPER_POS)
 
-        EXEC_STATE[(symbol, tf)] = {
-            'last_signal': signal,
-            'last_candle_ts': int(candle_ts),
-            'ts': datetime.now().isoformat()
-        }
+    await _notify_trade_entry(
+        symbol, tf, signal,
+        mode="paper", price=float(last_price),
+        qty=0.0,
+        base_margin=0, eff_margin=0,
+        lev_used=0,
+        score=EXEC_STATE.get(('score', symbol, tf))
+    )
 
-        # (체결 후) 디스코드 알림
-        prev = _preview_allocation_and_qty(symbol, tf, signal, float(last_price), ex=ex)
-        await _notify_trade_entry(
-            symbol, tf, signal,
-            mode="futures", price=float(last_price),
-            qty=float(prev.get('qty', 0.0)),
-            base_margin=prev['base_margin'], eff_margin=prev['eff_margin'],
-            lev_used=prev['lev_used'],
-            score=EXEC_STATE.get(('score', symbol, tf))
-        )
-
-        # 🔒 같은 캔들 재진입 방지 플래그
-        if candle_ts is not None:
-            ENTERED_CANDLE[(symbol, tf)] = int(candle_ts)
-
-    except Exception as e:
-        log(f"[NOTIFY] futures entry warn {symbol} {tf}: {e}")
-
-
+    # [ANCHOR: IDEMP_MARK_BEFORE_RETURN]
+    idem_mark(symbol, tf, candle_ts_ms)
 
 # 모듈 로드 시점에 한 번 생성 (라이브 모드에서만 의미 있음)
 try:
@@ -3549,7 +3572,7 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
 # === 라우팅(ETH/BTC) & 동시 TF 제한 ===
 ROUTE_BY_TF_RAW   = os.getenv("ROUTE_BY_TF", "")  # 예: "15m:ETH,1h:BTC,4h:AUTO,1d:AUTO"
 ALLOW_BOTH_PER_TF = os.getenv("ALLOW_BOTH_PER_TF", "0") == "1"
-IGNORE_OCCUPANCY_TFS = {'1d'}
+IGNORE_OCCUPANCY_TFS = set([x.strip() for x in os.getenv("IGNORE_OCCUPANCY_TFS","" ).split(",") if x.strip()])
 
 DEBOUNCE_SEC   = int(os.getenv('DEBOUNCE_SEC', '10'))
 COOLDOWN_SEC   = int(os.getenv('COOLDOWN_SEC', '30'))
@@ -3591,7 +3614,6 @@ import os, json
 
 os.makedirs("logs", exist_ok=True)
 
-IDEMP_FILE    = "logs/idemp_keys.json"
 OPEN_POS_FILE = "logs/futures_positions.json"      # 심볼 보유 추적
 OPEN_TF_FILE  = "logs/futures_positions_tf.json"   # TF별 점유 심볼 추적
 
@@ -3609,48 +3631,25 @@ def _save_json(path, obj):
     except Exception as e:
         log(f"[WARN] json save fail {path}: {e}")
 
-# === [PATCH] Idempotence helpers (캔들 시각 단위 중복 진입 방지) ===============
-# ⬇️ 이 블록은 IDEMP_FILE / _load_json / _save_json 정의 아래에 추가하세요.
-try:
-    IDEMP_KEYS
-except NameError:
-    IDEMP_KEYS = _load_json(IDEMP_FILE, {})  # 재시작 후에도 유지
+# === [ANCHOR: IDEMP_UTILS] 아이템포턴스(중복진입 방지) 유틸 ===
+IDEMP_FILE = "logs/idempotence.json"
+_IDEMP = _load_json(IDEMP_FILE, {})  # dict: key -> 1
 
-def _idem_key(symbol: str, tf: str, candle_ts: int, signal: str) -> str:
-    return f"{symbol}|{tf}|{int(candle_ts)}|{signal.upper()}"
+def _idem_key(symbol: str, tf: str, candle_ts_ms: int) -> str:
+    return f"{symbol}|{tf}|{int(candle_ts_ms)}"
 
-def _idem_seen(symbol: str, tf: str, candle_ts: int, signal: str) -> bool:
+def idem_hit(symbol: str, tf: str, candle_ts_ms: int) -> bool:
     try:
-        k = _idem_key(symbol, tf, candle_ts, signal)
-        return bool(IDEMP_KEYS.get(k))
+        return _IDEMP.get(_idem_key(symbol, tf, candle_ts_ms), 0) == 1
     except Exception:
         return False
 
-def _idem_mark(symbol: str, tf: str, candle_ts: int, signal: str):
+def idem_mark(symbol: str, tf: str, candle_ts_ms: int):
     try:
-        k = _idem_key(symbol, tf, candle_ts, signal)
-        IDEMP_KEYS[k] = datetime.now().isoformat()
-        _save_json(IDEMP_FILE, IDEMP_KEYS)
-    except Exception as e:
-        log(f"[IDEMP] save warn: {e}")
-
-def _idem_prune(max_keep: int = 5000):
-    """키가 너무 많아지면 오래된 것부터 정리"""
-    try:
-        if len(IDEMP_KEYS) <= max_keep:
-            return
-        # timestamp 값으로 정렬 후 앞쪽 제거
-        items = sorted(
-            IDEMP_KEYS.items(),
-            key=lambda kv: kv[1]
-        )
-        drop = len(items) - max_keep
-        for i in range(drop):
-            del IDEMP_KEYS[items[i][0]]
-        _save_json(IDEMP_FILE, IDEMP_KEYS)
-    except Exception as e:
-        log(f"[IDEMP] prune warn: {e}")
-# ===============================================================================
+        _IDEMP[_idem_key(symbol, tf, candle_ts_ms)] = 1
+        _save_json(IDEMP_FILE, _IDEMP)
+    except Exception:
+        pass
 
 PAPER_POS_TF_FILE = "logs/paper_positions_tf.json"
 PAPER_POS_TF = _load_json(PAPER_POS_TF_FILE, {})   # key: tf -> symbol (paper 전용)
@@ -3658,9 +3657,27 @@ PAPER_POS_TF = _load_json(PAPER_POS_TF_FILE, {})   # key: tf -> symbol (paper �
 PAPER_POS_FILE = "logs/paper_positions.json"
 PAPER_POS = _load_json(PAPER_POS_FILE, {})   # key: f"{symbol}|{tf}" -> {side, entry, opened_ts, high, low}
 
-IDEMP_KEYS = _load_json(IDEMP_FILE, {"keys": []})
 FUT_POS    = _load_json(OPEN_POS_FILE, {})         # symbol -> {'side','qty','entry'}
 FUT_POS_TF = _load_json(OPEN_TF_FILE, {})          # tf -> "BTC/USDT" 또는 "ETH/USDT"
+
+# [ANCHOR: HYDRATE_FROM_DISK_BEGIN]
+def _hydrate_from_disk():
+    try:
+        # 페이퍼 포지션/점유 복원
+        global PAPER_POS, PAPER_POS_TF
+        if 'PAPER_POS' in globals():
+            for k, v in (PAPER_POS or {}).items():
+                try:
+                    sym, tf = k.split("|", 1)
+                    # TF 점유가 비어있으면 복원
+                    if not PAPER_POS_TF.get(tf):
+                        PAPER_POS_TF[tf] = sym
+                except Exception:
+                    continue
+        _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+    except Exception as e:
+        log(f"[HYDRATE] warn: {e}")
+# [ANCHOR: HYDRATE_FROM_DISK_END]
 
 # === Margin Switch Queue: 포지션/오더 때문에 실패한 마진 전환을 예약 ===
 MARGIN_Q_FILE = "logs/margin_switch_queue.json"
@@ -3776,20 +3793,6 @@ FUT_ORDERS = {}      # (symbol, tf) -> {'tp': order_id, 'sl': order_id}
 FUT_POS_TF = _load_json(OPEN_TF_FILE, {})  # key: tf -> symbol
 os.makedirs("logs", exist_ok=True)
 
-
-IDEMP_KEYS = _load_json(IDEMP_FILE, {"keys": []})
-FUT_POS    = _load_json(OPEN_POS_FILE, {})  # key: symbol -> {'side': 'LONG'/'SHORT', 'qty': float, 'entry': float}
-FUT_POS_TF = _load_json(OPEN_TF_FILE, {})   # key: tf -> "BTC/USDT" 또는 "ETH/USDT"
-
-def _idem_key(symbol, tf, candle_ts, signal):
-    return f"{symbol}|{tf}|{int(candle_ts)}|{signal}"
-
-def _remember_idem(key, keep=500):
-    IDEMP_KEYS["keys"] = (IDEMP_KEYS.get("keys") or [])[-keep:] + [key]
-    _save_json(IDEMP_FILE, IDEMP_KEYS)
-
-def _idem_exists(key):
-    return key in (IDEMP_KEYS.get("keys") or [])
 
 def _ppct(p, q):  # % 차이
     try:
@@ -4333,6 +4336,16 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
     except Exception as e:
         log(f"[NOTIFY] trade exit warn {symbol} {tf}: {e}")
 
+    # [ANCHOR: SET_COOLDOWN_ON_EXIT]
+    try:
+        if ENABLE_COOLDOWN:
+            import time
+            LAST_EXIT_TS[tf] = time.time()
+            COOLDOWN_UNTIL[tf] = LAST_EXIT_TS[tf] + float(POST_EXIT_COOLDOWN_SEC.get(tf, 0.0))
+            log(f"⏳ cooldown set: {tf} until {COOLDOWN_UNTIL[tf]:.0f}")
+    except Exception:
+        pass
+
 
 async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool:
     ex = FUT_EXCHANGE
@@ -4568,11 +4581,6 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     except Exception as e:
         log(f"[FUT] margin queue sweep warn: {e}")
 
-    # idem 체크
-    key = _idem_key(symbol, tf, candle_ts, signal)
-    if _idem_exists(key):
-        return
-    
     # 라우팅 가드
     if not _route_allows(symbol, tf):
         return
@@ -5465,13 +5473,11 @@ async def send_timed_reports():
                         show_risk=False
                     )
 
-                    display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
-                    display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
+                    display_price = sanitize_price_for_tf(symbol_btc, tf, c_c)
 
                     # (선택) PDF 생성 — 파일 목록에 같이 첨부
                     try:
-                        display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
-                        display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
+                        display_price = sanitize_price_for_tf(symbol_btc, tf, c_c)
                         pdf_path = generate_pdf_report(
                             df=df, tf=tf, symbol=symbol_btc,
                             signal=signal, price=display_price, score=score,
@@ -5584,6 +5590,7 @@ async def on_ready():
         return
     client.startup_done = True
 
+    _hydrate_from_disk()
     await _sync_open_state_on_ready()
     asyncio.create_task(init_analysis_tasks())
     
@@ -6597,8 +6604,7 @@ async def on_message(message):
         perf_file  = analyze_performance_for(symbol, tf)
         performance_file = generate_performance_stats(tf, symbol=symbol)
 
-        display_price = current_price_eth if isinstance(current_price_eth, (int, float)) else price
-        display_price = sanitize_price_for_tf(symbol, tf, display_price)
+        display_price = sanitize_price_for_tf(symbol, tf, price)
 
         pdf_path = generate_pdf_report(
             df=df,
