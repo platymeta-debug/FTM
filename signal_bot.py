@@ -62,6 +62,7 @@ WAIT_TARGET_SEC = _parse_kv_numbers(os.getenv("WAIT_TARGET_SEC"), {"15m": 0.0, "
 TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
+
 FRAME_GATE = {}       # {tf: {"ts": int, "cand": [dict], "winner": str|None, "obs_until": int, "tgt_until": int}}
 LAST_EXIT_TS = {}     # {tf: epoch_sec}
 COOLDOWN_UNTIL = {}   # {tf: epoch_sec}
@@ -240,6 +241,7 @@ def _parse_tf_map(s: str, cast=float):
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+
 def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
     """
     OBS/TARGET-aware selector per TF & candle:
@@ -267,8 +269,10 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
             pass
         return 0.0
 
+
     now_ms = _now_ms()
     g = FRAME_GATE.get(tf)
+
 
     # New candle → open frame
     if (not g) or int(g.get("ts", -1)) != int(candle_ts_ms):
@@ -323,6 +327,7 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
     g["winner"] = cand.get("symbol")
     return True
 # [ANCHOR: GATEKEEPER_V3_END]
+
 
 
 # [ANCHOR: NORMALIZE_EXEC_SIGNAL]
@@ -3215,9 +3220,11 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip (already executed this candle)")
         log(f"⏭ {symbol} {tf}: skip reason=IDEMP")
         return
-    # [ANCHOR: NORMALIZE_EXEC_SIGNAL_CALL]
-    exec_signal = _normalize_exec_signal(signal)
-    if exec_signal not in ("BUY", "SELL"):
+    # --- normalize strong/weak signals ---
+    _BUY_SET = {"BUY", "STRONG BUY", "WEAK BUY"}
+    _SELL_SET = {"SELL", "STRONG SELL", "WEAK SELL"}
+    exec_signal = "BUY" if signal in _BUY_SET else ("SELL" if signal in _SELL_SET else None)
+    if exec_signal is None:
         log(f"⏭ {symbol} {tf}: skip (signal={signal})")
         log(f"⏭ {symbol} {tf}: skip reason=NEUTRAL")
         return
@@ -4478,7 +4485,9 @@ async def _auto_close_and_notify_eth(
 
     pnl = None
 
+
     # [ANCHOR: EXIT_NOTIFY_FIX_BEGIN]
+
     ep = float(entry_price or 0.0)
 
     # 선물 청산 먼저
@@ -4506,6 +4515,7 @@ async def _auto_close_and_notify_eth(
             mode=("futures" if is_futures else "paper"),
             pnl_pct=(float(pnl) if pnl is not None else None),
             status=status_text
+
         )
     except Exception as e:
         log(f"[NOTIFY] paper/fut exit (ETH) warn {symbol_eth} {tf}: {e}")
@@ -4600,6 +4610,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
 
     if not (AUTO_TRADE and TRADE_MODE == "futures"):
         return
+
     exec_signal = _normalize_exec_signal(signal)
     if exec_signal not in ("BUY", "SELL"):
         return
@@ -6520,6 +6531,7 @@ async def on_message(message):
                       (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None)
                 gate = FRAME_GATE.get(tf, {})
                 cd   = COOLDOWN_UNTIL.get(tf, 0)
+
                 obs_left = _remain_sec(gate.get("obs_until"))
                 tgt_left = _remain_sec(gate.get("tgt_until"))
                 lines.append(
