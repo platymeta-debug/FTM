@@ -247,12 +247,12 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     now = time.monotonic()
 
     # ENV 파라미터
-    obs_map = parse_tf_map(os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60"))
+    obs_map = _parse_tf_map(os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60"))
     obs_sec = float(obs_map.get(tf, 0) or 0)
 
     wait_enable = str(os.getenv("WAIT_TARGET_ENABLE", "0")) == "1"
-    target_map = parse_tf_map(os.getenv("TARGET_SCORE_BY_TF", "15m:0,1h:0,4h:0,1d:0"))
-    wait_map = parse_tf_map(os.getenv("WAIT_TARGET_SEC", "15m:0,1h:0,4h:0,1d:0"))
+    target_map = _parse_tf_map(os.getenv("TARGET_SCORE_BY_TF", "15m:0,1h:0,4h:0,1d:0"))
+    wait_map = _parse_tf_map(os.getenv("WAIT_TARGET_SEC", "15m:0,1h:0,4h:0,1d:0"))
     mode = (os.getenv("TARGET_WAIT_MODE", "SOFT") or "SOFT").upper()  # SOFT|HARD
 
     strong_bypass = float(os.getenv("STRONG_BYPASS_SCORE", "0") or 0.0)
