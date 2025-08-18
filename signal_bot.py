@@ -220,13 +220,11 @@ def _score_bucket(score, cfg):
         return None
 
 # [ANCHOR: GATEKEEPER_LOGIC]
-# [PATCH B1: GATEKEEPER_OBS_PARSER]
-def _obs_ms_for(tf: str) -> int:
+def _obs_secs_for(tf: str) -> int:
     """
-    GATEKEEPER_OBS_SEC="15m:15,1h:25,4h:40,1d:60" 형식 파싱 → ms 반환
-    없으면 TF별 기본값 사용(15m:20,1h:25,4h:40,1d:60)
+    Parse GATEKEEPER_OBS_SEC="15m:20,1h:25,4h:40,1d:60" to seconds per TF.
+    Fallback defaults: 15m=20, 1h=25, 4h=40, 1d=60.
     """
-    import os
     raw = os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60")
     try:
         parts = [p.strip() for p in raw.split(",") if ":" in p]
@@ -234,83 +232,95 @@ def _obs_ms_for(tf: str) -> int:
     except Exception:
         kv = {}
     default = {"15m": 20, "1h": 25, "4h": 40, "1d": 60}
-    sec = kv.get(tf, default.get(tf, 20))
-    return int(sec) * 1000
+    return int(kv.get(tf, default.get(tf, 20)))
 
-# [PATCH B2: GATEKEEPER_OBS_LOGIC]
-def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
+def _gk_debug(msg: str):
+    if os.getenv("GK_DEBUG", "0") == "1":
+        try:
+            log(f"[GK] {msg}")
+        except Exception:
+            print(f"[GK] {msg}")
+
+def gatekeeper_offer(tf: str, candle_ts: int, payload: dict) -> bool:
     """
-    동일 TF·동일 캔들(ts)에서 후보를 수집·선별한다.
-    - 첫 후보만 있는 상태로 관찰시간(OBS) 경과 → 단일 후보 승자 확정(True)
-    - 두 후보가 들어오면 점수 비교(abs)로 승자 1개만 True
-    - winner 확정 후에는 해당 심볼만 True
+    Single TF & candle frame selector:
+    - When the frame opens (first candidate), we start an OBS window; if no rival arrives
+      by OBS expiry, the single candidate becomes the winner.
+    - If two candidates arrive within the same frame, pick the one with larger |score|.
+    - Optional TARGET wait (flat only): wait up to target_until to meet per-TF threshold.
     """
     import time
-    now_ms = int(time.time() * 1000)
-    ts = int(candle_ts_ms)
+    now = time.monotonic()         # monotonic seconds for waiting logic
+    ts = int(candle_ts)            # treat as SECONDS for frame identity
 
     g = FRAME_GATE.get(tf)
     if (not g) or g.get("ts") != ts:
-        # 새 캔들 프레임 시작
-
-        flat = not ((PAPER_POS_TF.get(tf) if 'PAPER_POS_TF' in globals() else None) or (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None))
-        target_wait = float(WAIT_TARGET_SEC.get(tf, 0.0))
+        # Flat state: neither PAPER nor FUT positions occupy this TF
+        holding = bool((PAPER_POS_TF.get(tf) if 'PAPER_POS_TF' in globals() else None) or
+                       (FUT_POS_TF.get(tf)   if 'FUT_POS_TF'   in globals() else None))
+        flat = (not holding)
+        obs_sec = _obs_secs_for(tf)
+        tgt_sec = float(WAIT_TARGET_SEC.get(tf, 0.0)) if (WAIT_TARGET_ENABLE and flat) else 0.0
         g = {
             "ts": ts,
             "cand": [payload],
             "winner": None,
-            "first_seen_ms": now_ms,
+            "obs_until": now + obs_sec,
+            "target_until": (now + tgt_sec) if tgt_sec > 0 else 0.0,
             "flat": flat,
-            "target_until": (time.time() + target_wait) if (flat and target_wait > 0) else 0.0,
         }
-
         FRAME_GATE[tf] = g
-        # 첫 후보는 일단 보류
+        _gk_debug(f"{tf} frame-open: obs={obs_sec}s target_wait={tgt_sec}s flat={flat} cand=1")
         return False
 
-    # 같은 캔들에서 후속 호출
-    # 1) 단일 후보로 OBS 경과 시 → 단일 후보 승자 확정
-    if len(g["cand"]) == 1 and not g.get("winner"):
-        if (now_ms - int(g.get("first_seen_ms") or now_ms)) >= _obs_ms_for(tf):
 
-            # [ANCHOR: TARGET_SCORE_WAIT]
-            if WAIT_TARGET_ENABLE and g.get("flat", False):
-                target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
-                if target > 0.0:
-                    best = 0.0
-                    for c in g["cand"]:
-                        s = float(c.get("score") or 0.0)
-                        diru = str(c.get("dir"," ")).upper()
-                        ds = s if diru in ("BUY","LONG") else (-s)
-                        if ds > best:
-                            best = ds
-                    now = time.time()
-                    if now < float(g.get("target_until") or 0.0) and best < target:
-                        log(f"⏳ {tf}: target-wait (best={best:.2f} < target={target:.2f})")
-                        return False
-                    if TARGET_WAIT_MODE == "HARD" and best < target:
-                        log(f"⛔ {tf}: target-not-met (best={best:.2f} < target={target:.2f})")
-                        FRAME_GATE.pop(tf, None)
-                        return False
-
-            log(f"[GK] {tf}: OBS passed single-candidate → {g['cand'][0].get('symbol')}")
-            g["winner"] = g["cand"][0].get("symbol")
-            return payload.get("symbol") == g["winner"]
-
-    # 2) 후보 추가
-    g["cand"].append(payload)
-
-    # 3) 이미 승자 있으면 그 심볼만 통과
+    # same frame
+    # 1) if winner already set, allow only that symbol
     if g.get("winner"):
         return payload.get("symbol") == g["winner"]
 
-    # 4) 두 후보 비교로 승자 결정 (점수 절댓값 큰 쪽)
-    a, b = g["cand"][0], g["cand"][1] if len(g["cand"]) > 1 else g["cand"][0]
-    sa = abs(float(a.get("score") or 0.0))
-    sb = abs(float(b.get("score") or 0.0))
-    g["winner"] = (a if sa >= sb else b).get("symbol")
+    # 2) add this candidate
 
-    return payload.get("symbol") == g["winner"]
+    g["cand"].append(payload)
+
+    # 3) if two (or more) candidates exist, decide immediately by |score|
+    if len(g["cand"]) >= 2:
+        a, b = g["cand"][0], g["cand"][1]
+        sa = abs(float(a.get("score") or 0.0))
+        sb = abs(float(b.get("score") or 0.0))
+        g["winner"] = (a if sa >= sb else b).get("symbol")
+        _gk_debug(f"{tf} two-candidate decision → winner={g['winner']} (|sa|={sa:.2f}, |sb|={sb:.2f})")
+        return payload.get("symbol") == g["winner"]
+
+    # 4) single-candidate path → if OBS expired, check TARGET, then pass-through
+    if now >= float(g.get("obs_until") or now):
+        # TARGET wait (flat only)
+        if WAIT_TARGET_ENABLE and g.get("flat", False):
+            target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
+            if target > 0.0:
+                # directional best: BUY uses +score, SELL uses -score
+                best = 0.0
+                for c in g["cand"]:
+                    s = float(c.get("score") or 0.0)
+                    diru = str(c.get("dir","" )).upper()
+                    ds = s if diru in ("BUY","LONG") else (-s)
+                    if ds > best:
+                        best = ds
+                if (float(g.get("target_until") or 0.0) > 0.0) and (now < float(g["target_until"])) and best < target:
+                    _gk_debug(f"{tf} target-wait: best={best:.2f} < target={target:.2f} (waiting)")
+                    return False
+                if TARGET_WAIT_MODE == "HARD" and best < target:
+                    _gk_debug(f"{tf} target-not-met: best={best:.2f} < target={target:.2f} (HARD skip this candle)")
+                    FRAME_GATE.pop(tf, None)
+                    return False
+
+        # pass-through single candidate
+        g["winner"] = g["cand"][0].get("symbol")
+        _gk_debug(f"{tf} OBS expired→ single-candidate winner={g['winner']}")
+        return payload.get("symbol") == g["winner"]
+
+    # 5) still within OBS window → keep waiting
+    return False
 
 # [ANCHOR: EVAL_PROTECTIVE_EXITS_STD]
 def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
@@ -3182,14 +3192,13 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
                 TRIGGER_STATE[key] = 'FLAT'
                 ARMED_SIGNAL.pop(key, None)
                 ARMED_TS.pop(key, None)
-# signal_bot.py
 async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if candle_ts is None:
         log(f"⏭ {symbol} {tf}: skip reason=DATA")
 
         return
-    candle_ts_ms = int(candle_ts)
-    if idem_hit(symbol, tf, candle_ts_ms):
+    candle_ts = int(candle_ts)
+    if idem_hit(symbol, tf, candle_ts):
         log(f"⏭ {symbol} {tf}: skip (already executed this candle)")
         log(f"⏭ {symbol} {tf}: skip reason=IDEMP")
         return
@@ -3226,7 +3235,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
     # ② 게이트키퍼
     cand = {"symbol": symbol, "dir": signal, "score": EXEC_STATE.get(('score', symbol, tf))}
-    allowed = gatekeeper_offer(tf, candle_ts_ms, cand)
+
+    allowed = gatekeeper_offer(tf, candle_ts, cand)
+
     if not allowed:
         log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
@@ -3255,7 +3266,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     PAPER_POS[key] = {
         "side": ("LONG" if signal == "BUY" else "SHORT"),
         "entry": float(last_price),
-        "opened_ts": candle_ts_ms*1000,
+        "opened_ts": candle_ts*1000,
         "high": float(last_price),
         "low": float(last_price)
     }
@@ -3271,7 +3282,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     )
 
     # [ANCHOR: IDEMP_MARK_BEFORE_RETURN]
-    idem_mark(symbol, tf, candle_ts_ms)
+    idem_mark(symbol, tf, candle_ts)
 
 # 모듈 로드 시점에 한 번 생성 (라이브 모드에서만 의미 있음)
 try:
@@ -3649,18 +3660,18 @@ def _save_json(path, obj):
 IDEMP_FILE = "logs/idempotence.json"
 _IDEMP = _load_json(IDEMP_FILE, {})  # dict: key -> 1
 
-def _idem_key(symbol: str, tf: str, candle_ts_ms: int) -> str:
-    return f"{symbol}|{tf}|{int(candle_ts_ms)}"
+def _idem_key(symbol: str, tf: str, candle_ts: int) -> str:
+    return f"{symbol}|{tf}|{int(candle_ts)}"
 
-def idem_hit(symbol: str, tf: str, candle_ts_ms: int) -> bool:
+def idem_hit(symbol: str, tf: str, candle_ts: int) -> bool:
     try:
-        return _IDEMP.get(_idem_key(symbol, tf, candle_ts_ms), 0) == 1
+        return _IDEMP.get(_idem_key(symbol, tf, candle_ts), 0) == 1
     except Exception:
         return False
 
-def idem_mark(symbol: str, tf: str, candle_ts_ms: int):
+def idem_mark(symbol: str, tf: str, candle_ts: int):
     try:
-        _IDEMP[_idem_key(symbol, tf, candle_ts_ms)] = 1
+        _IDEMP[_idem_key(symbol, tf, candle_ts)] = 1
         _save_json(IDEMP_FILE, _IDEMP)
     except Exception:
         pass
@@ -6510,9 +6521,20 @@ async def on_message(message):
                       (FUT_POS_TF.get(tf) if 'FUT_POS_TF' in globals() else None)
                 gate = FRAME_GATE.get(tf, {})
                 cd   = COOLDOWN_UNTIL.get(tf, 0)
+                obs_left = 0
+                target_left = 0
+                try:
+                    import time
+                    if gate.get("obs_until"):
+                        obs_left = max(0, int(gate["obs_until"] - time.monotonic()))
+                    if gate.get("target_until"):
+                        target_left = max(0, int(gate["target_until"] - time.monotonic()))
+                except Exception:
+                    pass
                 lines.append(
                     f"· {tf}: occ={occ or '-'} | cooldown={(max(0,int(cd-time.time())) if cd else 0)}s "
-                    f"| gate(ts={gate.get('ts','-')}, cand={len(gate.get('cand',[]))}, winner={gate.get('winner','-')})"
+                    f"| gate(ts={gate.get('ts','-')}, cand={len(gate.get('cand',[]))}, winner={gate.get('winner','-')}, "
+                    f"obs={obs_left}s, tgt={target_left}s)"
                 )
             await message.channel.send("\n".join(lines))
         except Exception as e:
