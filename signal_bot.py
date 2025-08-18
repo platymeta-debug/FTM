@@ -273,12 +273,14 @@ def gatekeeper_offer(tf: str, candle_ts: int, payload: dict) -> bool:
         _gk_debug(f"{tf} frame-open: obs={obs_sec}s target_wait={tgt_sec}s flat={flat} cand=1")
         return False
 
+
     # same frame
     # 1) if winner already set, allow only that symbol
     if g.get("winner"):
         return payload.get("symbol") == g["winner"]
 
     # 2) add this candidate
+
     g["cand"].append(payload)
 
     # 3) if two (or more) candidates exist, decide immediately by |score|
@@ -3233,7 +3235,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
     # ② 게이트키퍼
     cand = {"symbol": symbol, "dir": signal, "score": EXEC_STATE.get(('score', symbol, tf))}
+
     allowed = gatekeeper_offer(tf, candle_ts, cand)
+
     if not allowed:
         log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
