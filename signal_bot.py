@@ -72,6 +72,38 @@ def log(msg: str):
 
 
 
+# === [ANCHOR: DAILY_CHANGE_UTILS] 일봉 변동률 유틸 (단일 기준) ===
+DAILY_OPEN_CACHE = {}  # {symbol: {"open": float, "ts": epoch_seconds}}
+DAILY_OPEN_TTL = 60  # seconds
+
+async def get_daily_open(symbol: str) -> float | None:
+    now = int(time.time())
+    rec = DAILY_OPEN_CACHE.get(symbol)
+    if rec and (now - rec.get("ts", 0) < DAILY_OPEN_TTL):
+        return rec.get("open")
+
+    try:
+        df_1d = await safe_get_ohlcv(symbol, '1d', limit=1)
+        if _len(df_1d) >= 1:
+            val = float(df_1d['open'].iloc[-1])
+            DAILY_OPEN_CACHE[symbol] = {"open": val, "ts": now}
+            return val
+    except Exception:
+        pass
+    return None
+
+async def compute_daily_change_pct(symbol: str, price_ref: float | None) -> float | None:
+    """하루 시작가(1d open) 대비 변동률을 단일 방식으로 산출"""
+    try:
+        if not isinstance(price_ref, (int, float)) or price_ref <= 0:
+            return None
+        dopen = await get_daily_open(symbol)
+        if dopen and dopen > 0:
+            return ((float(price_ref) - dopen) / dopen) * 100.0
+    except Exception:
+        pass
+    return None
+
 # === 안전 인덱싱 유틸 ===
 def _closed_i(df):
     # 닫힌 봉 인덱스: 최소 2개 이상일 때 -2, 아니면 -1
@@ -459,6 +491,44 @@ def detect_market_regime(tf='1h'):
     return label, ctx
 
 # === 실시간 가격(티커) 유틸 ===
+ # === [ANCHOR: PRICE_SNAPSHOT_UTIL] 심볼별 라이브 프라이스 스냅샷 (공통 현재가) ===
+PRICE_SNAPSHOT = {}  # {symbol: {"ts": ms, "last": float|None, "bid": float|None, "ask": float|None, "mid": float|None, "chosen": float|None}}
+PRICE_SNAPSHOT_TTL_MS = 500  # 동일 틱 처리용 짧은 TTL
+
+async def get_price_snapshot(symbol: str) -> dict:
+    """
+    전 TF(15m/1h/4h/1d)에서 동일하게 쓸 '현재가 스냅샷'을 만든다.
+    chosen = mid(가능) 또는 last(대체). 실패 시 None.
+    """
+    now_ms = int(time.time() * 1000)
+    rec = PRICE_SNAPSHOT.get(symbol)
+    if rec and (now_ms - rec.get("ts", 0) < PRICE_SNAPSHOT_TTL_MS):
+        return rec
+
+    # 1) 선물 모드면 선물 인스턴스 우선, 2) 아니면 스팟 티커
+    last = bid = ask = mid = chosen = None
+    try:
+        ex = FUT_EXCHANGE if (TRADE_MODE == "futures" and FUT_EXCHANGE) else None
+        if ex:
+            t = await _post(ex.fetch_ticker, symbol)
+            last = float(t.get('last') or 0) or None
+            bid  = float(t.get('bid')  or 0) or None
+            ask  = float(t.get('ask')  or 0) or None
+        else:
+            last = float(fetch_live_price(symbol) or 0) or None
+    except Exception:
+        pass
+
+    if bid and ask:
+        try:
+            mid = (bid + ask) / 2.0
+        except Exception:
+            mid = None
+
+    chosen = mid or last
+    PRICE_SNAPSHOT[symbol] = {"ts": now_ms, "last": last, "bid": bid, "ask": ask, "mid": mid, "chosen": chosen}
+    return PRICE_SNAPSHOT[symbol]
+
 def fetch_live_price(symbol: str) -> float | None:
     try:
         ex = ccxt.binance({
@@ -968,6 +1038,10 @@ highest_price = {'15m': None, '1h': None, '4h': None, '1d': None}
 lowest_price = {'15m': None, '1h': None, '4h': None, '1d': None}
 neutral_info = {'15m': None, '1h': None, '4h': None, '1d': None}
 
+TRIGGER_STATE = defaultdict(lambda: 'FLAT')  # key: (symbol, tf) -> FLAT/ARMED/CONFIRMED
+ARMED_SIGNAL = {}
+ARMED_TS = {}
+
 os.makedirs("logs", exist_ok=True)
 os.makedirs("images", exist_ok=True)
 
@@ -989,6 +1063,23 @@ def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
+
+
+# === [UTIL] calc_daily_change_pct — 퍼포먼스 스냅샷과 동일식 ===
+def calc_daily_change_pct(symbol: str, current_price: float | None) -> float | None:
+    """
+    퍼포먼스 스냅샷과 동일한 방식으로 1일 변동률을 계산한다.
+    식: (현재가 - 전일 종가) / 전일 종가 * 100
+    """
+    try:
+        d1 = get_ohlcv(symbol, '1d', limit=3)
+        if d1 is None or len(d1) < 2:
+            return None
+        prev_close = float(d1['close'].iloc[-2])   # 전일 종가
+        curr = float(current_price) if isinstance(current_price, (int, float)) else float(d1['close'].iloc[-1])
+        return ((curr - prev_close) / prev_close) * 100.0 if prev_close else None
+    except Exception:
+        return None
 
 
 def add_indicators(df):
@@ -1140,6 +1231,19 @@ def add_indicators(df):
     
     return df
 
+# === [DOC] 분석 점수 산출 기준 =========================================
+# - 기본 가격: 닫힌 캔들 종가(close_for_calc) 사용 (intrabar_confirm 모드에서도 신호/로그는 닫힌 캔들)
+# - 지표/가중(예시):
+#   • Ichimoku: 구름 위치(+/-1), 전환/기준 교차(+/-0.5), 종가 vs 기준선(+0.5), 치코우 vs 과거가(+/-0.5)
+#   • RSI: 과매수/과매도 존, 극단 마진 보정(타임프레임별 임계치 보정)
+#   • MACD: 시그널 교차/히스토그램 기여
+#   • ADX(+DI/-DI): 추세 강도/방향
+#   • StochRSI(K/D): 모멘텀
+#   • MFI/OBV/Bollinger/SuperTrend: 보조 기여
+# - 버킷 컷오프(CFG):
+#   STRONG BUY/BUY/NEUTRAL/SELL/STRONG SELL 경계값은 CFG["strong_cut"], ["buy_cut"], ["sell_cut"], ["strong_sell_cut"] 사용
+# - agree_long/agree_short: 상위TF 정렬은 close 값 기준(닫힌 캔들)
+# ======================================================================
 
 def calculate_signal(df, tf, symbol):
 
@@ -1652,7 +1756,7 @@ def ichimoku_analysis(df):
 
 # ==== 퍼포먼스 스냅샷 빌더 ====
 def build_performance_snapshot(
-    tf, symbol, price, *,
+    tf, symbol, display_price, *,
     daily_change_pct=None,      # format_signal_message에서 넘겨줌
     recent_scores=None          # 최근 점수 리스트(예: [2.1, 2.4, ...])
 ) -> str:
@@ -1679,7 +1783,7 @@ def build_performance_snapshot(
             if d1 is None or len(d1) <= (k+1): 
                 return None
             prev = float(d1['close'].iloc[-(k+1)])
-            curr = float(price) if isinstance(price, (int, float)) else float(d1['close'].iloc[-1])
+            curr = float(display_price) if isinstance(display_price, (int, float)) else float(d1['close'].iloc[-1])
             return ((curr - prev) / prev) * 100.0 if prev else None
         except Exception:
             return None
@@ -1706,8 +1810,8 @@ def build_performance_snapshot(
     # 본문 구성
     sym = (symbol or "ETH/USDT").split('/')[0].upper()
     tf_tag = tf.upper()
-    usd_str = _fmt_usd(price) if isinstance(price, (int, float)) else "$-"
-    krw_str = usd_to_krw(price) if isinstance(price, (int, float)) else "₩-"
+    usd_str = _fmt_usd(display_price) if isinstance(display_price, (int, float)) else "$-"
+    krw_str = usd_to_krw(display_price) if isinstance(display_price, (int, float)) else "₩-"
 
     lines = []
     lines.append("## 📈 **퍼포먼스 스냅샷**")
@@ -1955,7 +2059,8 @@ def format_signal_message(
     daily_change_pct=None,
     score_history=None,
     recent_scores=None,
-    live_price=None
+    live_price=None,
+    show_risk: bool = False
 ):
     tf_str = {'15m': '15분봉', '1h': '1시간봉', '4h': '4시간봉', '1d': '일봉'}[tf]
     now_str = datetime.now().strftime("%m월 %d일 %H:%M")
@@ -2032,15 +2137,17 @@ def format_signal_message(
             basis_price = float(last_close)  # 최후 폴백: 종가
 
 
-    # ✅ 손절/익절/트레일링/MA 스탑 (표시용)
-    main_msg += "\n### 📌 손절·익절·트레일링" 
+    # [ANCHOR: risk_section_guard_begin]
+    risk_msg = ""
+    if show_risk:
+        risk_msg += "\n### 📌 손절·익절·트레일링"
 
-    if basis_price is not None:
-        sig_is_buy = str(signal).startswith("BUY")
+        if basis_price is not None:
+            sig_is_buy = str(signal).startswith("BUY")
 
-        _cfg = globals()
-        hs_on  = (_cfg.get('USE_HARD_STOP', {}) or {}).get(tf, True)
-        hs_pct = (_cfg.get('HARD_STOP_PCT', {}) or {}).get(tf, 3.0)
+            _cfg = globals()
+            hs_on  = (_cfg.get('USE_HARD_STOP', {}) or {}).get(tf, True)
+            hs_pct = (_cfg.get('HARD_STOP_PCT', {}) or {}).get(tf, 3.0)
 
         # TP 설정: 전역
         _tp_map = _cfg.get('take_profit_pct', {}) or {}
@@ -2055,9 +2162,9 @@ def format_signal_message(
         # 하드 스탑(4h/1d만 ON)
         if hs_on and hs_pct and hs_pct > 0:
             sl = basis_price * (1 - hs_pct / 100) if sig_is_buy else basis_price * (1 + hs_pct / 100)
-            main_msg += f"\n\n- **하드 스탑**: ${sl:.2f} ({hs_pct}%) — {tf} 활성화\n"
+            risk_msg += f"\n\n- **하드 스탑**: ${sl:.2f} ({hs_pct}%) — {tf} 활성화\n"
         else:
-            main_msg += "\n\n- **하드 스탑**: 사용 안 함 (트레일링/MA 스탑 사용)\n"
+            risk_msg += "\n\n- **하드 스탑**: 사용 안 함 (트레일링/MA 스탑 사용)\n"
 
         # MA 스탑 표시
         ma_cfg = _cfg.get('MA_STOP_CFG', {})
@@ -2092,18 +2199,18 @@ def format_signal_message(
                     diff_txt = f"가격 기준 {diff_pct:+.2f}% ({direction})"
                 else:
                     diff_txt = ""
-                main_msg += f"- **MA 스탑**: {ma_col}=**${ma_val:.2f}**({diff_txt}{confirm_txt}{buf_txt})\n"
+                risk_msg += f"- **MA 스탑**: {ma_col}=**${ma_val:.2f}**({diff_txt}{confirm_txt}{buf_txt})\n"
             else:
-                main_msg += f"**MA 스탑**: {ma_col}({confirm_txt}{buf_txt})\n"
+                risk_msg += f"**MA 스탑**: {ma_col}({confirm_txt}{buf_txt})\n"
 
 
         # 익절 표시
-        main_msg += f"- **익절가**: ${tp:.2f} 현재 분봉기준({tp_pct_local}%)\n"
+        risk_msg += f"- **익절가**: ${tp:.2f} 현재 분봉기준({tp_pct_local}%)\n"
 
 
 
         # ----------------- 실행 체크리스트(쉬운 표현 + 설명 포함) -----------------
-        main_msg += "### 🎯 체크리스트\n"
+        risk_msg += "### 🎯 체크리스트\n"
 
         # 기준 가격(now) 확보: price → 종가 폴백
         now_price = None
@@ -2121,8 +2228,8 @@ def format_signal_message(
 
             # (옵션) 여러 시간대 합의
             try:
-                if agree_long is not None and agree_short is not None:
-                    main_msg += f"- 여러 시간대 분석 결과: 매수 **{agree_long}** / 매도 **{agree_short}** — 같은 방향 표가 많을수록 신뢰도 ↑\n"
+                    if agree_long is not None and agree_short is not None:
+                        risk_msg += f"- 여러 시간대 분석 결과: 매수 **{agree_long}** / 매도 **{agree_short}** — 같은 방향 표가 많을수록 신뢰도 ↑\n"
             except Exception:
                 pass
             
@@ -2179,7 +2286,7 @@ def format_signal_message(
                 if risk_pct <= risk_floor + 1e-9 or rr >= 10:
                     warn = " — ※ 평균선에 매우 근접: 손익비가 과대평가될 수 있음"
 
-                main_msg += f"- 손익비(지금 들어갈 경우): **{rr:.2f}배** (손실 한도 {risk_pct:.2f}%, 이익 목표 {tp_pct_local:.2f}%) — **{rr_hint}**{warn}\n"
+                risk_msg += f"- 손익비(지금 들어갈 경우): **{rr:.2f}배** (손실 한도 {risk_pct:.2f}%, 이익 목표 {tp_pct_local:.2f}%) — **{rr_hint}**{warn}\n"
 
             # 2) 중요 레벨까지 거리(%) — 평균선 / 일목 기준선 / 20봉 고저 / 변동성
             prox_lines = []
@@ -2242,8 +2349,8 @@ def format_signal_message(
             except Exception:
                 pass
 
-            if prox_lines:
-                main_msg += "\n".join(prox_lines) + "\n"
+                if prox_lines:
+                    risk_msg += "\n".join(prox_lines) + "\n"
             
 
             # 🎯 실행 체크리스트 하단 액션 힌트 (쉬운 표현)
@@ -2279,12 +2386,15 @@ def format_signal_message(
             # 종합 액션 힌트 출력(항목별 개별 줄)
             hints = [h for h in (rr_text, dist_text, vol_text) if h]
             if hints:
-                main_msg += "\n➡️ **액션 힌트**\n" + "\n".join(f"- {h}" for h in hints) + "\n"
+                risk_msg += "\n➡️ **액션 힌트**\n" + "\n".join(f"- {h}" for h in hints) + "\n"
 
         else:
-            main_msg += "- 가격 데이터 부족으로 체크리스트를 만들 수 없습니다.\n"
+            risk_msg += "- 가격 데이터 부족으로 체크리스트를 만들 수 없습니다.\n"
         # ------------------------------------------------------------
 
+    if show_risk and risk_msg:
+        main_msg += risk_msg
+    # [ANCHOR: risk_section_guard_end]
 
     # ✅ 점수 및 등급
     main_msg += "\n### **📊 점수 기반 판단**\n"
@@ -2544,7 +2654,7 @@ def format_signal_message(
             summary_msg = build_performance_snapshot(
                 tf=tf,
                 symbol=symbol,
-                price=price,
+                display_price=display_price,
                 daily_change_pct=daily_change_pct,
                 recent_scores=recent_scores
             )
@@ -2639,9 +2749,14 @@ def log_to_csv(symbol, tf, signal, price, rsi, macd,
             if tf in PAPER_POS_TF:
                 PAPER_POS_TF.pop(tf, None)
                 _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+            k = f"{symbol}|{tf}"
+            if k in PAPER_POS:
+                PAPER_POS.pop(k, None)
+                _save_json(PAPER_POS_FILE, PAPER_POS)
     except Exception:
         pass
-    price = sanitize_price_for_tf(symbol, tf, price)
+    if os.getenv("SANITIZE_LOG_PRICE","0") == "1":
+        price = sanitize_price_for_tf(symbol, tf, price)
 
 
 
@@ -2869,6 +2984,62 @@ def _min_notional_ok(ex, symbol, price, amount):
         # 정보가 없으면 보수적으로 MIN_NOTIONAL 사용
         return (price * amount) >= MIN_NOTIONAL
 
+
+def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
+    tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
+    sl_pct = float((HARD_STOP_PCT or {}).get(tf, 0.0))
+    if not entry or not price:
+        return False, ""
+    if side == "LONG":
+        if tp_pct and price >= entry * (1 + tp_pct/100):
+            return True, "TP"
+        if sl_pct and price <= entry * (1 - sl_pct/100):
+            return True, "SL"
+    else:
+        if tp_pct and price <= entry * (1 - tp_pct/100):
+            return True, "TP"
+        if sl_pct and price >= entry * (1 + sl_pct/100):
+            return True, "SL"
+    return False, ""
+
+async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, entry_map):
+    key = (symbol, tf)
+    state = TRIGGER_STATE.get(key, 'FLAT')
+    if trigger_mode == 'close':
+        await maybe_execute_trade(symbol, tf, signal, last_price=display_price, candle_ts=c_ts)
+        if signal not in ('BUY', 'SELL'):
+            TRIGGER_STATE[key] = 'FLAT'
+        return
+
+    if trigger_mode == 'intrabar':
+        await maybe_execute_trade(symbol, tf, signal, last_price=display_price, candle_ts=c_ts)
+        return
+
+    if trigger_mode == 'intrabar_confirm':
+        if state == 'FLAT':
+            if signal in ('BUY', 'SELL'):
+                TRIGGER_STATE[key] = 'ARMED'
+                ARMED_SIGNAL[key] = signal
+                ARMED_TS[key] = c_ts
+                await maybe_execute_trade(symbol, tf, signal, last_price=display_price, candle_ts=c_ts)
+        elif state == 'ARMED':
+            if c_ts > ARMED_TS.get(key, 0):
+                if signal == ARMED_SIGNAL.get(key):
+                    TRIGGER_STATE[key] = 'CONFIRMED'
+                else:
+                    opp = 'SELL' if ARMED_SIGNAL.get(key) == 'BUY' else 'BUY'
+                    log(f"[REVERT] {symbol} {tf}: intrabar trigger reverted")
+                    await maybe_execute_trade(symbol, tf, opp, last_price=display_price, candle_ts=c_ts)
+                    entry_map[tf] = None
+                    TRIGGER_STATE[key] = 'FLAT'
+                    ARMED_SIGNAL.pop(key, None)
+                    ARMED_TS.pop(key, None)
+        elif state == 'CONFIRMED':
+            await maybe_execute_trade(symbol, tf, signal, last_price=display_price, candle_ts=c_ts)
+            if signal not in ('BUY', 'SELL'):
+                TRIGGER_STATE[key] = 'FLAT'
+                ARMED_SIGNAL.pop(key, None)
+                ARMED_TS.pop(key, None)
 # signal_bot.py
 async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts= None):
 
@@ -2930,19 +3101,22 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts= None):
     if TRADE_MODE == "paper" or not GLOBAL_EXCHANGE:
         # ① 라우팅 가드 (ETH/ BTC 제한)
         if not _route_allows(symbol, tf):
+            log(f"[PAPER] block {symbol} {tf}: route disallow")
             return
-        
+
         # --- TF 후보 선정: 같은 TF에서 더 우수한 심볼만 허용 (페이퍼/현물) ---
-        if not ALLOW_BOTH_PER_TF:
+        if tf not in IGNORE_OCCUPANCY_TFS and not ALLOW_BOTH_PER_TF:
             if not PAPER_POS_TF.get(tf) and not FUT_POS_TF.get(tf):
                 if not _is_best_candidate(symbol, tf, signal):
                     log(f"[PAPER] skip {symbol} {tf} {signal}: better candidate exists")
                     ENTERED_CANDLE[(symbol, tf)] = candle_ts
                     return
 
-        # ② 같은 TF 단일점유(옵션) — 같은 심볼이어도 '점유 중이면' 무조건 차단
-        if not ALLOW_BOTH_PER_TF:
-            other = PAPER_POS_TF.get(tf) or FUT_POS_TF.get(tf)
+        # ② 같은 TF 단일점유(옵션)
+        if tf not in IGNORE_OCCUPANCY_TFS and not ALLOW_BOTH_PER_TF:
+            other_paper = PAPER_POS_TF.get(tf)
+            other_fut   = FUT_POS_TF.get(tf)
+            other = next((x for x in (other_paper, other_fut) if x and x != symbol), None)
             if other:
                 log(f"[PAPER] skip {symbol} {tf}: TF already occupied by {other}")
                 ENTERED_CANDLE[(symbol, tf)] = candle_ts
@@ -2971,6 +3145,16 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts= None):
         # ④ 페이퍼 점유 상태 기록(동시 진입 방지)
         PAPER_POS_TF[tf] = symbol
         _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+
+        key = f"{symbol}|{tf}"
+        PAPER_POS[key] = {
+            "side": ("LONG" if signal == "BUY" else "SHORT"),
+            "entry": float(last_price),
+            "opened_ts": int((candle_ts or 0) * 1000) or int(time.time()*1000),
+            "high": float(last_price),
+            "low":  float(last_price)
+        }
+        _save_json(PAPER_POS_FILE, PAPER_POS)
 
         # ⑤ 로깅
         os.makedirs("logs", exist_ok=True)
@@ -3363,6 +3547,15 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
 # === 라우팅(ETH/BTC) & 동시 TF 제한 ===
 ROUTE_BY_TF_RAW   = os.getenv("ROUTE_BY_TF", "")  # 예: "15m:ETH,1h:BTC,4h:AUTO,1d:AUTO"
 ALLOW_BOTH_PER_TF = os.getenv("ALLOW_BOTH_PER_TF", "0") == "1"
+IGNORE_OCCUPANCY_TFS = {'1d'}
+
+DEBOUNCE_SEC   = int(os.getenv('DEBOUNCE_SEC', '10'))
+COOLDOWN_SEC   = int(os.getenv('COOLDOWN_SEC', '30'))
+MIN_HOLD_SEC   = int(os.getenv('MIN_HOLD_SEC', '0'))
+HYSTERESIS_PCT = float(os.getenv('HYSTERESIS_PCT', '0.05'))
+
+def trigger_mode_for(tf: str) -> str:
+    return os.getenv(f'TRIGGER_MODE_TF_{tf.upper()}', os.getenv('TRIGGER_MODE', 'close')).lower()
 
 def _parse_route_map(raw):
     m = {}
@@ -3378,6 +3571,9 @@ def _parse_route_map(raw):
 ROUTE_TF = _parse_route_map(ROUTE_BY_TF_RAW)
 
 def _route_allows(symbol, tf):
+    # [ANCHOR: allow_daily_tf_toggle]
+    if tf == '1d' and os.getenv("ALLOW_DAILY_TF","1") == "1":
+        return True
     rule = (ROUTE_TF.get(tf) or "AUTO").upper()
     if rule in ("AUTO", "BOTH", "ALL"):
         return True
@@ -3456,6 +3652,9 @@ def _idem_prune(max_keep: int = 5000):
 
 PAPER_POS_TF_FILE = "logs/paper_positions_tf.json"
 PAPER_POS_TF = _load_json(PAPER_POS_TF_FILE, {})   # key: tf -> symbol (paper 전용)
+
+PAPER_POS_FILE = "logs/paper_positions.json"
+PAPER_POS = _load_json(PAPER_POS_FILE, {})   # key: f"{symbol}|{tf}" -> {side, entry, opened_ts, high, low}
 
 IDEMP_KEYS = _load_json(IDEMP_FILE, {"keys": []})
 FUT_POS    = _load_json(OPEN_POS_FILE, {})         # symbol -> {'side','qty','entry'}
@@ -4069,6 +4268,32 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             trv = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
             sv  = _req_slippage_pct(symbol, tf)
             lines.append(f"• 리스크: TP {tpv:.2f}% / SL {slv:.2f}% / TR {trv:.2f}% / 슬리피지 {sv:.2f}%")
+            # [ANCHOR: entry_risk_prices]
+            try:
+                _tp_map = (globals().get('take_profit_pct') or {})
+                _sl_map = (globals().get('HARD_STOP_PCT') or {})
+                _ts_map = (globals().get('trailing_stop_pct') or {})
+
+                tpv = float(_tp_map.get(tf, 2.0))
+                slv = float(_sl_map.get(tf, 0.0))
+                trv = float(_ts_map.get(tf, 0.0))
+
+                if signal == "BUY":
+                    tp_price = price * (1 + tpv/100.0) if tpv>0 else None
+                    sl_price = price * (1 - slv/100.0) if slv>0 else None
+                else:
+                    tp_price = price * (1 - tpv/100.0) if tpv>0 else None
+                    sl_price = price * (1 + slv/100.0) if slv>0 else None
+
+                price_lines = []
+                if tp_price: price_lines.append(f"TP: {_fmt_usd(tp_price)} (+{tpv:.2f}%)")
+                if sl_price: price_lines.append(f"SL: {_fmt_usd(sl_price)} (-{slv:.2f}%)")
+                if trv>0:    price_lines.append(f"TR: {trv:.2f}% (퍼센트 트레일)")
+
+                if price_lines:
+                    lines.append("• 리스크(가격): " + " / ".join(price_lines))
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -4225,6 +4450,7 @@ async def _auto_close_and_notify_eth(
 
 
     # CSV/상태 정리 (ETH는 접미사 없이 공통 변수 사용)
+    exit_price = sanitize_price_for_tf(symbol_eth, tf, exit_price)
     log_to_csv(
         symbol_eth, tf, action, exit_price,
         rsi, macd, pnl,
@@ -4286,6 +4512,7 @@ async def _auto_close_and_notify_btc(
         log(f"[NOTIFY] btc exit send warn {symbol} {tf}: {ne}")
 
     # CSV/상태 정리
+    xp = sanitize_price_for_tf(symbol, tf, xp)
     log_to_csv(
         symbol, tf, action, xp,
         rsi, macd, None,
@@ -4482,6 +4709,23 @@ try:
 except Exception as e:
     log(f"[FUT] exchange init fail: {e}")
     FUT_EXCHANGE = None
+
+
+async def _sync_open_state_on_ready():
+    # 페이퍼: 파일 로드로 충분 (이미 상단에서 로드됨)
+    # 선물: 거래소 포지션 동기화
+    try:
+        ex = FUT_EXCHANGE
+        if ex:
+            for sym in ("BTC/USDT","ETH/USDT"):
+                qty, side, entry = await _fetch_pos_qty(ex, sym)
+                if side and abs(qty) > 0:
+                    FUT_POS[sym] = {"side": side, "qty": float(qty), "entry": float(entry), "opened_ts": int(time.time()*1000)}
+                    FUT_POS_TF.setdefault("15m", None)
+            _save_json(OPEN_POS_FILE, FUT_POS)
+            _save_json(OPEN_TF_FILE, FUT_POS_TF)
+    except Exception as e:
+        log(f"[SYNC] warn: {e}")
 
 # === Hedge mode & TF-level overrides ===
 HEDGE_MODE   = os.getenv("HEDGE_MODE", "1") == "1"
@@ -5009,7 +5253,6 @@ async def send_timed_reports():
                         continue
 
                     symbol_eth = 'ETH/USDT'
-                    current_price_eth = fetch_live_price(symbol_eth)
 
                     # === Closed-candle snapshot (ETH) ===
                     # (use closed candle to avoid intra-candle spikes)
@@ -5043,14 +5286,11 @@ async def send_timed_reports():
                     if _len(df) == 0:
                         log(f"⏭️ {symbol_eth} {tf} 보고서 생략: 데이터 없음")
                         continue
-                    price_now = closed_price  # 📌 라이브틱 대신 닫힌 15m 종가 사용
-                    df_1d = get_ohlcv(symbol_eth, '1d', limit=300)
-                    if len(df_1d) >= 1:
-                        # 하루 시작가 자체는 일봉의 open(익일 00:00 고정)이므로 그대로 둠
-                        daily_open = float(df_1d['open'].iloc[-1])
-                        daily_change_pct = ((price_now - daily_open) / daily_open) * 100
-                    else:
-                        daily_change_pct = None
+                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
+                    live_price = snap.get("mid") or snap.get("last")
+                    display_price = live_price if isinstance(live_price, (int, float)) else closed_price
+                    # [ANCHOR: daily_change_unify_eth_alt]
+                    daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
 
                     
                     # 📍 ETH 진입 정보 주입
@@ -5074,7 +5314,8 @@ async def send_timed_reports():
                         daily_change_pct=daily_change_pct,
                         score_history=score_history.get(tf),
                         recent_scores=score_history.get(tf),
-                        live_price=current_price_eth 
+                        live_price=display_price,
+                        show_risk=False
                     )
 
 
@@ -5094,22 +5335,19 @@ async def send_timed_reports():
                     main_msg_pdf = addon + "\n" + main_msg_pdf
                     summary_msg_pdf = addon + "\n" + summary_msg_pdf
 
-
-                    msg_for_pdf = {
-                        'main': main_msg_pdf,
-                        'summary': summary_msg_pdf,
-                        'short': None
-                    }
+                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
+                    display_price = snap.get("mid") or snap.get("last") or closed_price
 
                     pdf_path = generate_pdf_report(
-                        symbol_eth, tf,
-                        main_txt=msg_for_pdf['main'],
-                        summary_txt=msg_for_pdf['summary'],
-                        short_txt=msg_for_pdf['short'],
-                        img_groups=chart_files,
-                        ichimoku_img=ichimoku_file,
-                        score_img=score_file,
-                        perf_img=perf_file
+                        df=df, tf=tf, symbol=symbol_eth,
+                        signal=signal, price=display_price, score=score,
+                        reasons=reasons, weights=weights,
+                        agree_long=agree_long, agree_short=agree_short,
+                        now=datetime.now(),
+                        chart_imgs=chart_files, ichimoku_img=ichimoku_file,
+                        daily_change_pct=daily_change_pct,
+                        discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
+                        entry_price=entry_price_local, entry_time=entry_time_local
                     )
                     
 
@@ -5166,7 +5404,6 @@ async def send_timed_reports():
                     symbol_btc = 'BTC/USDT'
 
                     # 1) 데이터/지표
-                    current_price_btc = fetch_live_price(symbol_btc)
                     df = await safe_get_ohlcv(symbol_btc, tf, limit=300)
                     df = await safe_add_indicators(df)
 
@@ -5184,16 +5421,11 @@ async def send_timed_reports():
                     signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = \
                         calculate_signal(df, tf, symbol_btc)
 
-                    # 3) 일중 변동률(안전)
-                    try:
-                        df_1d = await safe_get_ohlcv(symbol_btc, '1d', limit=300)
-                        daily_change_pct = None
-                        if _len(df_1d) > 0:
-                            daily_open = float(df_1d['open'].iloc[-1])
-                            if daily_open:
-                                daily_change_pct = (float(c_c) - daily_open) / daily_open * 100.0
-                    except Exception:
-                        daily_change_pct = None
+                    snap = await get_price_snapshot(symbol_btc)  # BTC/USDT
+                    live_price = snap.get("mid") or snap.get("last")
+                    display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                    # [ANCHOR: daily_change_unify_btc]
+                    daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
 
                     # 4) 진입 정보 (없으면 None)
                     _epb = entry_data_btc.get(tf)  # (entry_price, entry_time)
@@ -5217,20 +5449,22 @@ async def send_timed_reports():
                         recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
                         daily_change_pct=daily_change_pct,
                         symbol=symbol_btc,
-                        live_price=current_price_btc
+                        live_price=display_price,
+                        show_risk=False
                     )
 
                     # (선택) PDF 생성 — 파일 목록에 같이 첨부
                     try:
                         pdf_path = generate_pdf_report(
                             df=df, tf=tf, symbol=symbol_btc,
-                            signal=signal, price=c_c, score=score,
+                            signal=signal, price=display_price, score=score,
                             reasons=reasons, weights=weights,
                             agree_long=agree_long, agree_short=agree_short,
                             now=datetime.now(),
                             chart_imgs=chart_files, ichimoku_img=ichimoku_file,
                             daily_change_pct=daily_change_pct,
-                            discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf)
+                            discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
+                            entry_price=entry_price_local, entry_time=entry_time_local
                         )
                     except Exception as e:
                         log(f"PDF 생성 경고: {e}")
@@ -5266,8 +5500,9 @@ async def send_timed_reports():
                         log(f"❌ BTC 전송 오류: {e}")
 
                     # 9) 상태 업데이트(‘발송 성공’ 시점)
-                    if not score_history_btc[tf] or round(score, 1) != score_history_btc[tf][-1]:
-                        score_history_btc[tf].append(round(score, 1))
+                    hist = score_history_btc.setdefault(tf, deque(maxlen=4))
+                    if not hist or round(score, 1) != hist[-1]:
+                        hist.append(round(score, 1))
 
                     previous_signal_btc[tf] = signal
                     previous_score_btc[tf]  = score
@@ -5280,8 +5515,10 @@ async def send_timed_reports():
                     last_sent_score_btc[tf]  = score
                     last_sent_price_btc[tf]  = float(c_c)
 
-                    # 10) (자동매매) — 실제 체결은 에러 없이 ‘발송 후’에만 시도
-                    await maybe_execute_trade(symbol_btc, tf, signal, last_price=c_c, candle_ts=c_ts)
+                    # 10) (자동매매) — 트리거 모드별 처리
+                    trigger_mode = trigger_mode_for(tf)
+                    log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                    await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
 
                 except Exception as e:
                     log(f"⚠️ BTC 루프 오류: {e}")
@@ -5328,6 +5565,7 @@ async def on_ready():
         return
     client.startup_done = True
 
+    await _sync_open_state_on_ready()
     asyncio.create_task(init_analysis_tasks())
     
    # ✅ 채널별 시작 메시지 전송 (ETH)
@@ -5360,12 +5598,7 @@ async def on_ready():
 
     while True:
         try:
-            # ✅ 루프 1회마다 실시간 가격 1번만 조회해 TF 전부에 동일 적용
-            eth_live = fetch_live_price(symbol_eth)
-
-            # ✅ 여기서 1d 캔들 한 번만 가져오기
-            df_1d = await safe_get_ohlcv(symbol_eth, '1d', limit=300)
-            daily_open_price = float(df_1d['open'].iloc[-1]) if len(df_1d) else None
+            # ✅ 루프 1회마다 실시간 가격 스냅샷 활용 (TF 공통)
 
             for tf in timeframes:
                 ch_id = CHANNEL_IDS.get(tf)
@@ -5423,9 +5656,27 @@ async def on_ready():
 
                 now_str = datetime.now().strftime("%m월 %d일 %H:%M")
                 previous = previous_signal.get(tf)
-                daily_change_pct = None # 일봉 퍼센트
-                if daily_open_price and daily_open_price > 0:
-                    daily_change_pct = ( (price - daily_open_price) / daily_open_price ) * 100
+                snap = await get_price_snapshot(symbol_eth)
+                live_price = snap.get("mid") or snap.get("last")
+                display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: daily_change_unify_eth]
+                daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
+
+                # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
+                k = f"{symbol_eth}|{tf}"
+                pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_eth) if TRADE_MODE == "futures" else None)
+                if pos:
+                    side = pos.get("side")
+                    entry = float(pos.get("entry") or 0)
+                    hit, reason = _eval_tp_sl(side, entry, float(display_price), tf)
+                    if hit:
+                        if TRADE_MODE == "paper":
+                            await _notify_trade_exit(symbol_eth, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
+                            PAPER_POS.pop(k, None); _save_json(PAPER_POS_FILE, PAPER_POS)
+                            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                        elif TRADE_MODE == "futures":
+                            await futures_close_all(symbol_eth, tf, exit_price=float(display_price), reason=reason)
+                        continue
 
                 # 현재가가를 차해가면 최고/최저가 갱신
                 if highest_price[tf] is None:
@@ -5698,9 +5949,8 @@ async def on_ready():
                         ([] if (score_history[tf] and round(score,1)==score_history[tf][-1]) else [round(score,1)])
                     ),
 
-                    live_price=eth_live  # reuse ticker for consistent short/long pricing
-
-
+                    live_price=display_price,  # reuse ticker for consistent short/long pricing
+                    show_risk=False
                 )
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
                 candle_ts = None
@@ -5712,12 +5962,9 @@ async def on_ready():
                         # 폴백: POSIX seconds → ms
                         candle_ts = int(df['timestamp'].iloc[-2].timestamp() * 1000)
 
-                # (중요) 호출 시 candle_ts 전달
-                await maybe_execute_trade(
-                    symbol_eth, tf, signal,
-                    last_price=c_c,          # 닫힌 종가
-                    candle_ts=c_ts           # 닫힌 캔들 TS(초)
-                )
+                trigger_mode = trigger_mode_for(tf)
+                log(f"[DEBUG] {symbol_eth} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                await handle_trigger(symbol_eth, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 channel = _get_channel_or_skip('ETH', tf)
                 if channel is None:
@@ -5771,7 +6018,7 @@ async def on_ready():
                 else:
                     neutral_info[tf] = None
 
-                log_to_csv(symbol_eth, tf, signal, price, rsi, macd, pnl,
+                log_to_csv(symbol_eth, tf, signal, display_price, rsi, macd, pnl,
                         entry_price=entry_price,
                         entry_time=entry_time,
                         score=score,
@@ -5783,13 +6030,7 @@ async def on_ready():
                 previous_score[tf] = score
 
             # ===== BTC 실시간 루프 (1h/4h/1d) =====
-            try:
-                df_1d_btc = await safe_get_ohlcv(symbol_btc, '1d', limit=300)
-                daily_open_btc = float(df_1d_btc['open'].iloc[-1]) if len(df_1d_btc) else None
-            except Exception:
-                daily_open_btc = None
-
-            btc_live = fetch_live_price(symbol_btc)
+            # ✅ 루프 1회마다 실시간 가격 스냅샷 활용 (TF 공통)
 
             for tf in TIMEFRAMES_BTC:
                 ch_id = CHANNEL_BTC.get(tf)
@@ -5824,10 +6065,27 @@ async def on_ready():
                 LATEST_WEIGHTS[(symbol_btc, tf)] = dict(weights) if isinstance(weights, dict) else {}
                 LATEST_WEIGHTS_DETAIL[(symbol_btc, tf)] = dict(weights_detail) if isinstance(weights_detail, dict) else {}
                 
-                # 일봉 변동률
-                daily_change_pct = None
-                if daily_open_btc and daily_open_btc > 0:
-                    daily_change_pct = ((price - daily_open_btc) / daily_open_btc) * 100
+                snap = await get_price_snapshot(symbol_btc)
+                live_price = snap.get("mid") or snap.get("last")
+                display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: daily_change_unify_btc]
+                daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
+
+                # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
+                k = f"{symbol_btc}|{tf}"
+                pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_btc) if TRADE_MODE == "futures" else None)
+                if pos:
+                    side = pos.get("side")
+                    entry = float(pos.get("entry") or 0)
+                    hit, reason = _eval_tp_sl(side, entry, float(display_price), tf)
+                    if hit:
+                        if TRADE_MODE == "paper":
+                            await _notify_trade_exit(symbol_btc, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
+                            PAPER_POS.pop(k, None); _save_json(PAPER_POS_FILE, PAPER_POS)
+                            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                        elif TRADE_MODE == "futures":
+                            await futures_close_all(symbol_btc, tf, exit_price=float(display_price), reason=reason)
+                        continue
 
                 # 🔽 BTC 심볼+타임프레임별 리포트/이미지 경로 생성
                 score_file = plot_score_history(symbol_btc, tf)
@@ -5839,8 +6097,12 @@ async def on_ready():
 
 
                 # === (BTC) 자동 손절 / 트레일링 스탑 처리 ===
-                if previous in ['BUY', 'SELL'] and entry_data_btc[tf]:
-                    entry_price, entry_time = entry_data_btc[tf]
+                if previous in ['BUY', 'SELL']:
+                    _ep = entry_data_btc.get(tf) or (None, None)
+                    entry_price = _ep[0]
+                    entry_time  = _ep[1]
+                    if entry_price is None:
+                        continue
 
                     ref_close = float(df['close'].iloc[-1])
                     curr_price = float(price) if isinstance(price, (int, float)) else ref_close
@@ -5853,11 +6115,11 @@ async def on_ready():
                     # 트레일링 기준 갱신
                     if previous == 'BUY':
                         highest_price_btc.setdefault(tf, entry_price)
-                        if curr_high > highest_price_btc[tf]:
+                        if curr_high > highest_price_btc.get(tf, entry_price):
                             highest_price_btc[tf] = curr_high
                     elif previous == 'SELL':
                         lowest_price_btc.setdefault(tf, entry_price)
-                        if curr_low < lowest_price_btc[tf]:
+                        if curr_low < lowest_price_btc.get(tf, entry_price):
                             lowest_price_btc[tf] = curr_low
 
                     # MA 스탑 체크 함수 (ETH 예시)
@@ -5908,7 +6170,7 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 - hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 + tp_pct / 100)
-                        trail_price       = ((highest_price_btc[tf] or entry_price) * (1 - ts / 100)) if use_trail else None
+                        trail_price       = ((highest_price_btc.get(tf, entry_price) or entry_price) * (1 - ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price <= stop_price)        if stop_price else False
                         trail_hit = (curr_price <= trail_price)       if trail_price is not None else False
@@ -5947,7 +6209,7 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 + hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 - tp_pct / 100)
-                        trail_price       = ((lowest_price_btc[tf] or entry_price) * (1 + ts / 100)) if use_trail else None
+                        trail_price       = ((lowest_price_btc.get(tf, entry_price) or entry_price) * (1 + ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price >= stop_price)        if stop_price else False
                         trail_hit = (curr_price >= trail_price)       if trail_price is not None else False
@@ -5996,7 +6258,7 @@ async def on_ready():
                 now_str_btc = datetime.now().strftime("%m월 %d일 %H:%M")
                 if str(signal).startswith('BUY') or str(signal).startswith('SELL'):
                     update_entry = False
-                    prev_entry = entry_data_btc[tf]
+                    prev_entry = entry_data_btc.get(tf)
                     if previous != signal or prev_entry is None:
                         update_entry = True
                     else:
@@ -6007,14 +6269,12 @@ async def on_ready():
                             update_entry = True
                     if update_entry:
                         entry_data_btc[tf] = (price, now_str_btc)
-                        # 트레일링 기준도 같이 초기화
-                        if str(signal).startswith('BUY'):
-                            highest_price_btc[tf] = price
-                        else:
-                            lowest_price_btc[tf]  = price
+                        highest_price_btc[tf] = price
+                        lowest_price_btc[tf]  = price
 
-                if signal == previous and entry_data_btc[tf]:
-                    prev_price, _ = entry_data_btc[tf]
+                prev_entry2 = entry_data_btc.get(tf)
+                if signal == previous and prev_entry2:
+                    prev_price, _ = prev_entry2
                     prev_score = previous_score_btc.get(tf, None)
                     if prev_score is not None:
                         if signal == 'BUY':
@@ -6044,39 +6304,36 @@ async def on_ready():
                     previous_price_btc[tf]  = float(price) if isinstance(price,(int,float)) else None
                     last_candle_ts_btc[tf]  = c_ts
                     continue
-                
 
-                # BTC 로그 저장 추가
+                _epb = entry_data_btc.get(tf)
+                _entry_price = _epb[0] if _epb else None
+                _entry_time  = _epb[1] if _epb else None
+
                 log_to_csv(
-                    symbol_btc,  # ← 심볼 구분
+                    symbol_btc,
                     tf,
                     signal,
-                    price,
+                    display_price,
                     rsi,
                     macd,
-                    pnl=None,  # 필요하면 계산
-                    entry_price=None,
-                    entry_time=None,
+                    pnl=None,
+                    entry_price=_entry_price,
+                    entry_time=_entry_time,
                     score=score,
                     reasons=reasons,
                     weights=weights
                 )
 
-                # 호출부 바로 위에 추가
-                _epb = entry_data_btc.get(tf)
-                _entry_time  = _epb[1] if _epb else None
-                _entry_price = _epb[0] if _epb else None
-
-                # 그리고 호출부는 이렇게 정리
                 main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
                     tf=tf, signal=signal, price=price, pnl=None, strength=reasons, df=df,
                     score=score, weights=weights, weights_detail=weights_detail, prev_score_value=previous_score_btc.get(tf),
                     agree_long=agree_long, agree_short=agree_short, daily_change_pct=daily_change_pct,
                     symbol=symbol_btc,
-                    entry_time=_entry_time,                # ✅ 지역변수로 전달
-                    entry_price=_entry_price,              # ✅ 지역변수로 전달
+                    entry_time=_entry_time,
+                    entry_price=_entry_price,
                     recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-                    live_price=btc_live  # reuse ticker for consistent short/long pricing
+                    live_price=display_price,  # reuse ticker for consistent short/long pricing
+                    show_risk=False
                 )
 
 
@@ -6101,8 +6358,9 @@ async def on_ready():
                 await channel.send(summary_msg_pdf, silent=True)
 
                 # 점수기록: 실제 발송시에만
-                if not score_history_btc[tf] or round(score,1) != score_history_btc[tf][-1]:
-                    score_history_btc[tf].append(round(score,1))
+                hist = score_history_btc.setdefault(tf, deque(maxlen=4))
+                if not hist or round(score,1) != hist[-1]:
+                    hist.append(round(score,1))
 
                 # 발송 기록 갱신
                 last_sent_ts_btc[tf]     = c_ts
@@ -6119,11 +6377,9 @@ async def on_ready():
                 else:
                     neutral_info_btc[tf] = None
 
-                await maybe_execute_trade(
-                    symbol_btc, tf, signal,
-                    last_price=c_c,
-                    candle_ts=c_ts
-                )
+                trigger_mode = trigger_mode_for(tf)
+                log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
 
                 # 상태 업데이트(손절/익절 분기에서 이미 continue 되므로 여기선 순수 신호 상태만 기록)
                 previous_signal_btc[tf] = signal
@@ -6155,10 +6411,10 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    parts = message.content.split()
+    parts = message.content.strip().split()
 
         # ===== PnL 리포트 생성 =====
-    if message.content.strip().startswith("!리포트") or message.content.strip().lower().startswith("!report"):
+    if (parts and parts[0] in ("!리포트","!report")) and (len(parts) == 1):
         try:
             path = await generate_pnl_pdf()
             if not path:
@@ -6185,6 +6441,10 @@ async def on_message(message):
         signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol)
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+        snap = await get_price_snapshot(symbol)
+        live_price_val = snap.get("mid") or snap.get("last")
+        display_price = live_price_val if isinstance(live_price_val, (int, float)) else price
+
         main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
             tf=tf,
             signal=signal,
@@ -6201,7 +6461,8 @@ async def on_message(message):
             agree_long=agree_long,
             agree_short=agree_short,
             symbol=symbol,
-            live_price=current_price_eth 
+            live_price=display_price,
+            show_risk=False
             )
         
 
@@ -6231,6 +6492,30 @@ async def on_message(message):
             await message.channel.send("❌ PDF 모듈 임포트에 실패했습니다. (generate_pdf_report=None)")
             return
 
+        # [ANCHOR: REPORT_PRICE_SNAPSHOT_BEGIN]
+        # 리포트에서도 전 TF와 동일한 '현재가 스냅샷'을 사용
+        try:
+            snap = await get_price_snapshot(symbol)
+            report_price = snap.get("mid") or snap.get("last")
+        except Exception:
+            report_price = None
+        # 마지막 보루: 스냅샷 실패 시 실시간/종가로 대체
+        if not isinstance(report_price, (int, float)):
+            try:
+                report_price = fetch_live_price(symbol)
+            except Exception:
+                report_price = None
+        if not isinstance(report_price, (int, float)):
+            # df가 있으면 마지막 종가로
+            try:
+                _df_tmp = get_ohlcv(symbol, tf, limit=2)
+                if _df_tmp is not None and len(_df_tmp) > 0:
+                    report_price = float(_df_tmp['close'].iloc[-1])
+            except Exception:
+                pass
+        # [ANCHOR: REPORT_PRICE_SNAPSHOT_END]
+        log(f"[REPORT] {symbol} tf={tf} report_price={report_price}")
+
         df = get_ohlcv(symbol, tf, limit=300)
         df = add_indicators(df)
 
@@ -6238,18 +6523,13 @@ async def on_message(message):
         chart_files   = save_chart_groups(df, symbol, tf)
         ichimoku_file = save_ichimoku_chart(df, symbol, tf)
 
-
         df_1d = get_ohlcv(symbol, '1d', limit=300)
         signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol)
 
         # 일봉 변동률 계산
-        price_now = fetch_live_price(symbol)
-        df_1d = get_ohlcv(symbol, '1d', limit=300)
-        if _len(df_1d) >= 1 and isinstance(df_1d['open'].iloc[-1], (int,float,np.floating)):
-            daily_open = float(df_1d['open'].iloc[-1])
-            daily_change_pct = ((price_now - daily_open) / daily_open) * 100 if daily_open else None
-        else:
-            daily_change_pct = None
+        display_price = report_price
+        # [ANCHOR: daily_change_unify_eth_alt]
+        daily_change_pct = calc_daily_change_pct(symbol, display_price)
 
 
         main_msg_pdf, summary_msg_pdf, _short_msg_pdf = format_signal_message(
@@ -6268,7 +6548,8 @@ async def on_message(message):
             agree_long=agree_long,
             agree_short=agree_short,
             daily_change_pct=daily_change_pct,
-            live_price=current_price_eth 
+            live_price=report_price,
+            show_risk=False
         )
         msg_for_pdf = f"{main_msg_pdf}\n\n{summary_msg_pdf}"
 
@@ -6282,7 +6563,7 @@ async def on_message(message):
             tf=tf,
             symbol=symbol,
             signal=signal,
-            price=price,
+            price=report_price,
             score=score,
             reasons=reasons,
             weights=weights,
@@ -6291,12 +6572,13 @@ async def on_message(message):
             now=datetime.now(),
             chart_imgs=chart_files,                 # ✅ 분할차트 리스트
             ichimoku_img=ichimoku_file,             # ✅ 이치모쿠
-            discord_message=msg_for_pdf
+            discord_message=msg_for_pdf,
+            daily_change_pct=daily_change_pct
         )
 
 
         # 심볼별 로그 저장
-        log_to_csv(symbol, tf, signal, price, rsi, macd, None, None, None, score, reasons, weights)
+        log_to_csv(symbol, tf, signal, report_price, rsi, macd, None, None, None, score, reasons, weights)
 
         # 빈 메시지 가드 적용
         # 보고서 안내 문구
