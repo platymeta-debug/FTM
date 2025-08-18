@@ -5696,7 +5696,8 @@ async def on_ready():
                     recent_scores=(
                         list(score_history[tf]) +
                         ([] if (score_history[tf] and round(score,1)==score_history[tf][-1]) else [round(score,1)])
-                    )
+                    ),
+                    live_price=eth_live  # reuse ticker for consistent short/long pricing
                 )
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
                 candle_ts = None
@@ -6072,7 +6073,7 @@ async def on_ready():
                     entry_time=_entry_time,                # ✅ 지역변수로 전달
                     entry_price=_entry_price,              # ✅ 지역변수로 전달
                     recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-                    live_price=btc_live
+                    live_price=btc_live  # reuse ticker for consistent short/long pricing
                 )
 
 
