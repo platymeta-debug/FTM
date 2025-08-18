@@ -28,8 +28,43 @@ symbol_btc = 'BTC/USDT'
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
 
-# [ANCHOR: GATEKEEPER_STATE]
-FRAME_GATE = {}  # {tf: {"ts": int, "cand": list[dict], "winner": str|None}}
+
+# === [ANCHOR: OBS_COOLDOWN_CFG] Gatekeeper/Observe/Cooldown Config ===
+def _parse_kv_numbers(val: str | None, default: dict[str, float]) -> dict[str, float]:
+    d = {}
+    try:
+        for part in str(val or "").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            d[k] = float(v)
+    except Exception:
+        pass
+    return d or default
+
+ENABLE_OBSERVE = os.getenv("ENABLE_OBSERVE", "1") == "1"
+ENABLE_COOLDOWN = os.getenv("ENABLE_COOLDOWN", "1") == "1"
+STRONG_BYPASS_SCORE = float(os.getenv("STRONG_BYPASS_SCORE", "0.80"))
+GK_TTL_HOLD_SEC = float(os.getenv("GK_TTL_HOLD_SEC", "0.8"))
+
+OBS_WINDOW_SEC = _parse_kv_numbers(os.getenv("OBS_WINDOW_SEC"), {"15m": 1.5, "1h": 2.0, "4h": 2.5, "1d": 3.0})
+POST_EXIT_COOLDOWN_SEC = _parse_kv_numbers(os.getenv("POST_EXIT_COOLDOWN_SEC"), {"15m": 10.0, "1h": 30.0, "4h": 60.0, "1d": 120.0})
+
+WAIT_TARGET_ENABLE = os.getenv("WAIT_TARGET_ENABLE", "1") == "1"
+TARGET_SCORE_BY_TF = _parse_kv_numbers(os.getenv("TARGET_SCORE_BY_TF"), {"15m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0})
+WAIT_TARGET_SEC = _parse_kv_numbers(os.getenv("WAIT_TARGET_SEC"), {"15m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0})
+TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
+
+# === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
+FRAME_GATE = {}       # {tf: {"ts": int, "cand": [payload...], "winner": str|None, "t0": float, "observe_until": float, "target_until": float, "flat": bool}}
+LAST_EXIT_TS = {}     # {tf: epoch_sec}
+COOLDOWN_UNTIL = {}   # {tf: epoch_sec}
+
 
 # === Console/File logging (UTF-8 safe for Windows) ===
 import logging, sys, os
@@ -194,23 +229,89 @@ def _candidate_score(payload: dict) -> float:
 
 def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     """
-    동일 TF·동일 캔들(ts)에서 두 심볼 후보 중 더 좋은 하나만 True 반환.
-    payload 예: {"symbol": "ETH/USDT", "dir": "BUY", "score": 0.55}
+
+    동일 TF·동일 캔들(ts)에서 후보를 수집·선별한다.
+    - 보유중(포지션 존재): 빠른 동시성 조정만(TTL=GK_TTL_HOLD_SEC)
+    - 비보유(Flat): 짧은 관찰창(OBS_WINDOW_SEC[tf]) 동안 후보 수집 후 최고점수 1개만 채택
+    - 청산 직후: COOLDOWN_UNTIL[tf] 이전엔 진입 금지
+    - 강한 신호(|score|>=STRONG_BYPASS_SCORE): 관찰/쿨다운을 무시하고 즉시 통과
+    (PART 2의 '목표 점수 대기'는 아래에서 함께 처리)
     """
+    import time
+    now = time.time()
+    ts = int(candle_ts_ms)
+
+    # 포지션 보유 여부 계산(해당 TF에 어떤 심볼이든 점유 중인지)
+    holding = bool((PAPER_POS_TF and PAPER_POS_TF.get(tf)) or (FUT_POS_TF and FUT_POS_TF.get(tf)))
+    flat = not holding
+
+    # 청산 직후 쿨다운
+    if ENABLE_COOLDOWN and (now < float(COOLDOWN_UNTIL.get(tf, 0.0))):
+        log(f"⏭ {payload.get('symbol')} {tf}: skip (cooldown)")
+        return False
+
+    # 강한 신호 바이패스
+    score = float(payload.get("score") or 0.0)
+    if abs(score) >= float(STRONG_BYPASS_SCORE):
+        return True
+
+    # 프레임/관찰창 초기화
     g = FRAME_GATE.get(tf)
-    if not g or g.get("ts") != int(candle_ts_ms):
-        g = {"ts": int(candle_ts_ms), "cand": [payload], "winner": None}
+    ttl = float(GK_TTL_HOLD_SEC if holding else (OBS_WINDOW_SEC.get(tf, GK_TTL_HOLD_SEC) if ENABLE_OBSERVE else 0.0))
+    if (not g) or g.get("ts") != ts:
+        g = {"ts": ts, "cand": [payload], "winner": None, "t0": now,
+             "observe_until": now + ttl, "target_until": now + float(WAIT_TARGET_SEC.get(tf, 0.0)),
+             "flat": flat}
         FRAME_GATE[tf] = g
-        return False  # 첫 후보는 보류(두 번째 들어오면 결정)
-    # 같은 캔들 두 번째 후보 도착 → 판단
+        # 보유 중이면 첫 후보도 바로 True(빠른 처리)
+        if holding:
+            return True
+        # 비보유면 관찰창 시작: 첫 후보는 일단 보류
+        if not ENABLE_OBSERVE:
+            g["winner"] = payload.get("symbol")
+            return True
+        return False
+
+    # 같은 캔들 → 후보 추가
     g["cand"].append(payload)
-    if g.get("winner"):
-        return payload.get("symbol") == g["winner"]
-    a, b = g["cand"][0], g["cand"][1]
-    sa, sb = abs(_candidate_score(a)), abs(_candidate_score(b))
-    winner = a if sa >= sb else b
-    g["winner"] = winner.get("symbol")
-    # 최종 승자만 True, 패자는 False
+
+    # 보유 중(holding): 짧은 TTL 후 승자 결정(대개 True)
+    if holding:
+        if not g.get("winner") and (now - float(g["t0"])) >= GK_TTL_HOLD_SEC:
+            a, b = g["cand"][0], g["cand"][1] if len(g["cand"]) > 1 else g["cand"][0]
+            sa = abs(float(a.get("score") or 0.0)); sb = abs(float(b.get("score") or 0.0))
+            g["winner"] = (a if sa >= sb else b).get("symbol")
+        return payload.get("symbol") == g.get("winner", payload.get("symbol"))
+
+    # 비보유(flat): 관찰창 종료 시점까지 두 후보 수집
+    if ENABLE_OBSERVE and now < float(g.get("observe_until") or now):
+        return False  # 관찰 중
+
+    # 관찰창 종료 → 후보 결정
+    if not g.get("winner"):
+
+        # === [ANCHOR: TARGET_SCORE_WAIT] 목표 점수 충족 대기 ===
+        if WAIT_TARGET_ENABLE and g.get("flat", False):
+            target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
+            if target > 0.0:
+                top_curr = max([abs(float(c.get("score") or 0.0)) for c in g["cand"]] or [0.0])
+                if time.time() < float(g.get("target_until") or 0.0) and top_curr < target:
+                    log(f"⏳ {tf}: target-wait (best={top_curr:.2f} < target={target:.2f})")
+                    return False
+                if TARGET_WAIT_MODE == "HARD" and top_curr < target:
+                    log(f"⛔ {tf}: target-not-met (best={top_curr:.2f} < target={target:.2f})")
+                    FRAME_GATE.pop(tf, None)
+                    return False
+                # SOFT 모드: 관찰창/대기 종료 시점에 best 후보로 진행
+
+        top = None; top_s = -1
+        for c in g["cand"]:
+            s = abs(float(c.get("score") or 0.0))
+            if s > top_s:
+                top, top_s = c, s
+        g["winner"] = top.get("symbol") if top else payload.get("symbol")
+
+
     return payload.get("symbol") == g["winner"]
 
 # [ANCHOR: EVAL_PROTECTIVE_EXITS]
@@ -3122,10 +3223,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
 
-    cand = {"symbol": symbol, "dir": signal, "score": EXEC_STATE.get(('score', symbol, tf))}
+
+    cand = {"symbol": symbol, "dir": signal, "score": float(EXEC_STATE.get(('score', symbol, tf)) or 0.0)}
     allowed = gatekeeper_offer(tf, candle_ts_ms, cand)
     if not allowed:
-        log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
+        import time
+        why = "cooldown" if time.time() < float(COOLDOWN_UNTIL.get(tf, 0.0) or 0.0) else ("observe" if FRAME_GATE.get(tf, {}).get("flat") else "hold-ttl")
+        log(f"⏸ {symbol} {tf}: pending gatekeeper ({why})")
+
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
@@ -4249,6 +4354,16 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
         await ch.send("\n".join(lines))
     except Exception as e:
         log(f"[NOTIFY] trade exit warn {symbol} {tf}: {e}")
+
+    # [ANCHOR: SET_COOLDOWN_ON_EXIT]
+    try:
+        if ENABLE_COOLDOWN:
+            import time
+            LAST_EXIT_TS[tf] = time.time()
+            COOLDOWN_UNTIL[tf] = LAST_EXIT_TS[tf] + float(POST_EXIT_COOLDOWN_SEC.get(tf, 0.0))
+            log(f"⏳ cooldown set: {tf} until {COOLDOWN_UNTIL[tf]:.0f}")
+    except Exception:
+        pass
 
 
 async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool:
