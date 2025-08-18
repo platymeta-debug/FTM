@@ -220,97 +220,62 @@ def _score_bucket(score, cfg):
         return None
 
 # [ANCHOR: GATEKEEPER_LOGIC]
-def _candidate_score(payload: dict) -> float:
-    # score 우선순위: 'total_score' > 'strength' > 'coefficient' > 0
-    for k in ("total_score","score","strength","coefficient"):
-        if k in payload and isinstance(payload[k], (int,float)):
-            return float(payload[k])
-    return 0.0
+# [PATCH B1: GATEKEEPER_OBS_PARSER]
+def _obs_ms_for(tf: str) -> int:
+    """
+    GATEKEEPER_OBS_SEC="15m:15,1h:25,4h:40,1d:60" 형식 파싱 → ms 반환
+    없으면 TF별 기본값 사용(15m:20,1h:25,4h:40,1d:60)
+    """
+    import os
+    raw = os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60")
+    try:
+        parts = [p.strip() for p in raw.split(",") if ":" in p]
+        kv = {k.strip(): int(v) for k, v in (p.split(":", 1) for p in parts)}
+    except Exception:
+        kv = {}
+    default = {"15m": 20, "1h": 25, "4h": 40, "1d": 60}
+    sec = kv.get(tf, default.get(tf, 20))
+    return int(sec) * 1000
 
+# [PATCH B2: GATEKEEPER_OBS_LOGIC]
 def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
     """
-
     동일 TF·동일 캔들(ts)에서 후보를 수집·선별한다.
-    - 보유중(포지션 존재): 빠른 동시성 조정만(TTL=GK_TTL_HOLD_SEC)
-    - 비보유(Flat): 짧은 관찰창(OBS_WINDOW_SEC[tf]) 동안 후보 수집 후 최고점수 1개만 채택
-    - 청산 직후: COOLDOWN_UNTIL[tf] 이전엔 진입 금지
-    - 강한 신호(|score|>=STRONG_BYPASS_SCORE): 관찰/쿨다운을 무시하고 즉시 통과
-    (PART 2의 '목표 점수 대기'는 아래에서 함께 처리)
+    - 첫 후보만 있는 상태로 관찰시간(OBS) 경과 → 단일 후보 승자 확정(True)
+    - 두 후보가 들어오면 점수 비교(abs)로 승자 1개만 True
+    - winner 확정 후에는 해당 심볼만 True
     """
     import time
-    now = time.time()
+    now_ms = int(time.time() * 1000)
     ts = int(candle_ts_ms)
 
-    # 포지션 보유 여부 계산(해당 TF에 어떤 심볼이든 점유 중인지)
-    holding = bool((PAPER_POS_TF and PAPER_POS_TF.get(tf)) or (FUT_POS_TF and FUT_POS_TF.get(tf)))
-    flat = not holding
-
-    # 청산 직후 쿨다운
-    if ENABLE_COOLDOWN and (now < float(COOLDOWN_UNTIL.get(tf, 0.0))):
-        log(f"⏭ {payload.get('symbol')} {tf}: skip (cooldown)")
-        return False
-
-    # 강한 신호 바이패스
-    score = float(payload.get("score") or 0.0)
-    if abs(score) >= float(STRONG_BYPASS_SCORE):
-        return True
-
-    # 프레임/관찰창 초기화
     g = FRAME_GATE.get(tf)
-    ttl = float(GK_TTL_HOLD_SEC if holding else (OBS_WINDOW_SEC.get(tf, GK_TTL_HOLD_SEC) if ENABLE_OBSERVE else 0.0))
     if (not g) or g.get("ts") != ts:
-        g = {"ts": ts, "cand": [payload], "winner": None, "t0": now,
-             "observe_until": now + ttl, "target_until": now + float(WAIT_TARGET_SEC.get(tf, 0.0)),
-             "flat": flat}
+        # 새 캔들 프레임 시작
+        g = {"ts": ts, "cand": [payload], "winner": None, "first_seen_ms": now_ms}
         FRAME_GATE[tf] = g
-        # 보유 중이면 첫 후보도 바로 True(빠른 처리)
-        if holding:
-            return True
-        # 비보유면 관찰창 시작: 첫 후보는 일단 보류
-        if not ENABLE_OBSERVE:
-            g["winner"] = payload.get("symbol")
-            return True
+        # 첫 후보는 일단 보류
         return False
 
-    # 같은 캔들 → 후보 추가
+    # 같은 캔들에서 후속 호출
+    # 1) 단일 후보로 OBS 경과 시 → 단일 후보 승자 확정
+    if len(g["cand"]) == 1 and not g.get("winner"):
+        if (now_ms - int(g.get("first_seen_ms") or now_ms)) >= _obs_ms_for(tf):
+            g["winner"] = g["cand"][0].get("symbol")
+            return payload.get("symbol") == g["winner"]
+
+    # 2) 후보 추가
     g["cand"].append(payload)
 
-    # 보유 중(holding): 짧은 TTL 후 승자 결정(대개 True)
-    if holding:
-        if not g.get("winner") and (now - float(g["t0"])) >= GK_TTL_HOLD_SEC:
-            a, b = g["cand"][0], g["cand"][1] if len(g["cand"]) > 1 else g["cand"][0]
-            sa = abs(float(a.get("score") or 0.0)); sb = abs(float(b.get("score") or 0.0))
-            g["winner"] = (a if sa >= sb else b).get("symbol")
-        return payload.get("symbol") == g.get("winner", payload.get("symbol"))
+    # 3) 이미 승자 있으면 그 심볼만 통과
+    if g.get("winner"):
+        return payload.get("symbol") == g["winner"]
 
-    # 비보유(flat): 관찰창 종료 시점까지 두 후보 수집
-    if ENABLE_OBSERVE and now < float(g.get("observe_until") or now):
-        return False  # 관찰 중
-
-    # 관찰창 종료 → 후보 결정
-    if not g.get("winner"):
-
-        # === [ANCHOR: TARGET_SCORE_WAIT] 목표 점수 충족 대기 ===
-        if WAIT_TARGET_ENABLE and g.get("flat", False):
-            target = float(TARGET_SCORE_BY_TF.get(tf, 0.0))
-            if target > 0.0:
-                top_curr = max([abs(float(c.get("score") or 0.0)) for c in g["cand"]] or [0.0])
-                if time.time() < float(g.get("target_until") or 0.0) and top_curr < target:
-                    log(f"⏳ {tf}: target-wait (best={top_curr:.2f} < target={target:.2f})")
-                    return False
-                if TARGET_WAIT_MODE == "HARD" and top_curr < target:
-                    log(f"⛔ {tf}: target-not-met (best={top_curr:.2f} < target={target:.2f})")
-                    FRAME_GATE.pop(tf, None)
-                    return False
-                # SOFT 모드: 관찰창/대기 종료 시점에 best 후보로 진행
-
-        top = None; top_s = -1
-        for c in g["cand"]:
-            s = abs(float(c.get("score") or 0.0))
-            if s > top_s:
-                top, top_s = c, s
-        g["winner"] = top.get("symbol") if top else payload.get("symbol")
-
+    # 4) 두 후보 비교로 승자 결정 (점수 절댓값 큰 쪽)
+    a, b = g["cand"][0], g["cand"][1] if len(g["cand"]) > 1 else g["cand"][0]
+    sa = abs(float(a.get("score") or 0.0))
+    sb = abs(float(b.get("score") or 0.0))
+    g["winner"] = (a if sa >= sb else b).get("symbol")
 
     return payload.get("symbol") == g["winner"]
 
@@ -3212,17 +3177,16 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
 
-    cand = {"symbol": symbol, "dir": signal, "score": float(EXEC_STATE.get(('score', symbol, tf)) or 0.0)}
-    allowed = gatekeeper_offer(tf, candle_ts_ms, cand)
-    if not allowed:
-        import time
-        why = "cooldown" if time.time() < float(COOLDOWN_UNTIL.get(tf, 0.0) or 0.0) else ("observe" if FRAME_GATE.get(tf, {}).get("flat") else "hold-ttl")
-        log(f"⏸ {symbol} {tf}: pending gatekeeper ({why})")
-        log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
-        return
-
+    # [PATCH A: ROUTE_BEFORE_GATEKEEPER]
     if not _route_allows(symbol, tf):
         log(f"⏭ {symbol} {tf}: skip reason=ROUTE")
+        return
+
+    cand = {"symbol": symbol, "dir": signal, "score": EXEC_STATE.get(('score', symbol, tf))}
+    allowed = gatekeeper_offer(tf, int(candle_ts_ms), cand)
+    if not allowed:
+        log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
+        log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
     if tf not in IGNORE_OCCUPANCY_TFS and PAPER_POS_TF.get(tf):
