@@ -238,9 +238,11 @@ def _candidate_score(payload: dict) -> float:
     return 0.0
 
 def gatekeeper_offer(tf: str, candle_ts_ms: int, payload: dict) -> bool:
+
     """게이트키퍼 V3: 동일 TF·캔들 내 후보 경쟁/관찰"""
     now_ms = int(time.time() * 1000)
     score = float(payload.get("score") or 0.0)
+
 
     g = FRAME_GATE.get(tf)
     if not g or int(g.get("ts", -1)) != int(candle_ts_ms):
