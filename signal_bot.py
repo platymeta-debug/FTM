@@ -2946,6 +2946,7 @@ def _min_notional_ok(ex, symbol, price, amount):
         return (price * amount) >= MIN_NOTIONAL
 
 
+
 def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, str]:
     tp_pct = float((take_profit_pct or {}).get(tf, 0.0))
     sl_pct = float((HARD_STOP_PCT or {}).get(tf, 0.0))
@@ -2962,6 +2963,7 @@ def _eval_tp_sl(side: str, entry: float, price: float, tf: str) -> tuple[bool, s
         if sl_pct and price >= entry * (1 + sl_pct/100):
             return True, "SL"
     return False, ""
+
 
 async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, entry_map):
     key = (symbol, tf)
@@ -5248,11 +5250,13 @@ async def send_timed_reports():
                     if _len(df) == 0:
                         log(f"⏭️ {symbol_eth} {tf} 보고서 생략: 데이터 없음")
                         continue
+
                     display_price = sanitize_price_for_tf(symbol_eth, tf,
                         (current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price)
                     )
                     # [ANCHOR: daily_change_unify_eth_alt]
                     daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
+
 
                     
                     # 📍 ETH 진입 정보 주입
@@ -5296,6 +5300,7 @@ async def send_timed_reports():
                     # ETH의 이 경로는 short_msg를 안 쓰므로 메인/요약에만 반영
                     main_msg_pdf = addon + "\n" + main_msg_pdf
                     summary_msg_pdf = addon + "\n" + summary_msg_pdf
+
 
                     display_price = current_price_eth if isinstance(current_price_eth, (int, float)) else closed_price
                     display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
@@ -5387,7 +5392,9 @@ async def send_timed_reports():
                     display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
                     display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
                     # [ANCHOR: daily_change_unify_btc]
+
                     daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
+
 
                     # 4) 진입 정보 (없으면 None)
                     _epb = entry_data_btc.get(tf)  # (entry_price, entry_time)
@@ -5415,8 +5422,13 @@ async def send_timed_reports():
                         show_risk=False
                     )
 
+                    display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
+                    display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
+
                     # (선택) PDF 생성 — 파일 목록에 같이 첨부
                     try:
+                        display_price = current_price_btc if isinstance(current_price_btc, (int, float)) else c_c
+                        display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
                         pdf_path = generate_pdf_report(
                             df=df, tf=tf, symbol=symbol_btc,
                             signal=signal, price=display_price, score=score,
@@ -5622,6 +5634,7 @@ async def on_ready():
                 display_price = eth_live if isinstance(eth_live, (int, float)) else c_c
                 display_price = sanitize_price_for_tf(symbol_eth, tf, display_price)
                 # [ANCHOR: daily_change_unify_eth]
+
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
@@ -5639,6 +5652,7 @@ async def on_ready():
                         elif TRADE_MODE == "futures":
                             await futures_close_all(symbol_eth, tf, exit_price=float(display_price), reason=reason)
                         continue
+
 
                 # 현재가가를 차해가면 최고/최저가 갱신
                 if highest_price[tf] is None:
@@ -5924,6 +5938,7 @@ async def on_ready():
                         # 폴백: POSIX seconds → ms
                         candle_ts = int(df['timestamp'].iloc[-2].timestamp() * 1000)
 
+
                 trigger_mode = trigger_mode_for(tf)
                 log(f"[DEBUG] {symbol_eth} live={eth_live} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
                 await handle_trigger(symbol_eth, tf, trigger_mode, signal, display_price, c_ts, entry_data)
@@ -5980,6 +5995,7 @@ async def on_ready():
                 else:
                     neutral_info[tf] = None
 
+
                 log_to_csv(symbol_eth, tf, signal, display_price, rsi, macd, pnl,
                         entry_price=entry_price,
                         entry_time=entry_time,
@@ -6030,6 +6046,7 @@ async def on_ready():
                 display_price = btc_live if isinstance(btc_live, (int, float)) else price
                 display_price = sanitize_price_for_tf(symbol_btc, tf, display_price)
                 # [ANCHOR: daily_change_unify_btc]
+
                 daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
@@ -6047,6 +6064,7 @@ async def on_ready():
                         elif TRADE_MODE == "futures":
                             await futures_close_all(symbol_btc, tf, exit_price=float(display_price), reason=reason)
                         continue
+
 
                 # 🔽 BTC 심볼+타임프레임별 리포트/이미지 경로 생성
                 score_file = plot_score_history(symbol_btc, tf)
@@ -6270,6 +6288,7 @@ async def on_ready():
                 _entry_price = _epb[0] if _epb else None
                 _entry_time  = _epb[1] if _epb else None
 
+
                 log_to_csv(
                     symbol_btc,
                     tf,
@@ -6462,11 +6481,13 @@ async def on_message(message):
 
         # 일봉 변동률 계산
         price_now = fetch_live_price(symbol)
+
         display_price = sanitize_price_for_tf(symbol, tf,
             (price_now if isinstance(price_now, (int, float)) else price)
         )
         # [ANCHOR: daily_change_unify_eth_alt]
         daily_change_pct = calc_daily_change_pct(symbol, display_price)
+
 
 
         main_msg_pdf, summary_msg_pdf, _short_msg_pdf = format_signal_message(
@@ -6485,7 +6506,9 @@ async def on_message(message):
             agree_long=agree_long,
             agree_short=agree_short,
             daily_change_pct=daily_change_pct,
+
             live_price=price_now,
+
             show_risk=False
         )
         msg_for_pdf = f"{main_msg_pdf}\n\n{summary_msg_pdf}"
@@ -6494,6 +6517,9 @@ async def on_message(message):
         score_file = plot_score_history(symbol, tf)
         perf_file  = analyze_performance_for(symbol, tf)
         performance_file = generate_performance_stats(tf, symbol=symbol)
+
+        display_price = current_price_eth if isinstance(current_price_eth, (int, float)) else price
+        display_price = sanitize_price_for_tf(symbol, tf, display_price)
 
         pdf_path = generate_pdf_report(
             df=df,
