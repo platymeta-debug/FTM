@@ -64,6 +64,15 @@ AFTER_CLOSE_PAUSE = (cfg_get("AFTER_CLOSE_PAUSE", "1") == "1")
 DAILY_RESUME_HOUR_KST = int(cfg_get("DAILY_RESUME_HOUR_KST", "11"))
 _LAST_RESUME_YMD = None
 
+# [ANCHOR: PAUSE_BOOT_INIT]
+# Apply default pause only once on boot (global), not per-loop.
+try:
+    if DEFAULT_PAUSE and "__ALL__" not in PAUSE_UNTIL:
+        PAUSE_UNTIL["__ALL__"] = 2**62
+        logging.info("[PAUSE] default all paused on boot (until resume)")
+except Exception as _:
+    pass
+
 
 # === [ANCHOR: OBS_COOLDOWN_CFG] Gatekeeper/Observe/Cooldown Config ===
 def _parse_kv_numbers(val: str | None, default: dict[str, float]) -> dict[str, float]:
@@ -909,6 +918,22 @@ neutral_info = {'15m': None, '1h': None, '4h': None, '1d': None}
 entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
 highest_price = {}    # (symbol, tf) -> float
 lowest_price = {}     # (symbol, tf) -> float
+
+# [ANCHOR: LAST_PRICE_GLOBALS]
+LAST_PRICE = {}  # symbol -> last/mark price cache
+
+def set_last_price(symbol: str, price: float) -> None:
+    try:
+        LAST_PRICE[str(symbol).upper()] = float(price)
+    except Exception:
+        pass
+
+def get_last_price(symbol: str, default_price: float = 0.0) -> float:
+    try:
+        v = LAST_PRICE.get(str(symbol).upper())
+        return float(v) if v is not None else float(default_price)
+    except Exception:
+        return float(default_price)
 
 previous_bucket = {'15m': None, '1h': None, '4h': None, '1d': None}
 
@@ -6218,9 +6243,6 @@ async def on_ready():
                 now_ms = int(time.time()*1000)
                 key_all = PAUSE_UNTIL.get("__ALL__", 0)
                 key_tf = PAUSE_UNTIL.get((symbol_eth, tf), 0)
-                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
-                    PAUSE_UNTIL[(symbol_eth, tf)] = 2**62
-                    key_tf = PAUSE_UNTIL[(symbol_eth, tf)]
                 if now_ms < max(key_all, key_tf):
                     log(f"⏸ {symbol_eth} {tf}: paused until {(max(key_all, key_tf))}")
                     idem_mark(symbol_eth, tf, c_ts)
@@ -6256,6 +6278,11 @@ async def on_ready():
                 snap = await get_price_snapshot(symbol_eth)
                 live_price = snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: LAST_PRICE_UPDATE_ETH]
+                try:
+                    set_last_price(symbol_eth, display_price)
+                except Exception:
+                    pass
                 # [ANCHOR: daily_change_unify_eth]
 
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
@@ -6670,9 +6697,6 @@ async def on_ready():
                 now_ms = int(time.time()*1000)
                 key_all = PAUSE_UNTIL.get("__ALL__", 0)
                 key_tf = PAUSE_UNTIL.get((symbol_btc, tf), 0)
-                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
-                    PAUSE_UNTIL[(symbol_btc, tf)] = 2**62
-                    key_tf = PAUSE_UNTIL[(symbol_btc, tf)]
                 if now_ms < max(key_all, key_tf):
                     log(f"⏸ {symbol_btc} {tf}: paused until {(max(key_all, key_tf))}")
                     idem_mark(symbol_btc, tf, c_ts)
@@ -6703,6 +6727,11 @@ async def on_ready():
                 snap = await get_price_snapshot(symbol_btc)
                 live_price = snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: LAST_PRICE_UPDATE_BTC]
+                try:
+                    set_last_price(symbol_btc, display_price)
+                except Exception:
+                    pass
                 # [ANCHOR: daily_change_unify_btc]
 
                 daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
@@ -7082,12 +7111,12 @@ async def _set_pause(symbol: str | None, tf: str | None, minutes: int | None):
 
 @client.event
 async def on_message(message):
-    global os
     if message.author == client.user:
         return
 
     content = message.content.strip()
     parts = content.split()
+    # using global LAST_PRICE cache defined at module scope
 
     # [ANCHOR: CMD_SET_GET_SAVEENV]
     if content.startswith("!set "):
@@ -7168,8 +7197,14 @@ async def on_message(message):
     if content.startswith("!closeall"):
         try:
             n = 0
-            for (sym, tf), pos in list(PAPER_POS.items()):
-                _paper_close(sym, tf, float(LAST_PRICE.get(sym, pos.get("entry_price", 0))))
+            # PAPER_POS key is "SYMBOL|TF" (string). Split safely.
+            for key, pos in list(PAPER_POS.items()):
+                try:
+                    sym, tf = key.split("|", 1)
+                except Exception:
+                    continue
+                fallback = float(pos.get("entry_price", 0.0))
+                _paper_close(sym, tf, get_last_price(sym, fallback))
                 n += 1
             for tfk, sym in list(FUT_POS_TF.items()):
                 await futures_close_all(sym, tfk)
@@ -7183,7 +7218,7 @@ async def on_message(message):
         try:
             _, sym, tfx = content.split()
             if TRADE_MODE == "paper":
-                _paper_close(sym.upper(), tfx, float(LAST_PRICE.get(sym.upper(), 0)))
+                _paper_close(sym.upper(), tfx, get_last_price(sym.upper(), 0.0))
             else:
                 await futures_close_symbol_tf(sym.upper(), tfx)
             await message.channel.send(f"🟢 closed {sym.upper()} {tfx}")
@@ -7222,7 +7257,8 @@ async def on_message(message):
                 if tr is not None: pos["tr_pct"] = tr
                 FUT_POS[sym] = pos; _save_json(OPEN_POS_FILE, FUT_POS)
                 await _cancel_symbol_conditional_orders(sym)
-                await _ensure_tp_sl_trailing(sym, tfx, float(LAST_PRICE.get(sym, pos.get("entry", 0))), pos.get("side", "LONG"))
+                fallback = float(pos.get("entry", 0.0))
+                await _ensure_tp_sl_trailing(sym, tfx, get_last_price(sym, fallback), pos.get("side", "LONG"))
             await message.channel.send(f"⚙️ risk updated {sym} {tfx} (tp={tp}, sl={sl}, tr={tr})")
         except Exception as e:
             await message.channel.send(f"⚠️ risk error: {e}")
