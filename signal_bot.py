@@ -6195,6 +6195,7 @@ async def on_ready():
                     continue
 
                 now_str = datetime.now().strftime("%m월 %d일 %H:%M")
+                key2 = (symbol_eth, tf)
                 previous = previous_signal.get(key2)
 
                 snap = await get_price_snapshot(symbol_eth)
@@ -6203,8 +6204,6 @@ async def on_ready():
                 # [ANCHOR: daily_change_unify_eth]
 
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
-
-                key2 = (symbol_eth, tf)
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
                 k = f"{symbol_eth}|{tf}"
