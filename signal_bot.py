@@ -62,6 +62,11 @@ WAIT_TARGET_SEC = _parse_kv_numbers(os.getenv("WAIT_TARGET_SEC"), {"15m": 0.0, "
 TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
 GK_DEBUG = os.getenv("GK_DEBUG", "0") == "1"
 
+EXIT_DEBUG = os.getenv("EXIT_DEBUG", "0") == "1"
+STRICT_EXIT_NOTIFY = os.getenv("STRICT_EXIT_NOTIFY", "1") == "1"
+PAPER_STRICT_NONZERO = os.getenv("PAPER_STRICT_NONZERO", "0") == "1"
+
+
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
 
 # {tf: {"candle_ts_ms": int, "cand": [dict], "winner": str|None,
@@ -253,7 +258,6 @@ def _abs_score(c: dict) -> float:
     except Exception:
         pass
     return 0.0
-
 
 # [ANCHOR: GATEKEEPER_V3_BEGIN]
 def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
@@ -3291,14 +3295,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     pos = (PAPER_POS or {}).get(key)
     if pos:
         side  = str(pos.get("side", "")).upper()
-        entry = float(pos.get("entry") or 0)
+        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
         snap_curr = await get_price_snapshot(symbol)
         curr = snap_curr.get("mark") or snap_curr.get("mid") or snap_curr.get("last") or last_price
         hit, reason = _eval_tp_sl(side, float(entry), float(curr), tf)
         if hit:
-            await _notify_trade_exit(symbol, tf, side=side, entry_price=entry, exit_price=float(last_price), reason=(reason or "TP/SL"), mode=("paper" if TRADE_MODE!="futures" else "futures"))
-            PAPER_POS.pop(key, None); _save_json(PAPER_POS_FILE, PAPER_POS)
-            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+            info = _paper_close(symbol, tf, float(last_price))
+            if info:
+                await _notify_trade_exit(symbol, tf, side=info["side"], entry_price=info["entry_price"], exit_price=float(last_price), reason=(reason or "TP/SL"), mode="paper", pnl_pct=info.get("pnl_pct"))
             log(f"⏭ {symbol} {tf}: exited by {reason}, skip new entry this tick")
             log(f"⏭ {symbol} {tf}: skip reason=PROTECT")
             return
@@ -3342,21 +3346,40 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         return
 
 
+    alloc = _preview_allocation_and_qty(
+        symbol=symbol,
+        tf=tf,
+        signal=exec_signal,
+        price=float(last_price),
+        ex=None
+    )
+    base_margin = alloc["base_margin"]
+    eff_margin  = alloc["eff_margin"]
+    lev_used    = alloc["lev_used"]
+    qty         = alloc["qty"]
+
     PAPER_POS[key] = {
         "side": ("LONG" if exec_signal == "BUY" else "SHORT"),
         "entry": float(last_price),
-        "opened_ts": candle_ts*1000,
+        "entry_price": float(last_price),
+        "qty": qty,
+        "eff_margin": eff_margin,
+        "lev": lev_used,
+        "ts_ms": int(time.time()*1000),
         "high": float(last_price),
         "low": float(last_price)
     }
     _save_json(PAPER_POS_FILE, PAPER_POS)
 
+    if TRADE_MODE == "paper" and PAPER_STRICT_NONZERO and (not base_margin or not eff_margin or not qty):
+        logging.warning("[PAPER_WARN] zero allocation on paper entry: check PART A")
+
     await _notify_trade_entry(
         symbol, tf, exec_signal,
         mode="paper", price=float(last_price),
-        qty=0.0,
-        base_margin=0, eff_margin=0,
-        lev_used=0,
+        qty=qty,
+        base_margin=base_margin, eff_margin=eff_margin,
+        lev_used=lev_used,
         score=EXEC_STATE.get(('score', symbol, tf))
     )
 
@@ -3590,17 +3613,21 @@ def _mtf_alignment_text(symbol: str, tf: str, direction: str):
     agree = oppose = 0
     seen = 0
     for htf in htfs:
-        rec = SIG_STATE.get((symbol, htf)) or {}
-        d = rec.get('dir')
-        if d:
-            parts.append(f"{htf}: {d}")
-            seen += 1
-            if d == direction:
-                agree += 1
-            else:
-                oppose += 1
-        else:
+        rec = SIG_STATE.get((symbol, htf))
+        if rec is None:
             parts.append(f"{htf}: -")
+        else:
+            d = rec.get('dir')
+            if d:
+                parts.append(f"{htf}: {d}")
+                seen += 1
+                if d == direction:
+                    agree += 1
+                else:
+                    oppose += 1
+            else:
+                parts.append(f"{htf}: Neutral")
+                seen += 1
 
     if seen == 0:
         tail = "데이터 없음"
@@ -3764,6 +3791,37 @@ PAPER_POS = _load_json(PAPER_POS_FILE, {})   # key: f"{symbol}|{tf}" -> {side, e
 
 FUT_POS    = _load_json(OPEN_POS_FILE, {})         # symbol -> {'side','qty','entry'}
 FUT_POS_TF = _load_json(OPEN_TF_FILE, {})          # tf -> "BTC/USDT" 또는 "ETH/USDT"
+
+
+def _has_open_position(symbol: str, tf: str, mode: str) -> bool:
+    if mode == "paper":
+        return PAPER_POS.get(f"{symbol}|{tf}") is not None
+    pos = FUT_POS.get(symbol)
+    try:
+        return bool(pos and abs(float(pos.get("qty", 0))) > 0)
+    except Exception:
+        return False
+
+
+def _paper_close(symbol: str, tf: str, exit_price: float):
+    key = f"{symbol}|{tf}"
+    pos = PAPER_POS.pop(key, None)
+    if not pos:
+        return None
+    _save_json(PAPER_POS_FILE, PAPER_POS)
+    if PAPER_POS_TF.get(tf) == symbol:
+        PAPER_POS_TF.pop(tf, None)
+        _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+    side = pos.get("side", "")
+    entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+    pnl_pct = None
+    try:
+        if entry > 0 and exit_price > 0:
+            gross = ((exit_price - entry) / entry) * 100.0 if side == "LONG" else ((entry - exit_price) / entry) * 100.0
+            pnl_pct = gross
+    except Exception:
+        pnl_pct = None
+    return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct}
 
 # [ANCHOR: HYDRATE_FROM_DISK_BEGIN]
 def _hydrate_from_disk():
@@ -4301,6 +4359,9 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             log(f"[SKIP] trade notify {symbol} {tf}: channel not found {cid}")
             return
 
+        if mode == "paper" and PAPER_STRICT_NONZERO and ((not base_margin) or (not eff_margin) or (not qty)):
+            logging.warning("[PAPER_WARN] zero allocation on paper entry: check PART A")
+
         # 강도/MTF 요약
         sf = mf = None
         all_align = False
@@ -4535,6 +4596,28 @@ async def _auto_close_and_notify_eth(
     # reason이 비었으면 action으로 대체
     action_reason = reason or action
 
+    if not _has_open_position(symbol_eth, tf, TRADE_MODE):
+        if EXIT_DEBUG:
+            logging.info(f"[EXIT_DEBUG] skip exit: no open position for {symbol_eth} {tf}")
+        return
+
+    if TRADE_MODE == "paper":
+        info = _paper_close(symbol_eth, tf, float(exit_price))
+        if info:
+            try:
+                await _notify_trade_exit(
+                    symbol_eth, tf,
+                    side=info["side"],
+                    entry_price=info["entry_price"],
+                    exit_price=float(exit_price),
+                    reason=str(action_reason),
+                    mode="paper",
+                    pnl_pct=info.get("pnl_pct"),
+                )
+            except Exception as e:
+                log(f"[NOTIFY] paper exit warn {symbol_eth} {tf}: {e}")
+        return
+
     # 표시용 신호: 진입/청산 가격으로 추정(스팟 기준)
     display_signal = "BUY"
     if entry_price is not None and exit_price is not None:
@@ -4603,9 +4686,30 @@ async def _auto_close_and_notify_btc(
     BTC 자동 종료: 선물 청산 → 알림 전송 → CSV/상태 정리
     """
     action_reason = (reason or action or "").strip()
+    if not _has_open_position(symbol, tf, TRADE_MODE):
+        if EXIT_DEBUG:
+            logging.info(f"[EXIT_DEBUG] skip exit: no open position for {symbol} {tf}")
+        return
     ep = float(entry_price or 0.0)
     cp = float(curr_price or 0.0)
     xp = float(exit_price or cp or 0.0)
+
+    if TRADE_MODE == "paper":
+        info = _paper_close(symbol, tf, xp)
+        if info:
+            try:
+                await _notify_trade_exit(
+                    symbol, tf,
+                    side=info["side"],
+                    entry_price=info["entry_price"],
+                    exit_price=xp,
+                    reason=action_reason,
+                    mode="paper",
+                    pnl_pct=info.get("pnl_pct"),
+                )
+            except Exception as e:
+                log(f"[NOTIFY] paper exit warn {symbol} {tf}: {e}")
+        return
 
     # 선물 청산 시도
     status = "🧪 시뮬레이션/미실행"
@@ -5761,13 +5865,13 @@ async def on_ready():
                 pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_eth) if TRADE_MODE == "futures" else None)
                 if pos:
                     side = pos.get("side")
-                    entry = float(pos.get("entry") or 0)
+                    entry = float(pos.get("entry_price") or pos.get("entry") or 0)
                     hit, reason = _eval_tp_sl(side, entry, float(snap.get("mark") or display_price), tf)
                     if hit:
                         if TRADE_MODE == "paper":
-                            await _notify_trade_exit(symbol_eth, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
-                            PAPER_POS.pop(k, None); _save_json(PAPER_POS_FILE, PAPER_POS)
-                            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                            info = _paper_close(symbol_eth, tf, float(display_price))
+                            if info:
+                                await _notify_trade_exit(symbol_eth, tf, side=info["side"], entry_price=info["entry_price"], exit_price=float(display_price), reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"))
                         elif TRADE_MODE == "futures":
                             await futures_close_all(symbol_eth, tf, exit_price=float(display_price), reason=reason)
                         continue
@@ -6188,13 +6292,13 @@ async def on_ready():
                 pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_btc) if TRADE_MODE == "futures" else None)
                 if pos:
                     side = pos.get("side")
-                    entry = float(pos.get("entry") or 0)
+                    entry = float(pos.get("entry_price") or pos.get("entry") or 0)
                     hit, reason = _eval_tp_sl(side, entry, float(snap.get("mark") or display_price), tf)
                     if hit:
                         if TRADE_MODE == "paper":
-                            await _notify_trade_exit(symbol_btc, tf, side=("LONG" if side=="LONG" else "SHORT"), entry_price=entry, exit_price=float(display_price), reason=reason, mode="paper")
-                            PAPER_POS.pop(k, None); _save_json(PAPER_POS_FILE, PAPER_POS)
-                            PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                            info = _paper_close(symbol_btc, tf, float(display_price))
+                            if info:
+                                await _notify_trade_exit(symbol_btc, tf, side=info["side"], entry_price=info["entry_price"], exit_price=float(display_price), reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"))
                         elif TRADE_MODE == "futures":
                             await futures_close_all(symbol_btc, tf, exit_price=float(display_price), reason=reason)
                         continue
