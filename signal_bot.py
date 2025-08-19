@@ -60,10 +60,13 @@ WAIT_TARGET_ENABLE = os.getenv("WAIT_TARGET_ENABLE", "1") == "1"
 TARGET_SCORE_BY_TF = _parse_kv_numbers(os.getenv("TARGET_SCORE_BY_TF"), {"15m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0})
 WAIT_TARGET_SEC = _parse_kv_numbers(os.getenv("WAIT_TARGET_SEC"), {"15m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0})
 TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
+GK_DEBUG = os.getenv("GK_DEBUG", "0") == "1"
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
 
-FRAME_GATE = {}       # {tf: {"ts": int, "cand": [dict], "winner": str|None, "obs_until": int, "tgt_until": int}}
+# {tf: {"candle_ts_ms": int, "cand": [dict], "winner": str|None,
+#       "first_seen_ms": int, "obs_until_ms": int, "target_until_ms": int}}
+FRAME_GATE = {}
 LAST_EXIT_TS = {}     # {tf: epoch_sec}
 COOLDOWN_UNTIL = {}   # {tf: epoch_sec}
 
@@ -241,7 +244,18 @@ def _parse_tf_map(s: str, cast=float):
 def _now_ms() -> int:
     return int(time.time() * 1000)
 
+# === Gatekeeper helpers ===
+def _abs_score(c: dict) -> float:
+    try:
+        for k in ("score", "total_score", "strength", "coefficient"):
+            if k in c and isinstance(c[k], (int, float)):
+                return abs(float(c[k]))
+    except Exception:
+        pass
+    return 0.0
 
+
+# [ANCHOR: GATEKEEPER_V3_BEGIN]
 def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
     """
     OBS/TARGET-aware selector per TF & candle:
@@ -256,36 +270,30 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
     TARGET_MAP     = _parse_tf_map(os.getenv("TARGET_SCORE_BY_TF", "15m:0,1h:0,4h:0,1d:0"), float)
     WAIT_SEC_MAP   = _parse_tf_map(os.getenv("WAIT_TARGET_SEC", "15m:0,1h:0,4h:0,1d:0"), int)
     WAIT_ENABLE    = (os.getenv("WAIT_TARGET_ENABLE", "0") == "1")
-    WAIT_MODE      = (os.getenv("TARGET_WAIT_MODE", "SOFT") or "SOFT").upper()  # SOFT|HARD
+    WAIT_MODE      = (os.getenv("TARGET_WAIT_MODE", "SOFT") or "SOFT").upper()
     STRONG_BYPASS  = float(os.getenv("STRONG_BYPASS_SCORE", "0") or 0.0)
-
-    def _abs_score(c: dict) -> float:
-        try:
-            # common field name is "score" (fallbacks supported)
-            for k in ("score", "total_score", "strength", "coefficient"):
-                if k in c and isinstance(c[k], (int, float)):
-                    return abs(float(c[k]))
-        except Exception:
-            pass
-        return 0.0
-
 
     now_ms = _now_ms()
     g = FRAME_GATE.get(tf)
 
-
     # New candle → open frame
-    if (not g) or int(g.get("ts", -1)) != int(candle_ts_ms):
+    if (not g) or int(g.get("candle_ts_ms", -1)) != int(candle_ts_ms):
         obs_ms = int(OBS_SEC_MAP.get(tf, 0)) * 1000
         tgt_ms = int(WAIT_SEC_MAP.get(tf, 0)) * 1000 if WAIT_ENABLE else 0
         g = {
-            "ts": int(candle_ts_ms),
+            "candle_ts_ms": int(candle_ts_ms),
             "cand": [],
             "winner": None,
-            "obs_until": now_ms + obs_ms if obs_ms > 0 else now_ms,
-            "tgt_until": now_ms + tgt_ms if tgt_ms > 0 else now_ms,
+            "first_seen_ms": now_ms,
+            "obs_until_ms": now_ms + obs_ms if obs_ms > 0 else now_ms,
+            "target_until_ms": now_ms + tgt_ms if tgt_ms > 0 else now_ms,
         }
         FRAME_GATE[tf] = g
+        if GK_DEBUG:
+            log(f"[GK] {tf} frame-open ts={candle_ts_ms} obs={g['obs_until_ms']} tgt={g['target_until_ms']}")
+    else:
+        if GK_DEBUG:
+            log(f"[GK] {tf} frame-update ts={candle_ts_ms} obs={g.get('obs_until_ms')} tgt={g.get('target_until_ms')}")
 
     # De-dup same symbol; keep latest
     g["cand"] = [c for c in g["cand"] if c.get("symbol") != cand.get("symbol")]
@@ -293,40 +301,89 @@ def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
 
     # If already decided
     if g.get("winner"):
-        return (cand.get("symbol") == g["winner"])
+        return cand.get("symbol") == g["winner"]
 
     # Two or more candidates → decide by |score|
     if len(g["cand"]) >= 2:
         best = max(g["cand"], key=_abs_score)
         g["winner"] = best.get("symbol")
+        if GK_DEBUG:
+            log(f"[GK] {tf} dual-candidate winner={g['winner']}")
         return cand.get("symbol") == g["winner"]
 
     # Single candidate path
-    # Strong bypass (optional)
-    if STRONG_BYPASS and _abs_score(cand) >= STRONG_BYPASS:
-        g["winner"] = cand.get("symbol")
+    single = g["cand"][0]
+
+    # Strong bypass
+    if STRONG_BYPASS and _abs_score(single) >= STRONG_BYPASS:
+        g["winner"] = single.get("symbol")
+        if GK_DEBUG:
+            log(f"[GK] {tf} single-candidate strong-bypass")
         return True
 
-    # Wait until OBS expires
-    if now_ms < int(g.get("obs_until") or 0):
-        return False
+    obs_until = int(g.get("obs_until_ms") or 0)
+    tgt_until = int(g.get("target_until_ms") or 0)
 
-    # Apply TARGET waiting rules
+    if now_ms < obs_until:
+        return False
+    if GK_DEBUG and now_ms >= obs_until:
+        log(f"[GK] {tf} timer-expired obs")
+
     if WAIT_ENABLE:
         target = float(TARGET_MAP.get(tf, 0.0))
-        sc = _abs_score(cand)
+        sc = _abs_score(single)
         if WAIT_MODE == "HARD":
             if sc < target:
-                # HARD: do not enter this candle
                 return False
         else:  # SOFT
-            if sc < target and now_ms < int(g.get("tgt_until") or 0):
+            if sc < target and now_ms < tgt_until:
                 return False
+        if GK_DEBUG and now_ms >= tgt_until:
+            log(f"[GK] {tf} timer-expired tgt")
 
-    # Release single candidate
-    g["winner"] = cand.get("symbol")
+    g["winner"] = single.get("symbol")
+    if GK_DEBUG:
+        log(f"[GK] {tf} single-candidate release={g['winner']}")
     return True
 # [ANCHOR: GATEKEEPER_V3_END]
+
+
+def gatekeeper_heartbeat(now_ms: int):
+    """Auto-release pending frames once timers expire."""
+    OBS_SEC_MAP  = _parse_tf_map(os.getenv("GATEKEEPER_OBS_SEC", "15m:20,1h:25,4h:40,1d:60"), int)
+    TARGET_MAP   = _parse_tf_map(os.getenv("TARGET_SCORE_BY_TF", "15m:0,1h:0,4h:0,1d:0"), float)
+    WAIT_ENABLE  = (os.getenv("WAIT_TARGET_ENABLE", "0") == "1")
+    WAIT_MODE    = (os.getenv("TARGET_WAIT_MODE", "SOFT") or "SOFT").upper()
+
+    for tf, g in list(FRAME_GATE.items()):
+        if not isinstance(g, dict):
+            continue
+        cand_list = g.get("cand") or []
+        if len(cand_list) != 1 or g.get("winner"):
+            continue
+        obs_until = int(g.get("obs_until_ms") or 0)
+        tgt_until = int(g.get("target_until_ms") or 0)
+        if now_ms < obs_until:
+            continue
+        if GK_DEBUG and (now_ms >= obs_until or now_ms >= tgt_until):
+            log(f"[GK] {tf} timer-expired obs={now_ms >= obs_until} tgt={now_ms >= tgt_until}")
+        cand = cand_list[0]
+        score = _abs_score(cand)
+        target = float(TARGET_MAP.get(tf, 0.0))
+        allow = False
+        if not WAIT_ENABLE:
+            allow = True
+        elif WAIT_MODE == "HARD":
+            allow = score >= target
+        else:  # SOFT
+            allow = (score >= target) or (now_ms >= tgt_until)
+        if allow:
+            g["winner"] = cand.get("symbol")
+            if GK_DEBUG:
+                log(f"[GK] {tf} heartbeat release={g['winner']}")
+        ttl_ms = int(GK_TTL_HOLD_SEC * 1000) if GK_TTL_HOLD_SEC else 0
+        if ttl_ms and (now_ms - g.get("first_seen_ms", now_ms)) > ttl_ms and not g.get("winner"):
+            FRAME_GATE.pop(tf, None)
 
 
 
@@ -3258,7 +3315,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     # ② 게이트키퍼
 
     cand = {"symbol": symbol, "dir": exec_signal, "score": EXEC_STATE.get(('score', symbol, tf))}
-    allowed = gatekeeper_offer(tf, candle_ts, cand)
+    allowed = gatekeeper_offer(tf, candle_ts * 1000, cand)
 
     if not allowed:
         log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
@@ -5524,6 +5581,8 @@ async def send_timed_reports():
 
                     # 7) 알림 억제(게이팅)
                     curr_bucket = _score_bucket(score, CFG)
+                    trigger_mode = trigger_mode_for(tf)
+                    await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
                     ok_to_send, why = _should_notify(
                         tf, score, c_c, curr_bucket, c_ts,
                         last_sent_ts_btc, last_sent_bucket_btc, last_sent_score_btc, last_sent_price_btc
@@ -5566,13 +5625,6 @@ async def send_timed_reports():
                     last_sent_bucket_btc[tf] = curr_bucket
                     last_sent_score_btc[tf]  = score
                     last_sent_price_btc[tf]  = float(c_c)
-
-                    # 10) (자동매매) — 트리거 모드별 처리
-                    trigger_mode = trigger_mode_for(tf)
-
-                    log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
-
-                    await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
 
                 except Exception as e:
                     log(f"⚠️ BTC 루프 오류: {e}")
@@ -5654,6 +5706,8 @@ async def on_ready():
     while True:
         try:
 
+            gatekeeper_heartbeat(_now_ms())
+
             # ✅ 루프 1회마다 실시간 가격 스냅샷 활용 (TF 공통)
 
 
@@ -5690,25 +5744,6 @@ async def on_ready():
 
                 if _len(df) == 0:
                     log(f"⏭️ ETH {tf} 생략: 캔들 데이터 없음")
-                    continue
-
-                # === 같은 캔들 & 변화 미미면 생략 (ETH) ===
-                try:
-                    last_ts = get_closed_ts(df)
-                    if not last_ts:
-                        log("⏭️ 닫힌 캔들 타임스탬프 계산 실패 → 스킵")
-                        continue
-                except Exception:
-                    last_val = df['timestamp'].iloc[-1]
-                    last_ts = int(last_val.timestamp()) if hasattr(last_val, 'timestamp') else 0
-
-                prev_ts = last_candle_ts_eth[tf]
-                prev_sco = previous_score.get(tf)
-                prev_bkt = previous_bucket.get(tf)
-                curr_bkt = _score_bucket(score, CFG)
-
-                if prev_ts == c_ts and prev_bkt == curr_bkt and (prev_sco is not None) and abs(score - prev_sco) < SCORE_DELTA[tf]:
-                    log(f"⏭️ ETH {tf} 생략: 같은 캔들 + 신호 유지 + 점수Δ<{SCORE_DELTA[tf]} (Δ={abs(score - prev_sco):.2f})")
                     continue
 
                 now_str = datetime.now().strftime("%m월 %d일 %H:%M")
@@ -5889,6 +5924,19 @@ async def on_ready():
 
 
 
+                prev_ts = last_candle_ts_eth.get(tf)
+                prev_sco = previous_score.get(tf)
+                prev_bkt = previous_bucket.get(tf)
+                curr_bkt = _score_bucket(score, CFG)
+
+                trigger_mode = trigger_mode_for(tf)
+                log(f"[DEBUG] {symbol_eth} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                await handle_trigger(symbol_eth, tf, trigger_mode, signal, display_price, c_ts, entry_data)
+
+                if prev_ts == c_ts and prev_bkt == curr_bkt and (prev_sco is not None) and abs(score - prev_sco) < SCORE_DELTA[tf]:
+                    log(f"⏭️ ETH {tf} 생략: 같은 캔들 + 신호 유지 + 점수Δ<{SCORE_DELTA[tf]} (Δ={abs(score - prev_sco):.2f})")
+                    continue
+
                 # 🔁 기존 신호 유지 시 알림 생략 조건 처리
 
                 # 1. NEUTRAL 생략 조건: 별도 저장된 neutral_info에서 비교
@@ -6024,11 +6072,6 @@ async def on_ready():
                         # 폴백: POSIX seconds → ms
                         candle_ts = int(df['timestamp'].iloc[-2].timestamp() * 1000)
 
-
-                trigger_mode = trigger_mode_for(tf)
-                log(f"[DEBUG] {symbol_eth} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
-
-                await handle_trigger(symbol_eth, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 channel = _get_channel_or_skip('ETH', tf)
                 if channel is None:
@@ -6308,6 +6351,19 @@ async def on_ready():
 
 
 
+                prev_ts_b = last_candle_ts_btc.get(tf)
+                prev_sco_b = previous_score_btc.get(tf)
+                prev_bkt_b = previous_bucket_btc.get(tf)
+                curr_bucket = _score_bucket(score, CFG)
+
+                trigger_mode = trigger_mode_for(tf)
+                log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
+
+                if prev_ts_b == c_ts and prev_bkt_b == curr_bucket and (prev_sco_b is not None) and abs(score - prev_sco_b) < SCORE_DELTA[tf]:
+                    log(f"⏭️ BTC {tf} 생략: 같은 캔들 + 신호 유지 + 점수Δ<{SCORE_DELTA[tf]} (Δ={abs(score - prev_sco_b):.2f})")
+                    continue
+
                 # 1) NEUTRAL 생략
                 if signal == 'NEUTRAL':
                     prev_neutral = neutral_info_btc.get(tf)
@@ -6448,12 +6504,6 @@ async def on_ready():
                 else:
                     neutral_info_btc[tf] = None
 
-                trigger_mode = trigger_mode_for(tf)
-
-                log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
-
-                await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
-
                 # 상태 업데이트(손절/익절 분기에서 이미 continue 되므로 여기선 순수 신호 상태만 기록)
                 previous_signal_btc[tf] = signal
                 previous_score_btc[tf]  = score
@@ -6532,11 +6582,13 @@ async def on_message(message):
                 gate = FRAME_GATE.get(tf, {})
                 cd   = COOLDOWN_UNTIL.get(tf, 0)
 
-                obs_left = _remain_sec(gate.get("obs_until"))
-                tgt_left = _remain_sec(gate.get("tgt_until"))
+                obs_left = _remain_sec(gate.get("obs_until_ms"))
+                tgt_left = _remain_sec(gate.get("target_until_ms"))
+                if GK_DEBUG and len(gate.get("cand", [])) == 1 and obs_left == 0 and tgt_left == 0 and not gate.get("winner"):
+                    log(f"[GK_WARN] {tf} single-candidate but not released — check suppression order")
                 lines.append(
                     f"· {tf}: occ={occ or '-'} | cooldown={(max(0,int(cd-time.time())) if cd else 0)}s "
-                    f"| gate(ts={gate.get('ts','-')}, cand={len(gate.get('cand',[]))}, winner={gate.get('winner','-')}, "
+                    f"| gate(ts={gate.get('candle_ts_ms','-')}, cand={len(gate.get('cand',[]))}, winner={gate.get('winner','-')}, "
                     f"obs={obs_left}s, tgt={tgt_left}s)"
                 )
             await message.channel.send("\n".join(lines))
