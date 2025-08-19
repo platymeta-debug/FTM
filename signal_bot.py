@@ -874,7 +874,9 @@ neutral_info = {}
 entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
 highest_price = {}    # (symbol, tf) -> float
 lowest_price = {}     # (symbol, tf) -> float
+
 previous_bucket = {}
+
 
 
 # === 손절 익절 하드 스탑(고정 손절) on/off 및 퍼센트(퍼 TF) ===
@@ -3384,6 +3386,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                         "last_score": float(cur_score),
                         "last_update_ms": int(time.time()*1000),
                     })
+
                     avg = float(existing_paper["entry_price"])
                     tp_pct = float(existing_paper.get("tp_pct", 0.0))
                     sl_pct = float(existing_paper.get("sl_pct", 0.0))
@@ -3393,6 +3396,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                     else:
                         existing_paper["tp_price"] = (avg * (1 - tp_pct/100.0)) if tp_pct>0 else None
                         existing_paper["sl_price"] = (avg * (1 + sl_pct/100.0)) if sl_pct>0 else None
+
                     PAPER_POS[key] = existing_paper
                     _save_json(PAPER_POS_FILE, PAPER_POS)
                     did_scale = True
@@ -3400,6 +3404,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                     add_qty = await _fut_scale_in(symbol, float(last_price), notional_add, "LONG" if exec_signal=="BUY" else "SHORT")
                     if add_qty > 0:
                         did_scale = True
+
                         fp = FUT_POS.get(symbol, {})
                         old_qty = float(fp.get("qty", 0.0))
                         old_entry = float(fp.get("entry", last_price))
@@ -3416,6 +3421,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                             fp["sl_price"] = (new_entry*(1+sl_pct_fp/100.0)) if sl_pct_fp>0 else None
                         FUT_POS[symbol] = fp
                         _save_json(OPEN_POS_FILE, FUT_POS)
+
                         await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
             if did_scale and SCALE_LOG:
@@ -3434,11 +3440,13 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 closed = await _fut_reduce(symbol, red_qty, "LONG" if exec_signal=="BUY" else "SHORT") if red_qty>0 else 0.0
                 if closed > 0:
                     did_scale = True
+
                     fp = FUT_POS.get(symbol, {})
                     fp_qty = max(0.0, float(fp.get("qty", 0.0)) - closed)
                     fp["qty"] = fp_qty
                     FUT_POS[symbol] = fp
                     _save_json(OPEN_POS_FILE, FUT_POS)
+
                     await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
             if did_scale and SCALE_LOG:
@@ -3480,7 +3488,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     lev_used    = alloc["lev_used"]
     qty         = alloc["qty"]
 
+
     side = "LONG" if exec_signal == "BUY" else "SHORT"
+
 
     PAPER_POS[key] = {
         "side": side,
@@ -3492,6 +3502,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         "ts_ms": int(time.time()*1000),
         "high": float(last_price),
         "low": float(last_price),
+
     }
     # (NEW) persist risk to paper JSON and CSV
     tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
@@ -3516,6 +3527,24 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
     ])
     _log_trade_csv(symbol, tf, "OPEN", PAPER_POS[key]["side"], qty, float(last_price), extra=extra)
+
+    # [ANCHOR: POSITION_OPEN_HOOK]
+    if exec_signal == "BUY":
+        highest_price[(symbol, tf)] = float(last_price)
+        lowest_price.pop((symbol, tf), None)
+    else:
+        lowest_price[(symbol, tf)] = float(last_price)
+        highest_price.pop((symbol, tf), None)
+    previous_signal[(symbol, tf)] = exec_signal
+    entry_data[(symbol, tf)] = (float(last_price), datetime.now().strftime("%m월 %d일 %H:%M"))
+
+    extra = ",".join([
+        "mode=paper",
+        f"tp_pct={tp_pct:.2f}", f"sl_pct={sl_pct:.2f}", f"tr_pct={tr_pct:.2f}",
+        f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
+    ])
+    if PAPER_CSV_OPEN_LOG:
+        _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
 
     # [ANCHOR: POSITION_OPEN_HOOK]
     if exec_signal == "BUY":
@@ -3582,9 +3611,11 @@ def _margin_for_tf(tf):
     except Exception:
         return FUT_MGN_USDT
 
+
 # (NEW) unified (symbol, tf) key helper
 def _key2(symbol: str, tf: str):
     return (str(symbol), str(tf))
+
 
 # [ANCHOR: SCALE_CFG_BEGIN]
 SCALE_ENABLE = os.getenv("SCALE_ENABLE", "1") == "1"
@@ -4934,11 +4965,13 @@ async def _auto_close_and_notify_eth(
         entry_price=ep, entry_time=entry_time,
         score=score, reasons=[action_reason]
     )
+
     previous_signal[key2] = action
     previous_score[tf]  = None
     entry_data[key2]      = None
     highest_price[key2]   = None
     lowest_price[key2]    = None
+
 
 
 async def _auto_close_and_notify_btc(
@@ -5170,6 +5203,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         else:
             tp_price = float(last) * (1 - tp_pct/100.0) if tp_pct>0 else None
             sl_price = float(last) * (1 + sl_pct/100.0) if sl_pct>0 else None
+
         extra = ",".join([
             f"id={(ord_.get('id') if isinstance(ord_, dict) else '')}",
             "mode=futures",
@@ -5177,6 +5211,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
         ])
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last, extra=extra)
+
         # (NEW) persist risk to FUT_POS as well
         try:
             FUT_POS[symbol] = {
@@ -5187,6 +5222,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             _save_json(OPEN_POS_FILE, FUT_POS)
         except Exception as e:
             logging.warning(f"[FUT_POS_RISK_SAVE_WARN] {symbol} {tf}: {e}")
+
 
         # [ANCHOR: POSITION_OPEN_HOOK]
         key2 = (symbol, tf)
@@ -5798,7 +5834,9 @@ async def send_timed_reports():
 
                     
                     # 📍 ETH 진입 정보 주입
+
                     _ep = entry_data.get(key2)
+
                     entry_price_local = _ep[0] if _ep else None
                     entry_time_local  = _ep[1] if _ep else None
 
@@ -6166,6 +6204,8 @@ async def on_ready():
 
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
 
+                key2 = (symbol_eth, tf)
+
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
                 k = f"{symbol_eth}|{tf}"
                 pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_eth) if TRADE_MODE == "futures" else None)
@@ -6514,7 +6554,9 @@ async def on_ready():
 
                 # NEUTRAL 상태 저장
                 # 발송 후 상태 업데이트 보강
+
                 previous_signal[key2] = signal
+
                 previous_score[tf] = score
                 previous_price[tf] = price
 
@@ -6546,7 +6588,9 @@ async def on_ready():
                         weights=weights)
 
                 # 발송 후 업데이트
+
                 previous_signal[key2] = signal
+
                 previous_score[tf] = score
 
             # ===== BTC 실시간 루프 (1h/4h/1d) =====
