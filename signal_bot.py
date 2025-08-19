@@ -66,6 +66,7 @@ GK_DEBUG = os.getenv("GK_DEBUG", "0") == "1"
 EXIT_DEBUG = os.getenv("EXIT_DEBUG", "0") == "1"
 STRICT_EXIT_NOTIFY = os.getenv("STRICT_EXIT_NOTIFY", "1") == "1"
 PAPER_STRICT_NONZERO = os.getenv("PAPER_STRICT_NONZERO", "0") == "1"
+PAPER_CSV_OPEN_LOG = os.getenv("PAPER_CSV_OPEN_LOG", "1") == "1"
 
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
@@ -860,7 +861,7 @@ except Exception as e:
 # === 전역 상태 저장용 ===
 ENTERED_CANDLE = {}  # key: (symbol, tf) -> last_enter_open_ms
 
-previous_signal = {'15m': None, '1h': None, '4h': None, '1d': None}
+previous_signal = {}  # (symbol, tf) -> 'BUY'/'SELL'/'NEUTRAL'
 previous_score = {}
 score_history = {
     '15m': deque(maxlen=4),
@@ -870,9 +871,9 @@ score_history = {
 }
 previous_price = {}
 neutral_info = {}
-entry_data = {}
-highest_price = {}
-lowest_price = {}
+entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
+highest_price = {}    # (symbol, tf) -> float
+lowest_price = {}     # (symbol, tf) -> float
 previous_bucket = {'15m': None, '1h': None, '4h': None, '1d': None}
 
 
@@ -1265,25 +1266,12 @@ intents = discord.Intents.default()
 intents.message_content = True  # ✅ 메시지 읽기 권한 켜기
 client = discord.Client(intents=intents)
 
-previous_signals = {'15m': None, '1h': None, '4h': None, '1d': None}
-
-# --- BTC 상태 (ETH와 동일 구조) ---
-previous_signal_btc = {tf: None for tf in TIMEFRAMES_BTC}
-entry_data_btc      = {tf: None for tf in TIMEFRAMES_BTC}
 previous_score_btc  = {tf: None for tf in TIMEFRAMES_BTC}
 previous_price_btc  = {tf: None for tf in TIMEFRAMES_BTC}
-highest_price_btc   = {tf: None for tf in TIMEFRAMES_BTC}
-lowest_price_btc    = {tf: None for tf in TIMEFRAMES_BTC}
 neutral_info_btc    = {tf: None for tf in TIMEFRAMES_BTC}
 score_history_btc   = {tf: deque(maxlen=4) for tf in TIMEFRAMES_BTC}
 previous_bucket_btc = {tf: None for tf in TIMEFRAMES_BTC}
 last_candle_ts_btc  = {tf: 0 for tf in TIMEFRAMES_BTC}
-
-entry_data = {'15m': None, '1h': None, '4h': None, '1d': None}
-previous_score = {'15m': None, '1h': None, '4h': None, '1d': None}
-highest_price = {'15m': None, '1h': None, '4h': None, '1d': None}
-lowest_price = {'15m': None, '1h': None, '4h': None, '1d': None}
-neutral_info = {'15m': None, '1h': None, '4h': None, '1d': None}
 
 TRIGGER_STATE = defaultdict(lambda: 'FLAT')  # key: (symbol, tf) -> FLAT/ARMED/CONFIRMED
 ARMED_SIGNAL = {}
@@ -3261,7 +3249,7 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
                     opp = 'SELL' if ARMED_SIGNAL.get(key) == 'BUY' else 'BUY'
                     log(f"[REVERT] {symbol} {tf}: intrabar trigger reverted")
                     await maybe_execute_trade(symbol, tf, opp, last_price=display_price, candle_ts=c_ts)
-                    entry_map[tf] = None
+                    entry_map[key] = None
                     TRIGGER_STATE[key] = 'FLAT'
                     ARMED_SIGNAL.pop(key, None)
                     ARMED_TS.pop(key, None)
@@ -3396,6 +3384,17 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                         "last_score": float(cur_score),
                         "last_update_ms": int(time.time()*1000),
                     })
+
+                    avg = float(existing_paper["entry_price"])
+                    tp_pct = float(existing_paper.get("tp_pct", 0.0))
+                    sl_pct = float(existing_paper.get("sl_pct", 0.0))
+                    if existing_paper.get("side") == "LONG":
+                        existing_paper["tp_price"] = (avg * (1 + tp_pct/100.0)) if tp_pct>0 else None
+                        existing_paper["sl_price"] = (avg * (1 - sl_pct/100.0)) if sl_pct>0 else None
+                    else:
+                        existing_paper["tp_price"] = (avg * (1 - tp_pct/100.0)) if tp_pct>0 else None
+                        existing_paper["sl_price"] = (avg * (1 + sl_pct/100.0)) if sl_pct>0 else None
+
                     PAPER_POS[key] = existing_paper
                     _save_json(PAPER_POS_FILE, PAPER_POS)
                     did_scale = True
@@ -3403,6 +3402,24 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                     add_qty = await _fut_scale_in(symbol, float(last_price), notional_add, "LONG" if exec_signal=="BUY" else "SHORT")
                     if add_qty > 0:
                         did_scale = True
+
+                        fp = FUT_POS.get(symbol, {})
+                        old_qty = float(fp.get("qty", 0.0))
+                        old_entry = float(fp.get("entry", last_price))
+                        new_qty = old_qty + add_qty
+                        new_entry = (old_qty*old_entry + add_qty*float(last_price)) / max(new_qty,1e-9)
+                        fp.update({"qty": new_qty, "entry": new_entry})
+                        tp_pct_fp = float(fp.get("tp_pct", 0.0))
+                        sl_pct_fp = float(fp.get("sl_pct", 0.0))
+                        if fp.get("side") == "LONG":
+                            fp["tp_price"] = (new_entry*(1+tp_pct_fp/100.0)) if tp_pct_fp>0 else None
+                            fp["sl_price"] = (new_entry*(1-sl_pct_fp/100.0)) if sl_pct_fp>0 else None
+                        else:
+                            fp["tp_price"] = (new_entry*(1-tp_pct_fp/100.0)) if tp_pct_fp>0 else None
+                            fp["sl_price"] = (new_entry*(1+sl_pct_fp/100.0)) if sl_pct_fp>0 else None
+                        FUT_POS[symbol] = fp
+                        _save_json(OPEN_POS_FILE, FUT_POS)
+
                         await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
             if did_scale and SCALE_LOG:
@@ -3421,6 +3438,13 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 closed = await _fut_reduce(symbol, red_qty, "LONG" if exec_signal=="BUY" else "SHORT") if red_qty>0 else 0.0
                 if closed > 0:
                     did_scale = True
+
+                    fp = FUT_POS.get(symbol, {})
+                    fp_qty = max(0.0, float(fp.get("qty", 0.0)) - closed)
+                    fp["qty"] = fp_qty
+                    FUT_POS[symbol] = fp
+                    _save_json(OPEN_POS_FILE, FUT_POS)
+
                     await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
             if did_scale and SCALE_LOG:
@@ -3462,8 +3486,20 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     lev_used    = alloc["lev_used"]
     qty         = alloc["qty"]
 
+    tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
+    sl_pct = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
+    tr_pct = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
+    slip   = _req_slippage_pct(symbol, tf)
+    side = "LONG" if exec_signal == "BUY" else "SHORT"
+    if side == "LONG":
+        tp_price = float(last_price) * (1 + tp_pct/100.0) if tp_pct>0 else None
+        sl_price = float(last_price) * (1 - sl_pct/100.0) if sl_pct>0 else None
+    else:
+        tp_price = float(last_price) * (1 - tp_pct/100.0) if tp_pct>0 else None
+        sl_price = float(last_price) * (1 + sl_pct/100.0) if sl_pct>0 else None
+
     PAPER_POS[key] = {
-        "side": ("LONG" if exec_signal == "BUY" else "SHORT"),
+        "side": side,
         "entry": float(last_price),
         "entry_price": float(last_price),
         "qty": qty,
@@ -3471,9 +3507,29 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         "lev": lev_used,
         "ts_ms": int(time.time()*1000),
         "high": float(last_price),
-        "low": float(last_price)
+        "low": float(last_price),
+        "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
+        "tp_price": tp_price, "sl_price": sl_price, "slippage_pct": slip,
     }
     _save_json(PAPER_POS_FILE, PAPER_POS)
+
+    extra = ",".join([
+        "mode=paper",
+        f"tp_pct={tp_pct:.2f}", f"sl_pct={sl_pct:.2f}", f"tr_pct={tr_pct:.2f}",
+        f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
+    ])
+    if PAPER_CSV_OPEN_LOG:
+        _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
+
+    # [ANCHOR: POSITION_OPEN_HOOK]
+    if exec_signal == "BUY":
+        highest_price[(symbol, tf)] = float(last_price)
+        lowest_price.pop((symbol, tf), None)
+    else:
+        lowest_price[(symbol, tf)] = float(last_price)
+        highest_price.pop((symbol, tf), None)
+    previous_signal[(symbol, tf)] = exec_signal
+    entry_data[(symbol, tf)] = (float(last_price), datetime.now().strftime("%m월 %d일 %H:%M"))
 
     if TRADE_MODE == "paper" and PAPER_STRICT_NONZERO and (not base_margin or not eff_margin or not qty):
         logging.warning("[PAPER_WARN] zero allocation on paper entry: check PART A")
@@ -4877,11 +4933,12 @@ async def _auto_close_and_notify_eth(
         entry_price=ep, entry_time=entry_time,
         score=score, reasons=[action_reason]
     )
-    previous_signal[tf] = action
+    key2 = (symbol_eth, tf)
+    previous_signal[key2] = action
     previous_score[tf]  = None
-    entry_data[tf]      = None
-    highest_price[tf]   = None
-    lowest_price[tf]    = None
+    entry_data[key2]      = None
+    highest_price.pop(key2, None)
+    lowest_price.pop(key2, None)
 
 
 async def _auto_close_and_notify_btc(
@@ -4942,9 +4999,10 @@ async def _auto_close_and_notify_btc(
 
     # 알림(공통 헬퍼)
     try:
+        key2 = (symbol, tf)
         await _notify_trade_exit(
             symbol, tf,
-            side=previous_signal_btc.get(tf, ""),  # 있으면 사용
+            side=previous_signal.get(key2, ""),  # 있으면 사용
             entry_price=ep, exit_price=xp,
             reason=action_reason, mode="futures",
             pnl_pct=pnl_pct
@@ -4960,11 +5018,11 @@ async def _auto_close_and_notify_btc(
         entry_price=ep, entry_time=entry_time,
         score=score, reasons=[action_reason]
     )
-    previous_signal_btc[tf] = action
+    previous_signal[key2] = action
     previous_score_btc[tf]  = None
-    entry_data_btc[tf]      = None
-    highest_price_btc[tf]   = None
-    lowest_price_btc[tf]    = None
+    entry_data[key2]      = None
+    highest_price.pop(key2, None)
+    lowest_price.pop(key2, None)
 
 
 
@@ -5112,13 +5170,32 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         else:
             tp_price = float(last) * (1 - tp_pct/100.0) if tp_pct>0 else None
             sl_price = float(last) * (1 + sl_pct/100.0) if sl_pct>0 else None
+
+        FUT_POS[symbol].update({
+            'tp_pct': tp_pct, 'sl_pct': sl_pct, 'tr_pct': tr_pct,
+            'tp_price': tp_price, 'sl_price': sl_price
+        })
+
+        _save_json(OPEN_POS_FILE, FUT_POS)
         extra = ",".join([
             f"id={(ord_.get('id') if isinstance(ord_, dict) else '')}",
+            "mode=futures",
             f"tp_pct={tp_pct:.2f}", f"sl_pct={sl_pct:.2f}", f"tr_pct={tr_pct:.2f}",
             f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
         ])
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last, extra=extra)
-        _save_json(OPEN_POS_FILE, FUT_POS)
+
+        # [ANCHOR: POSITION_OPEN_HOOK]
+        key2 = (symbol, tf)
+        if side == 'LONG':
+            highest_price[key2] = float(last)
+            lowest_price.pop(key2, None)
+            previous_signal[key2] = 'BUY'
+        else:
+            lowest_price[key2] = float(last)
+            highest_price.pop(key2, None)
+            previous_signal[key2] = 'SELL'
+        entry_data[key2] = (float(last), datetime.now().strftime("%m월 %d일 %H:%M"))
 
         # 보호 주문(TP/SL) 동시 등록
         await _place_protect_orders(ex, symbol, tf, side, float(last))
@@ -5717,7 +5794,7 @@ async def send_timed_reports():
 
                     
                     # 📍 ETH 진입 정보 주입
-                    _ep = entry_data.get(tf)
+                    _ep = entry_data.get((symbol_eth, tf))
                     entry_price_local = _ep[0] if _ep else None
                     entry_time_local  = _ep[1] if _ep else None
 
@@ -5857,7 +5934,7 @@ async def send_timed_reports():
 
 
                     # 4) 진입 정보 (없으면 None)
-                    _epb = entry_data_btc.get(tf)  # (entry_price, entry_time)
+                    _epb = entry_data.get((symbol_btc, tf))  # (entry_price, entry_time)
                     entry_price_local = _epb[0] if _epb else None
                     entry_time_local  = _epb[1] if _epb else None
 
@@ -5907,7 +5984,7 @@ async def send_timed_reports():
                     # 7) 알림 억제(게이팅)
                     curr_bucket = _score_bucket(score, CFG)
                     trigger_mode = trigger_mode_for(tf)
-                    await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
+                    await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data)
                     ok_to_send, why = _should_notify(
                         tf, score, c_c, curr_bucket, c_ts,
                         last_sent_ts_btc, last_sent_bucket_btc, last_sent_score_btc, last_sent_price_btc
@@ -5940,7 +6017,7 @@ async def send_timed_reports():
                     if not hist or round(score, 1) != hist[-1]:
                         hist.append(round(score, 1))
 
-                    previous_signal_btc[tf] = signal
+                    previous_signal[(symbol_btc, tf)] = signal
                     previous_score_btc[tf]  = score
                     previous_bucket_btc[tf] = curr_bucket
                     previous_price_btc[tf]  = float(c_c)
@@ -6076,7 +6153,7 @@ async def on_ready():
                     continue
 
                 now_str = datetime.now().strftime("%m월 %d일 %H:%M")
-                previous = previous_signal.get(tf)
+                previous = previous_signal.get(key2)
 
                 snap = await get_price_snapshot(symbol_eth)
                 live_price = snap.get("mid") or snap.get("last")
@@ -6084,6 +6161,8 @@ async def on_ready():
                 # [ANCHOR: daily_change_unify_eth]
 
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
+
+                key2 = (symbol_eth, tf)
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
                 k = f"{symbol_eth}|{tf}"
@@ -6103,14 +6182,14 @@ async def on_ready():
 
 
                 # 현재가가를 차해가면 최고/최저가 갱신
-                if highest_price[tf] is None:
-                    highest_price[tf] = price
-                if lowest_price[tf] is None:
-                    lowest_price[tf] = price
+                if highest_price.get(key2) is None:
+                    highest_price[key2] = price
+                if lowest_price.get(key2) is None:
+                    lowest_price[key2] = price
 
                 # === 자동 손절 / 트레일링 스탑 처리 (캔들 고/저 + 이상치 가드 + TF별 MA 스탑) ===
-                if (str(previous).startswith('BUY') or str(previous).startswith('SELL')) and entry_data[tf]:
-                    entry_price, entry_time = entry_data[tf]
+                if (str(previous).startswith('BUY') or str(previous).startswith('SELL')) and entry_data.get(key2):
+                    entry_price, entry_time = entry_data.get(key2)
 
                     # 퍼센트 설정
                     tp_pct = take_profit_pct[tf]
@@ -6130,15 +6209,15 @@ async def on_ready():
 
                     # 트레일링 기준 갱신(캔들 고/저 기준)
                     if previous == 'BUY':
-                        if highest_price[tf] is None:
-                            highest_price[tf] = entry_price
-                        if curr_high > highest_price[tf]:
-                            highest_price[tf] = curr_high
+                        if highest_price.get(key2) is None:
+                            highest_price[key2] = entry_price
+                        if curr_high > highest_price.get(key2, entry_price):
+                            highest_price[key2] = curr_high
                     elif previous == 'SELL':
-                        if lowest_price[tf] is None:
-                            lowest_price[tf] = entry_price
-                        if curr_low < lowest_price[tf]:
-                            lowest_price[tf] = curr_low
+                        if lowest_price.get(key2) is None:
+                            lowest_price[key2] = entry_price
+                        if curr_low < lowest_price.get(key2, entry_price):
+                            lowest_price[key2] = curr_low
 
                     # MA 스탑 체크 함수 (ETH 예시)
                     def check_ma_stop(side: str):
@@ -6183,7 +6262,8 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 - hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 + tp_pct / 100)
-                        trail_price = ((highest_price[tf] or entry_price) * (1 - ts / 100)) if use_trail else None
+                        hp = max(float(highest_price.get(key2, 0.0)), float(entry_price))
+                        trail_price = (hp * (1 - ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price <= stop_price) if stop_price else False
                         trail_hit = (curr_price <= trail_price) if trail_price is not None else False
@@ -6223,7 +6303,8 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 + hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 - tp_pct / 100)
-                        trail_price = ((lowest_price[tf] or entry_price) * (1 + ts / 100)) if use_trail else None
+                        lp = min(float(lowest_price.get(key2, 1e30)), float(entry_price))
+                        trail_price = (lp * (1 + ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price >= stop_price) if stop_price else False
                         trail_hit = (curr_price >= trail_price) if trail_price is not None else False
@@ -6283,8 +6364,8 @@ async def on_ready():
                             continue
 
                 # 2. BUY/SELL 생략 조건 (entry_data 사용)
-                if signal == previous and entry_data[tf]:
-                    prev_price, _ = entry_data[tf]
+                if signal == previous and entry_data.get(key2):
+                    prev_price, _ = entry_data.get(key2)
                     prev_score = previous_score.get(tf, None)
                     if prev_score is not None:
                         if signal == 'BUY':
@@ -6305,11 +6386,11 @@ async def on_ready():
                 # 진입 정보 저장 (같은 방향일 경우 더 유리한 가격이면 갱신)
                 if str(signal).startswith('BUY') or str(signal).startswith('SELL'):
                     update_entry = False
-                    prev_entry = entry_data[tf]
+                    prev_entry = entry_data.get(key2)
                     # 진입 정보 저장 (같은 방향일 경우 더 유리한 가격이면 갱신)
                     if str(signal).startswith('BUY') or str(signal).startswith('SELL'):
                         update_entry = False
-                        prev_entry = entry_data[tf]
+                        prev_entry = entry_data.get(key2)
                         if previous != signal or prev_entry is None:
                             update_entry = True
                         else:
@@ -6319,16 +6400,16 @@ async def on_ready():
                             elif signal == 'SELL' and price > prev_price:
                                 update_entry = True
                         if update_entry:
-                            entry_data[tf] = (price, now_str)
+                            entry_data[key2] = (price, now_str)
                             # 🔹 포지션 오픈 시 트레일링 기준점도 진입가로 초기화
-                            highest_price[tf] = price if signal == 'BUY' else None
-                            lowest_price[tf]  = price if signal == 'SELL' else None
+                            highest_price[key2] = price if signal == 'BUY' else None
+                            lowest_price[key2]  = price if signal == 'SELL' else None
 
 
                 # 수익률 계산
                 pnl = None
                 if previous in ['BUY', 'SELL'] and signal in ['BUY', 'SELL'] and signal != previous:
-                    entry_price, entry_time = entry_data[tf]
+                    entry_price, entry_time = entry_data.get(key2)
                     if previous == 'BUY' and signal == 'SELL':
                         pnl = ((price - entry_price) / entry_price) * 100
                     elif previous == 'SELL' and signal == 'BUY':
@@ -6337,8 +6418,8 @@ async def on_ready():
                 chart_files = save_chart_groups(df, symbol_eth, tf)
 
                 # ✅ entry_data가 없을 경우 None으로 초기화
-                if entry_data[tf]:
-                    entry_price, entry_time = entry_data[tf]
+                if entry_data.get(key2):
+                    entry_price, entry_time = entry_data.get(key2)
                 else:
                     entry_price, entry_time = None, None
 
@@ -6431,7 +6512,7 @@ async def on_ready():
 
                 # NEUTRAL 상태 저장
                 # 발송 후 상태 업데이트 보강
-                previous_signal[tf] = signal
+                previous_signal[(symbol_eth, tf)] = signal
                 previous_score[tf] = score
                 previous_price[tf] = price
 
@@ -6463,7 +6544,7 @@ async def on_ready():
                         weights=weights)
 
                 # 발송 후 업데이트
-                previous_signal[tf] = signal
+                previous_signal[(symbol_eth, tf)] = signal
                 previous_score[tf] = score
 
             # ===== BTC 실시간 루프 (1h/4h/1d) =====
@@ -6537,12 +6618,13 @@ async def on_ready():
                 performance_file = generate_performance_stats(tf, symbol=symbol_btc)
 
                 # --- 게이트 (ETH와 동일 로직) ---
-                previous = previous_signal_btc.get(tf)
+                key2 = (symbol_btc, tf)
+                previous = previous_signal.get(key2)
 
 
                 # === (BTC) 자동 손절 / 트레일링 스탑 처리 ===
                 if previous in ['BUY', 'SELL']:
-                    _ep = entry_data_btc.get(tf) or (None, None)
+                    _ep = entry_data.get(key2) or (None, None)
                     entry_price = _ep[0]
                     entry_time  = _ep[1]
                     if entry_price is None:
@@ -6558,13 +6640,13 @@ async def on_ready():
 
                     # 트레일링 기준 갱신
                     if previous == 'BUY':
-                        highest_price_btc.setdefault(tf, entry_price)
-                        if curr_high > highest_price_btc.get(tf, entry_price):
-                            highest_price_btc[tf] = curr_high
+                        highest_price.setdefault(key2, entry_price)
+                        if curr_high > highest_price.get(key2, entry_price):
+                            highest_price[key2] = curr_high
                     elif previous == 'SELL':
-                        lowest_price_btc.setdefault(tf, entry_price)
-                        if curr_low < lowest_price_btc.get(tf, entry_price):
-                            lowest_price_btc[tf] = curr_low
+                        lowest_price.setdefault(key2, entry_price)
+                        if curr_low < lowest_price.get(key2, entry_price):
+                            lowest_price[key2] = curr_low
 
                     # MA 스탑 체크 함수 (ETH 예시)
                     def check_ma_stop(side: str):
@@ -6598,7 +6680,7 @@ async def on_ready():
                     hs_on = USE_HARD_STOP.get(tf, True)
                     hs_pct = HARD_STOP_PCT.get(tf, 3.0)
 
-                    prev_btc = previous_signal_btc.get(tf)  # ← BTC의 이전 신호 로컬 변수로 확보
+                    prev_btc = previous_signal.get((symbol_btc, tf))  # ← BTC의 이전 신호 로컬 변수로 확보
                     tp_pct = _req_tp_pct(symbol_btc, tf, (take_profit_pct or {}))
 
                     if entry_price is None:
@@ -6614,7 +6696,8 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 - hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 + tp_pct / 100)
-                        trail_price       = ((highest_price_btc.get(tf, entry_price) or entry_price) * (1 - ts / 100)) if use_trail else None
+                        hp = max(float(highest_price.get(key2, 0.0)), float(entry_price))
+                        trail_price       = (hp * (1 - ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price <= stop_price)        if stop_price else False
                         trail_hit = (curr_price <= trail_price)       if trail_price is not None else False
@@ -6653,7 +6736,8 @@ async def on_ready():
 
                         stop_price        = entry_price * (1 + hs_pct / 100) if hs_on and hs_pct > 0 else None
                         take_profit_price = entry_price * (1 - tp_pct / 100)
-                        trail_price       = ((lowest_price_btc.get(tf, entry_price) or entry_price) * (1 + ts / 100)) if use_trail else None
+                        lp = min(float(lowest_price.get(key2, 1e30)), float(entry_price))
+                        trail_price       = (lp * (1 + ts / 100)) if use_trail else None
 
                         stop_hit  = (curr_price >= stop_price)        if stop_price else False
                         trail_hit = (curr_price >= trail_price)       if trail_price is not None else False
@@ -6689,7 +6773,7 @@ async def on_ready():
 
                 trigger_mode = trigger_mode_for(tf)
                 log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
-                await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data_btc)
+                await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 if prev_ts_b == c_ts and prev_bkt_b == curr_bucket and (prev_sco_b is not None) and abs(score - prev_sco_b) < SCORE_DELTA[tf]:
                     log(f"⏭️ BTC {tf} 생략: 같은 캔들 + 신호 유지 + 점수Δ<{SCORE_DELTA[tf]} (Δ={abs(score - prev_sco_b):.2f})")
@@ -6715,7 +6799,7 @@ async def on_ready():
                 now_str_btc = datetime.now().strftime("%m월 %d일 %H:%M")
                 if str(signal).startswith('BUY') or str(signal).startswith('SELL'):
                     update_entry = False
-                    prev_entry = entry_data_btc.get(tf)
+                    prev_entry = entry_data.get(key2)
                     if previous != signal or prev_entry is None:
                         update_entry = True
                     else:
@@ -6725,11 +6809,11 @@ async def on_ready():
                         elif str(signal).startswith('SELL') and price > prev_price:
                             update_entry = True
                     if update_entry:
-                        entry_data_btc[tf] = (price, now_str_btc)
-                        highest_price_btc[tf] = price
-                        lowest_price_btc[tf]  = price
+                        entry_data[key2] = (price, now_str_btc)
+                        highest_price[key2] = price
+                        lowest_price[key2]  = price
 
-                prev_entry2 = entry_data_btc.get(tf)
+                prev_entry2 = entry_data.get(key2)
                 if signal == previous and prev_entry2:
                     prev_price, _ = prev_entry2
                     prev_score = previous_score_btc.get(tf, None)
@@ -6762,7 +6846,7 @@ async def on_ready():
                     last_candle_ts_btc[tf]  = c_ts
                     continue
 
-                _epb = entry_data_btc.get(tf)
+                _epb = entry_data.get(key2)
                 _entry_price = _epb[0] if _epb else None
                 _entry_time  = _epb[1] if _epb else None
 
@@ -6836,7 +6920,7 @@ async def on_ready():
                     neutral_info_btc[tf] = None
 
                 # 상태 업데이트(손절/익절 분기에서 이미 continue 되므로 여기선 순수 신호 상태만 기록)
-                previous_signal_btc[tf] = signal
+                previous_signal[(symbol_btc, tf)] = signal
                 previous_score_btc[tf]  = score
                 previous_bucket_btc[tf] = _score_bucket(score, CFG)
                 previous_price_btc[tf]  = float(price) if isinstance(price,(int,float)) else c_c
