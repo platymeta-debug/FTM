@@ -862,20 +862,20 @@ except Exception as e:
 ENTERED_CANDLE = {}  # key: (symbol, tf) -> last_enter_open_ms
 
 previous_signal = {}  # (symbol, tf) -> 'BUY'/'SELL'/'NEUTRAL'
-previous_score = {}
+previous_score = {'15m': None, '1h': None, '4h': None, '1d': None}
 score_history = {
     '15m': deque(maxlen=4),
     '1h': deque(maxlen=4),
     '4h': deque(maxlen=4),
     '1d': deque(maxlen=4),
 }
-previous_price = {}
-neutral_info = {}
+previous_price = {'15m': None, '1h': None, '4h': None, '1d': None}
+neutral_info = {'15m': None, '1h': None, '4h': None, '1d': None}
 entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
 highest_price = {}    # (symbol, tf) -> float
 lowest_price = {}     # (symbol, tf) -> float
 
-previous_bucket = {}
+previous_bucket = {'15m': None, '1h': None, '4h': None, '1d': None}
 
 
 
@@ -4806,7 +4806,7 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
             import time
             LAST_EXIT_TS[tf] = time.time()
             COOLDOWN_UNTIL[tf] = LAST_EXIT_TS[tf] + float(POST_EXIT_COOLDOWN_SEC.get(tf, 0.0))
-            log(f"⏳ cooldown set: {tf} until {COOLDOWN_UNTIL[tf]:.0f}")
+            log(f"⏳ cooldown set: {tf} until {COOLDOWN_UNTIL.get(tf, 0):.0f}")
     except Exception:
         pass
 
@@ -6499,7 +6499,7 @@ async def on_ready():
                     score=score,
                     weights=weights,
                     weights_detail=weights_detail,
-                    prev_score_value=previous_score[tf],
+                    prev_score_value=previous_score.get(tf),
                     agree_long=agree_long,
                     agree_short=agree_short,
                     symbol=symbol_eth,
