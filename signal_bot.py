@@ -874,7 +874,9 @@ neutral_info = {}
 entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
 highest_price = {}    # (symbol, tf) -> float
 lowest_price = {}     # (symbol, tf) -> float
-previous_bucket = {'15m': None, '1h': None, '4h': None, '1d': None}
+
+previous_bucket = {}
+
 
 
 # === 손절 익절 하드 스탑(고정 손절) on/off 및 퍼센트(퍼 TF) ===
@@ -3486,17 +3488,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     lev_used    = alloc["lev_used"]
     qty         = alloc["qty"]
 
-    tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
-    sl_pct = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
-    tr_pct = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
-    slip   = _req_slippage_pct(symbol, tf)
+
     side = "LONG" if exec_signal == "BUY" else "SHORT"
-    if side == "LONG":
-        tp_price = float(last_price) * (1 + tp_pct/100.0) if tp_pct>0 else None
-        sl_price = float(last_price) * (1 - sl_pct/100.0) if sl_pct>0 else None
-    else:
-        tp_price = float(last_price) * (1 - tp_pct/100.0) if tp_pct>0 else None
-        sl_price = float(last_price) * (1 + sl_pct/100.0) if sl_pct>0 else None
+
 
     PAPER_POS[key] = {
         "side": side,
@@ -3508,10 +3502,41 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         "ts_ms": int(time.time()*1000),
         "high": float(last_price),
         "low": float(last_price),
-        "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
-        "tp_price": tp_price, "sl_price": sl_price, "slippage_pct": slip,
+
     }
+    # (NEW) persist risk to paper JSON and CSV
+    tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
+    sl_pct = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
+    tr_pct = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
+    slip   = _req_slippage_pct(symbol, tf)
+    if PAPER_POS[key]["side"] == "LONG":
+        tp_price = float(last_price) * (1 + tp_pct/100.0) if tp_pct > 0 else None
+        sl_price = float(last_price) * (1 - sl_pct/100.0) if sl_pct > 0 else None
+    else:
+        tp_price = float(last_price) * (1 - tp_pct/100.0) if tp_pct > 0 else None
+        sl_price = float(last_price) * (1 + sl_pct/100.0) if sl_pct > 0 else None
+    PAPER_POS[key].update({
+        "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
+        "tp_price": tp_price, "sl_price": sl_price, "slippage_pct": slip
+    })
     _save_json(PAPER_POS_FILE, PAPER_POS)
+    # also write OPEN row for paper mode
+    extra = ",".join([
+        "mode=paper",
+        f"tp_pct={tp_pct:.2f}", f"sl_pct={sl_pct:.2f}", f"tr_pct={tr_pct:.2f}",
+        f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
+    ])
+    _log_trade_csv(symbol, tf, "OPEN", PAPER_POS[key]["side"], qty, float(last_price), extra=extra)
+
+    # [ANCHOR: POSITION_OPEN_HOOK]
+    if exec_signal == "BUY":
+        highest_price[(symbol, tf)] = float(last_price)
+        lowest_price.pop((symbol, tf), None)
+    else:
+        lowest_price[(symbol, tf)] = float(last_price)
+        highest_price.pop((symbol, tf), None)
+    previous_signal[(symbol, tf)] = exec_signal
+    entry_data[(symbol, tf)] = (float(last_price), datetime.now().strftime("%m월 %d일 %H:%M"))
 
     extra = ",".join([
         "mode=paper",
@@ -3585,6 +3610,12 @@ def _margin_for_tf(tf):
         return max(0.0, TOTAL_CAPITAL_USDT * pct)
     except Exception:
         return FUT_MGN_USDT
+
+
+# (NEW) unified (symbol, tf) key helper
+def _key2(symbol: str, tf: str):
+    return (str(symbol), str(tf))
+
 
 # [ANCHOR: SCALE_CFG_BEGIN]
 SCALE_ENABLE = os.getenv("SCALE_ENABLE", "1") == "1"
@@ -4858,6 +4889,7 @@ async def _auto_close_and_notify_eth(
     """
     # reason이 비었으면 action으로 대체
     action_reason = reason or action
+    key2 = _key2(symbol_eth, tf)
 
     if not _has_open_position(symbol_eth, tf, TRADE_MODE):
         if EXIT_DEBUG:
@@ -4933,12 +4965,13 @@ async def _auto_close_and_notify_eth(
         entry_price=ep, entry_time=entry_time,
         score=score, reasons=[action_reason]
     )
-    key2 = (symbol_eth, tf)
+
     previous_signal[key2] = action
     previous_score[tf]  = None
     entry_data[key2]      = None
-    highest_price.pop(key2, None)
-    lowest_price.pop(key2, None)
+    highest_price[key2]   = None
+    lowest_price[key2]    = None
+
 
 
 async def _auto_close_and_notify_btc(
@@ -5171,12 +5204,6 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             tp_price = float(last) * (1 - tp_pct/100.0) if tp_pct>0 else None
             sl_price = float(last) * (1 + sl_pct/100.0) if sl_pct>0 else None
 
-        FUT_POS[symbol].update({
-            'tp_pct': tp_pct, 'sl_pct': sl_pct, 'tr_pct': tr_pct,
-            'tp_price': tp_price, 'sl_price': sl_price
-        })
-
-        _save_json(OPEN_POS_FILE, FUT_POS)
         extra = ",".join([
             f"id={(ord_.get('id') if isinstance(ord_, dict) else '')}",
             "mode=futures",
@@ -5184,6 +5211,18 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
         ])
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last, extra=extra)
+
+        # (NEW) persist risk to FUT_POS as well
+        try:
+            FUT_POS[symbol] = {
+                **(FUT_POS.get(symbol) or {}),
+                "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
+                "tp_price": tp_price, "sl_price": sl_price
+            }
+            _save_json(OPEN_POS_FILE, FUT_POS)
+        except Exception as e:
+            logging.warning(f"[FUT_POS_RISK_SAVE_WARN] {symbol} {tf}: {e}")
+
 
         # [ANCHOR: POSITION_OPEN_HOOK]
         key2 = (symbol, tf)
@@ -5751,6 +5790,7 @@ async def send_timed_reports():
                         continue
 
                     symbol_eth = 'ETH/USDT'
+                    key2 = _key2(symbol_eth, tf)
 
                     # === Closed-candle snapshot (ETH) ===
                     # (use closed candle to avoid intra-candle spikes)
@@ -5794,7 +5834,9 @@ async def send_timed_reports():
 
                     
                     # 📍 ETH 진입 정보 주입
-                    _ep = entry_data.get((symbol_eth, tf))
+
+                    _ep = entry_data.get(key2)
+
                     entry_price_local = _ep[0] if _ep else None
                     entry_time_local  = _ep[1] if _ep else None
 
@@ -6512,7 +6554,9 @@ async def on_ready():
 
                 # NEUTRAL 상태 저장
                 # 발송 후 상태 업데이트 보강
-                previous_signal[(symbol_eth, tf)] = signal
+
+                previous_signal[key2] = signal
+
                 previous_score[tf] = score
                 previous_price[tf] = price
 
@@ -6544,7 +6588,9 @@ async def on_ready():
                         weights=weights)
 
                 # 발송 후 업데이트
-                previous_signal[(symbol_eth, tf)] = signal
+
+                previous_signal[key2] = signal
+
                 previous_score[tf] = score
 
             # ===== BTC 실시간 루프 (1h/4h/1d) =====
