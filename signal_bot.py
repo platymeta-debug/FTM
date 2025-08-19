@@ -8,7 +8,7 @@ import matplotlib
 matplotlib.use("Agg")  # ★ 비대화형 백엔드 (파일 저장 전용)
 import matplotlib.pyplot as plt
 import platform
-import os, sys
+import os, sys, logging
 import discord
 from dotenv import load_dotenv
 load_dotenv("key.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
@@ -16,10 +16,37 @@ import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
 import traceback
 import re
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from collections import deque
 from matplotlib import rcParams
 from collections import defaultdict
+
+# [ANCHOR: RUNTIME_CFG_DECL]
+RUNTIME_CFG = {}  # overlay store: key -> raw string
+
+def cfg_get(key: str, default: str | None = None) -> str | None:
+    if key in RUNTIME_CFG:
+        return RUNTIME_CFG[key]
+    return os.getenv(key, default)
+
+def cfg_set(key: str, value: str) -> None:
+    RUNTIME_CFG[key] = value
+
+def cfg_del(key: str) -> None:
+    if key in RUNTIME_CFG:
+        del RUNTIME_CFG[key]
+
+# [ANCHOR: VALIDATE_ON_BOOT]
+def _validate_tf_map(name: str, raw: str):
+    ok = all(k in ("15m", "1h", "4h", "1d") for k in re.findall(r"(15m|1h|4h|1d)", raw or ""))
+    if not ok:
+        logging.warning(f"[CFG_WARN] {name} has unknown TF keys: {raw}")
+
+for KEY in ("SCALE_UP_SCORE_DELTA", "SCALE_DOWN_SCORE_DELTA", "SCALE_STEP_PCT", "SCALE_REDUCE_PCT"):
+    _validate_tf_map(KEY, cfg_get(KEY, ""))
+for KEY in ("SLIPPAGE_BY_SYMBOL", "TP_PCT_BY_SYMBOL", "SL_PCT_BY_SYMBOL", "TRAIL_PCT_BY_SYMBOL"):
+    if not cfg_get(KEY):
+        logging.warning(f"[CFG_WARN] empty {KEY}")
 
 # === 전역 심볼 상수 ===
 symbol_eth = 'ETH/USDT'
@@ -28,6 +55,14 @@ symbol_btc = 'BTC/USDT'
 # 최근 계산된 지표 점수/이유를 분봉·심볼별로 캐시
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
+
+# [ANCHOR: PAUSE_GLOBALS]
+KST = timezone(timedelta(hours=9))
+PAUSE_UNTIL = {}  # (symbol, tf) -> epoch_ms; "__ALL__" -> epoch_ms
+DEFAULT_PAUSE = (cfg_get("DEFAULT_PAUSE", "1") == "1")
+AFTER_CLOSE_PAUSE = (cfg_get("AFTER_CLOSE_PAUSE", "1") == "1")
+DAILY_RESUME_HOUR_KST = int(cfg_get("DAILY_RESUME_HOUR_KST", "11"))
+_LAST_RESUME_YMD = None
 
 
 # === [ANCHOR: OBS_COOLDOWN_CFG] Gatekeeper/Observe/Cooldown Config ===
@@ -3618,7 +3653,7 @@ def _key2(symbol: str, tf: str):
 
 
 # [ANCHOR: SCALE_CFG_BEGIN]
-SCALE_ENABLE = os.getenv("SCALE_ENABLE", "1") == "1"
+SCALE_ENABLE = (cfg_get("SCALE_ENABLE", "1") == "1")
 def _parse_pct_map2(raw: str, default=0.0):
     d = {}
     if not raw: return d
@@ -3629,14 +3664,14 @@ def _parse_pct_map2(raw: str, default=0.0):
         except: d[k.strip()] = default
     return d
 
-SCALE_MAX_LEGS = int(os.getenv("SCALE_MAX_LEGS","3"))
-SCALE_UP_DELTA = _parse_pct_map2(os.getenv("SCALE_UP_SCORE_DELTA","15m:0.5,1h:0.6,4h:0.6,1d:0.7"))
-SCALE_DN_DELTA = _parse_pct_map2(os.getenv("SCALE_DOWN_SCORE_DELTA","15m:0.6,1h:0.7,4h:0.8,1d:1.0"))
-SCALE_STEP_PCT = _parse_pct_map2(os.getenv("SCALE_STEP_PCT","15m:0.25,1h:0.25,4h:0.25,1d:0.25"))
-SCALE_REDUCE_PCT = _parse_pct_map2(os.getenv("SCALE_REDUCE_PCT","15m:0.20,1h:0.20,4h:0.20,1d:0.20"))
-SCALE_MIN_ADD_NOTIONAL = float(os.getenv("SCALE_MIN_ADD_NOTIONAL_USDT","15"))
-SCALE_REALLOCATE_BRACKETS = os.getenv("SCALE_REALLOCATE_BRACKETS","1") == "1"  # re-arm TP/SL/Trail after scaling
-SCALE_LOG = os.getenv("SCALE_LOG","1") == "1"
+SCALE_MAX_LEGS = int(cfg_get("SCALE_MAX_LEGS", "3"))
+SCALE_UP_DELTA = _parse_pct_map2(cfg_get("SCALE_UP_SCORE_DELTA", "15m:0.5,1h:0.6,4h:0.6,1d:0.7"))
+SCALE_DN_DELTA = _parse_pct_map2(cfg_get("SCALE_DOWN_SCORE_DELTA", "15m:0.6,1h:0.7,4h:0.8,1d:1.0"))
+SCALE_STEP_PCT = _parse_pct_map2(cfg_get("SCALE_STEP_PCT", "15m:0.25,1h:0.25,4h:0.25,1d:0.25"))
+SCALE_REDUCE_PCT = _parse_pct_map2(cfg_get("SCALE_REDUCE_PCT", "15m:0.20,1h:0.20,4h:0.20,1d:0.20"))
+SCALE_MIN_ADD_NOTIONAL = float(cfg_get("SCALE_MIN_ADD_NOTIONAL_USDT", "15"))
+SCALE_REALLOCATE_BRACKETS = (cfg_get("SCALE_REALLOCATE_BRACKETS", "1") == "1")  # re-arm TP/SL/Trail after scaling
+SCALE_LOG = (cfg_get("SCALE_LOG", "1") == "1")
 # [ANCHOR: SCALE_CFG_END]
 
 # === Signal strength & MTF bias ===
@@ -3667,23 +3702,23 @@ def _parse_kv_map(raw, to_float=False, upper_key=True):
         m[k] = float(v) if to_float else v
     return m
 
-_STRENGTH_W = _parse_kv_map(os.getenv("STRENGTH_WEIGHTS",""), to_float=True)
+_STRENGTH_W = _parse_kv_map(cfg_get("STRENGTH_WEIGHTS", ""), to_float=True)
 if not _STRENGTH_W:
     _STRENGTH_W = {
         'STRONG_BUY':0.80, 'BUY':0.55, 'WEAK_BUY':0.30,
         'STRONG_SELL':0.80, 'SELL':0.55, 'WEAK_SELL':0.30
     }
 
-_BUCKET_RAW = os.getenv("STRENGTH_BUCKETS","80:STRONG,60:BASE,0:WEAK")
+_BUCKET_RAW = cfg_get("STRENGTH_BUCKETS", "80:STRONG,60:BASE,0:WEAK")
 # 내림차순 정렬된 [(th, label)] 리스트
 _STRENGTH_BUCKETS = sorted(
     [(int(k), v.upper()) for k, v in _parse_kv_map(_BUCKET_RAW, to_float=False, upper_key=False).items()],
     key=lambda x: -x[0]
 )
 
-_MTF_F = _parse_kv_map(os.getenv("MTF_FACTORS","ALL_ALIGN:1.00,MAJ_ALIGN:1.25,SOME_ALIGN:1.10,NO_ALIGN:0.85,MAJ_OPPOSE:0.60,ALL_OPPOSE:0.40"), to_float=True)
-_FULL_ON_ALL = os.getenv("FULL_ALLOC_ON_ALL_ALIGN","1") == "1"
-_DEBUG_ALLOC = os.getenv("DEBUG_ALLOC_LOG","0") == "1"
+_MTF_F = _parse_kv_map(cfg_get("MTF_FACTORS", "ALL_ALIGN:1.00,MAJ_ALIGN:1.25,SOME_ALIGN:1.10,NO_ALIGN:0.85,MAJ_OPPOSE:0.60,ALL_OPPOSE:0.40"), to_float=True)
+_FULL_ON_ALL = (cfg_get("FULL_ALLOC_ON_ALL_ALIGN", "1") == "1")
+_DEBUG_ALLOC = (cfg_get("DEBUG_ALLOC_LOG", "0") == "1")
 
 def _bucketize(score: float|None):
     if score is None:
@@ -4810,6 +4845,11 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
     except Exception:
         pass
 
+    # [ANCHOR: POSITION_CLOSE_HOOK]
+    if AFTER_CLOSE_PAUSE:
+        PAUSE_UNTIL[(symbol, tf)] = 2**62
+        log(f"⏸ post-close paused {symbol} {tf}")
+
 
 async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool:
     ex = FUT_EXCHANGE
@@ -4878,6 +4918,9 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
         if FUT_POS_TF.get(tf) == symbol:
             FUT_POS_TF.pop(tf, None); _save_json(OPEN_TF_FILE, FUT_POS_TF)
     return ok
+
+async def futures_close_symbol_tf(symbol, tf):
+    return await futures_close_all(symbol, tf)
 
 async def _auto_close_and_notify_eth(
     channel, tf, symbol_eth, action, reason,
@@ -5351,11 +5394,11 @@ def _parse_side_policy(raw: str):
     return out
 
 # ENV 로드
-_SLIP_BY_SYMBOL   = _parse_float_by_symbol(os.getenv("SLIPPAGE_BY_SYMBOL",""))
-_TP_BY_SYMBOL     = _parse_float_by_symbol(os.getenv("TP_PCT_BY_SYMBOL",""))
-_SL_BY_SYMBOL     = _parse_float_by_symbol(os.getenv("SL_PCT_BY_SYMBOL",""))
-_TRAIL_BY_SYMBOL  = _parse_float_by_symbol(os.getenv("TRAIL_PCT_BY_SYMBOL",""))
-_SIDE_POL_BY_SYM  = _parse_side_policy(os.getenv("HEDGE_SIDE_POLICY",""))
+_SLIP_BY_SYMBOL   = _parse_float_by_symbol(cfg_get("SLIPPAGE_BY_SYMBOL", ""))
+_TP_BY_SYMBOL     = _parse_float_by_symbol(cfg_get("TP_PCT_BY_SYMBOL", ""))
+_SL_BY_SYMBOL     = _parse_float_by_symbol(cfg_get("SL_PCT_BY_SYMBOL", ""))
+_TRAIL_BY_SYMBOL  = _parse_float_by_symbol(cfg_get("TRAIL_PCT_BY_SYMBOL", ""))
+_SIDE_POL_BY_SYM  = _parse_side_policy(cfg_get("HEDGE_SIDE_POLICY", ""))
 
 def _req_float_map(sym_map: dict, tf_map: dict, tf: str, default: float|None):
     """
@@ -5584,7 +5627,7 @@ def _req_leverage(symbol: str, tf: str) -> int:
     return int(TF_LEVERAGE.get(tf, FUT_LEVERAGE))
 
 # (선택) 디버그 확인용
-if os.getenv("DEBUG_ALLOC_LOG", "0") == "1":
+if cfg_get("DEBUG_ALLOC_LOG", "0") == "1":
     try:
         log(f"[CONF] LEV_BY_SYMBOL={_LEV_BY_SYMBOL}")
     except Exception:
@@ -6171,6 +6214,18 @@ async def on_ready():
                 c_o, c_h, c_l, c_c = closed_ohlc(df)     # c_c = closed_close
                 c_ts = closed_ts(df)                      # 닫힌 캔들 타임스탬프(초)
 
+                # [ANCHOR: PAUSE_PRECHECK]
+                now_ms = int(time.time()*1000)
+                key_all = PAUSE_UNTIL.get("__ALL__", 0)
+                key_tf = PAUSE_UNTIL.get((symbol_eth, tf), 0)
+                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
+                    PAUSE_UNTIL[(symbol_eth, tf)] = 2**62
+                    key_tf = PAUSE_UNTIL[(symbol_eth, tf)]
+                if now_ms < max(key_all, key_tf):
+                    log(f"⏸ {symbol_eth} {tf}: paused until {(max(key_all, key_tf))}")
+                    idem_mark(symbol_eth, tf, c_ts)
+                    continue
+
                 signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol_eth)
 
                 # [ANCHOR: STORE_EXEC_SCORE]
@@ -6611,6 +6666,18 @@ async def on_ready():
                 # 신호 계산 후 즉시 닫힌 봉 값 확정
                 c_o, c_h, c_l, c_c = closed_ohlc(df)
                 c_ts = closed_ts(df)
+                # [ANCHOR: PAUSE_PRECHECK]
+                now_ms = int(time.time()*1000)
+                key_all = PAUSE_UNTIL.get("__ALL__", 0)
+                key_tf = PAUSE_UNTIL.get((symbol_btc, tf), 0)
+                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
+                    PAUSE_UNTIL[(symbol_btc, tf)] = 2**62
+                    key_tf = PAUSE_UNTIL[(symbol_btc, tf)]
+                if now_ms < max(key_all, key_tf):
+                    log(f"⏸ {symbol_btc} {tf}: paused until {(max(key_all, key_tf))}")
+                    idem_mark(symbol_btc, tf, c_ts)
+                    continue
+
                 df = await safe_add_indicators(df)
                 signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol_btc)
 
@@ -6973,6 +7040,18 @@ async def on_ready():
         except Exception as e:
             log(f"⚠️ 오류 발생: {e}")
 
+        # [ANCHOR: DAILY_RESUME_11KST]
+        try:
+            now_kst = datetime.now(KST)
+            ymd = now_kst.strftime("%Y%m%d")
+            global _LAST_RESUME_YMD
+            if now_kst.hour == DAILY_RESUME_HOUR_KST and _LAST_RESUME_YMD != ymd:
+                PAUSE_UNTIL.clear()
+                _LAST_RESUME_YMD = ymd
+                logging.info("[PAUSE] auto-resume all at 11:00 KST")
+        except Exception as _:
+            pass
+
         await asyncio.sleep(90)
 
 # ========== 초기화 태스크 ==========
@@ -6987,7 +7066,20 @@ async def init_analysis_tasks():
                 log(f"초기화 오류 {symbol} {tf}: {e}")
 
 
-        
+
+async def _set_pause(symbol: str | None, tf: str | None, minutes: int | None):
+    until_ms = 2**62 if minutes is None else (int(time.time()*1000) + minutes*60*1000)
+    if not symbol or symbol.upper() == "ALL":
+        PAUSE_UNTIL["__ALL__"] = until_ms
+    else:
+        key2 = (symbol.upper(), tf) if tf and tf.upper() != "ALL" else None
+        if key2:
+            PAUSE_UNTIL[key2] = until_ms
+        else:
+            for tfx in ("15m", "1h", "4h", "1d"):
+                PAUSE_UNTIL[(symbol.upper(), tfx)] = until_ms
+
+
 @client.event
 async def on_message(message):
     global os
@@ -6997,29 +7089,194 @@ async def on_message(message):
     content = message.content.strip()
     parts = content.split()
 
+    # [ANCHOR: CMD_SET_GET_SAVEENV]
+    if content.startswith("!set "):
+        try:
+            payload = content[5:].strip()
+            if "=" in payload:
+                k, v = payload.split("=", 1)
+            else:
+                parts2 = payload.split(None, 1)
+                k, v = parts2[0], (parts2[1] if len(parts2) > 1 else "")
+            cfg_set(k.strip(), v.strip())
+            await message.channel.send(f"✅ set {k.strip()} = ```{v.strip()}```")
+            _reload_runtime_parsed_maps()
+        except Exception as e:
+            await message.channel.send(f"⚠️ set error: {e}")
+        return
+
+    if content.startswith("!get "):
+        k = content[5:].strip()
+        eff = cfg_get(k)
+        ov = RUNTIME_CFG.get(k, None)
+        await message.channel.send(f"🔎 {k}\n• effective: ```{eff}```\n• overlay: ```{ov}```")
+        return
+
+    if content.startswith("!saveenv"):
+        try:
+            path = cfg_get("KEY_ENV_PATH", "key.env")
+            with open(path, "r", encoding="utf-8") as f:
+                lines = f.read().splitlines()
+            kv = dict([(ln.split("=",1)[0], ln) for ln in lines if "=" in ln and not ln.strip().startswith("#")])
+            for k, v in RUNTIME_CFG.items():
+                new = f"{k}={v}"
+                if k in kv:
+                    idx = lines.index(kv[k])
+                    lines[idx] = new
+                else:
+                    lines.append(new)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            await message.channel.send(f"💾 saved overlay to {path} ({len(RUNTIME_CFG)} keys)")
+        except Exception as e:
+            await message.channel.send(f"⚠️ saveenv error: {e}")
+        return
+
+    # [ANCHOR: CMD_PAUSE_RESUME]
+    if content.startswith("!pause"):
+        try:
+            _, *args = content.split()
+            sym = args[0] if len(args) > 0 else "ALL"
+            tfx = args[1] if len(args) > 1 else "ALL"
+            mins = int(args[2]) if len(args) > 2 else None
+            await _set_pause(sym, tfx, mins)
+            await message.channel.send(f"⏸ paused {sym} {tfx} {'indefinitely' if mins is None else f'{mins}m'}")
+        except Exception as e:
+            await message.channel.send(f"⚠️ pause error: {e}")
+        return
+
+    if content.startswith("!resume"):
+        try:
+            _, *args = content.split()
+            sym = args[0] if len(args) > 0 else "ALL"
+            tfx = args[1] if len(args) > 1 else "ALL"
+            if sym.upper() == "ALL":
+                PAUSE_UNTIL.clear()
+            else:
+                if tfx.upper() == "ALL":
+                    for k in list(PAUSE_UNTIL.keys()):
+                        if isinstance(k, tuple) and k[0] == sym.upper():
+                            PAUSE_UNTIL.pop(k, None)
+                else:
+                    PAUSE_UNTIL.pop((sym.upper(), tfx), None)
+            await message.channel.send(f"▶ resumed {sym} {tfx}")
+        except Exception as e:
+            await message.channel.send(f"⚠️ resume error: {e}")
+        return
+
+    # [ANCHOR: CMD_CLOSE_CLOSEALL]
+    if content.startswith("!closeall"):
+        try:
+            n = 0
+            for (sym, tf), pos in list(PAPER_POS.items()):
+                _paper_close(sym, tf, float(LAST_PRICE.get(sym, pos.get("entry_price", 0))))
+                n += 1
+            for tfk, sym in list(FUT_POS_TF.items()):
+                await futures_close_all(sym, tfk)
+                n += 1
+            await message.channel.send(f"🟢 closed all ({n})")
+        except Exception as e:
+            await message.channel.send(f"⚠️ closeall error: {e}")
+        return
+
+    if content.startswith("!close "):
+        try:
+            _, sym, tfx = content.split()
+            if TRADE_MODE == "paper":
+                _paper_close(sym.upper(), tfx, float(LAST_PRICE.get(sym.upper(), 0)))
+            else:
+                await futures_close_symbol_tf(sym.upper(), tfx)
+            await message.channel.send(f"🟢 closed {sym.upper()} {tfx}")
+        except Exception as e:
+            await message.channel.send(f"⚠️ close error: {e}")
+        return
+
+    # [ANCHOR: CMD_RISK_SET]
+    if content.startswith("!risk "):
+        try:
+            _, sym, tfx, *rest = content.split()
+            sym = sym.upper()
+            args = " ".join(rest)
+            def _parse_kv(s, k):
+                m = re.search(rf"{k}\s*=\s*([0-9]+(\.[0-9]+)?)", s)
+                return float(m.group(1)) if m else None
+            tp = _parse_kv(args, "tp"); sl = _parse_kv(args, "sl"); tr = _parse_kv(args, "tr")
+            key = f"{sym}|{tfx}"
+            if TRADE_MODE == "paper" and key in PAPER_POS:
+                pos = PAPER_POS[key]
+                if tp is not None: pos["tp_pct"] = tp
+                if sl is not None: pos["sl_pct"] = sl
+                if tr is not None: pos["tr_pct"] = tr
+                avg = float(pos.get("entry_price", 0))
+                if pos.get("side") == "LONG":
+                    pos["tp_price"] = (avg * (1 + pos.get("tp_pct", 0) / 100)) if pos.get("tp_pct", 0) > 0 else None
+                    pos["sl_price"] = (avg * (1 - pos.get("sl_pct", 0) / 100)) if pos.get("sl_pct", 0) > 0 else None
+                else:
+                    pos["tp_price"] = (avg * (1 - pos.get("tp_pct", 0) / 100)) if pos.get("tp_pct", 0) > 0 else None
+                    pos["sl_price"] = (avg * (1 + pos.get("sl_pct", 0) / 100)) if pos.get("sl_pct", 0) > 0 else None
+                PAPER_POS[key] = pos; _save_json(PAPER_POS_FILE, PAPER_POS)
+            elif TRADE_MODE != "paper" and sym in FUT_POS:
+                pos = FUT_POS[sym]
+                if tp is not None: pos["tp_pct"] = tp
+                if sl is not None: pos["sl_pct"] = sl
+                if tr is not None: pos["tr_pct"] = tr
+                FUT_POS[sym] = pos; _save_json(OPEN_POS_FILE, FUT_POS)
+                await _cancel_symbol_conditional_orders(sym)
+                await _ensure_tp_sl_trailing(sym, tfx, float(LAST_PRICE.get(sym, pos.get("entry", 0))), pos.get("side", "LONG"))
+            await message.channel.send(f"⚙️ risk updated {sym} {tfx} (tp={tp}, sl={sl}, tr={tr})")
+        except Exception as e:
+            await message.channel.send(f"⚠️ risk error: {e}")
+        return
+
+    if content.startswith("!help"):
+        lines = [
+            "• !set KEY=VALUE / !get KEY / !saveenv",
+            "• !pause [SYMBOL|ALL] [TF|ALL] [mins?] / !resume [SYMBOL|ALL] [TF|ALL]",
+            "• !close SYMBOL TF / !closeall",
+            "• !risk SYMBOL TF tp=5 sl=2.5 tr=1.8",
+        ]
+        await message.channel.send("\n".join(lines))
+        return
+
     # [ANCHOR: DIAG_CMD_CONFIG]
     if content.startswith("!config"):
         try:
-            def _kv(s): 
-                return {k.strip(): v.strip() for k,v in 
-                        (p.split(":",1) for p in str(s or "").split(",") if ":" in p)}
-            cfg = {
-                "ENABLE_OBSERVE": os.getenv("ENABLE_OBSERVE","1"),
-                "ENABLE_COOLDOWN": os.getenv("ENABLE_COOLDOWN","1"),
-                "STRONG_BYPASS_SCORE": os.getenv("STRONG_BYPASS_SCORE","0.8"),
-                "GK_TTL_HOLD_SEC": os.getenv("GK_TTL_HOLD_SEC","0.8"),
-                "GATEKEEPER_OBS_SEC": os.getenv("GATEKEEPER_OBS_SEC","15m:20,1h:25,4h:40,1d:60"),
-                "WAIT_TARGET_ENABLE": os.getenv("WAIT_TARGET_ENABLE","0"),
-                "TARGET_SCORE_BY_TF": _kv(os.getenv("TARGET_SCORE_BY_TF","")),
-                "WAIT_TARGET_SEC": _kv(os.getenv("WAIT_TARGET_SEC","")),
-                "TARGET_WAIT_MODE": os.getenv("TARGET_WAIT_MODE","SOFT"),
-                "IGNORE_OCCUPANCY_TFS": os.getenv("IGNORE_OCCUPANCY_TFS",""),
-                "TRADE_MODE": os.getenv("TRADE_MODE","paper"),
-                "ROUTE_ALLOW": os.getenv("ROUTE_ALLOW","*"),
-                "ROUTE_DENY": os.getenv("ROUTE_DENY",""),
-            }
-            txt = "\n".join([f"• {k}: {v}" for k,v in cfg.items()])
-            await message.channel.send(f"**CONFIG**\n{txt}")
+            lines = [
+                f"• ENABLE_OBSERVE: {cfg_get('ENABLE_OBSERVE','1')}",
+                f"• ENABLE_COOLDOWN: {cfg_get('ENABLE_COOLDOWN','1')}",
+                f"• STRONG_BYPASS_SCORE: {cfg_get('STRONG_BYPASS_SCORE','0.8')}",
+                f"• GK_TTL_HOLD_SEC: {cfg_get('GK_TTL_HOLD_SEC','0.8')}",
+                f"• GATEKEEPER_OBS_SEC: {cfg_get('GATEKEEPER_OBS_SEC','15m:20,1h:25,4h:40,1d:60')}",
+                f"• WAIT_TARGET_ENABLE: {cfg_get('WAIT_TARGET_ENABLE','0')}",
+                f"• TARGET_SCORE_BY_TF: {cfg_get('TARGET_SCORE_BY_TF')}",
+                f"• WAIT_TARGET_SEC: {cfg_get('WAIT_TARGET_SEC')}",
+                f"• TARGET_WAIT_MODE: {cfg_get('TARGET_WAIT_MODE','SOFT')}",
+                f"• IGNORE_OCCUPANCY_TFS: {cfg_get('IGNORE_OCCUPANCY_TFS','')}",
+                f"• TRADE_MODE: {cfg_get('TRADE_MODE','paper')}",
+                f"• ROUTE_ALLOW: {cfg_get('ROUTE_ALLOW','*')}",
+                f"• ROUTE_DENY: {cfg_get('ROUTE_DENY','')}",
+            ]
+            # [ANCHOR: CONFIG_EXT]
+            lines.append(f"• STRENGTH_WEIGHTS: {cfg_get('STRENGTH_WEIGHTS')}")
+            lines.append(f"• STRENGTH_BUCKETS: {cfg_get('STRENGTH_BUCKETS')}")
+            lines.append(f"• MTF_FACTORS: {cfg_get('MTF_FACTORS')}")
+            lines.append(f"• FULL_ALLOC_ON_ALL_ALIGN: {cfg_get('FULL_ALLOC_ON_ALL_ALIGN','1')}")
+            lines.append(f"• SCALE_ENABLE: {cfg_get('SCALE_ENABLE')}")
+            lines.append(f"• SCALE_MAX_LEGS: {cfg_get('SCALE_MAX_LEGS')}")
+            lines.append(f"• SCALE_UP_SCORE_DELTA: {cfg_get('SCALE_UP_SCORE_DELTA')}")
+            lines.append(f"• SCALE_DOWN_SCORE_DELTA: {cfg_get('SCALE_DOWN_SCORE_DELTA')}")
+            lines.append(f"• SCALE_STEP_PCT: {cfg_get('SCALE_STEP_PCT')}")
+            lines.append(f"• SCALE_REDUCE_PCT: {cfg_get('SCALE_REDUCE_PCT')}")
+            lines.append(f"• SCALE_MIN_ADD_NOTIONAL_USDT: {cfg_get('SCALE_MIN_ADD_NOTIONAL_USDT')}")
+            lines.append(f"• SCALE_REALLOCATE_BRACKETS: {cfg_get('SCALE_REALLOCATE_BRACKETS')}")
+            lines.append(f"• SLIPPAGE_BY_SYMBOL: {cfg_get('SLIPPAGE_BY_SYMBOL')}")
+            lines.append(f"• TP_PCT_BY_SYMBOL: {cfg_get('TP_PCT_BY_SYMBOL')}")
+            lines.append(f"• SL_PCT_BY_SYMBOL: {cfg_get('SL_PCT_BY_SYMBOL')}")
+            lines.append(f"• TRAIL_PCT_BY_SYMBOL: {cfg_get('TRAIL_PCT_BY_SYMBOL')}")
+            lines.append(f"• DEFAULT_PAUSE: {cfg_get('DEFAULT_PAUSE','1')}")
+            lines.append(f"• AFTER_CLOSE_PAUSE: {cfg_get('AFTER_CLOSE_PAUSE','1')}")
+            lines.append(f"• DAILY_RESUME_HOUR_KST: {cfg_get('DAILY_RESUME_HOUR_KST','11')}")
+            await message.channel.send("**CONFIG**\n" + "\n".join(lines))
         except Exception as e:
             await message.channel.send(f"config error: {e}")
         return
@@ -7297,6 +7554,48 @@ async def on_message(message):
     elif message.content.startswith("!설정"):
         cfg_text = "\n".join([f"{k}: {v}" for k, v in CFG.items()])
         await message.channel.send(f"⚙ 현재 설정값:\n```{cfg_text}```")
+
+    # fallthrough to command router
+    await client.process_commands(message)
+
+# (NEW) reparse helper
+def _reload_runtime_parsed_maps():
+    global _STRENGTH_W, _STRENGTH_BUCKETS, _MTF_F, _FULL_ON_ALL, _DEBUG_ALLOC
+    global SCALE_ENABLE, SCALE_MAX_LEGS, SCALE_UP_DELTA, SCALE_DN_DELTA, SCALE_STEP_PCT, SCALE_REDUCE_PCT
+    global SCALE_MIN_ADD_NOTIONAL, SCALE_REALLOCATE_BRACKETS, SCALE_LOG
+    global _SLIP_BY_SYMBOL, _TP_BY_SYMBOL, _SL_BY_SYMBOL, _TRAIL_BY_SYMBOL
+    try:
+        _STRENGTH_W = _parse_kv_map(cfg_get("STRENGTH_WEIGHTS", ""), to_float=True)
+        if not _STRENGTH_W:
+            _STRENGTH_W = {
+                'STRONG_BUY':0.80, 'BUY':0.55, 'WEAK_BUY':0.30,
+                'STRONG_SELL':0.80, 'SELL':0.55, 'WEAK_SELL':0.30
+            }
+        _BUCKET = cfg_get("STRENGTH_BUCKETS", "80:STRONG,60:BASE,0:WEAK")
+        _STRENGTH_BUCKETS = sorted(
+            [(int(k), v.upper()) for k, v in _parse_kv_map(_BUCKET, to_float=False, upper_key=False).items()],
+            key=lambda x: -x[0]
+        )
+        _MTF_F = _parse_kv_map(cfg_get("MTF_FACTORS", "ALL_ALIGN:1.00,MAJ_ALIGN:1.25,SOME_ALIGN:1.10,NO_ALIGN:0.85,MAJ_OPPOSE:0.60,ALL_OPPOSE:0.40"), to_float=True)
+        _FULL_ON_ALL = (cfg_get("FULL_ALLOC_ON_ALL_ALIGN", "1") == "1")
+        _DEBUG_ALLOC = (cfg_get("DEBUG_ALLOC_LOG", "0") == "1")
+
+        SCALE_ENABLE = (cfg_get("SCALE_ENABLE", "1") == "1")
+        SCALE_MAX_LEGS = int(cfg_get("SCALE_MAX_LEGS", "3"))
+        SCALE_UP_DELTA = _parse_pct_map2(cfg_get("SCALE_UP_SCORE_DELTA", "15m:0.5,1h:0.6,4h:0.6,1d:0.7"))
+        SCALE_DN_DELTA = _parse_pct_map2(cfg_get("SCALE_DOWN_SCORE_DELTA", "15m:0.6,1h:0.7,4h:0.8,1d:1.0"))
+        SCALE_STEP_PCT = _parse_pct_map2(cfg_get("SCALE_STEP_PCT", "15m:0.25,1h:0.25,4h:0.25,1d:0.25"))
+        SCALE_REDUCE_PCT = _parse_pct_map2(cfg_get("SCALE_REDUCE_PCT", "15m:0.20,1h:0.20,4h:0.20,1d:0.20"))
+        SCALE_MIN_ADD_NOTIONAL = float(cfg_get("SCALE_MIN_ADD_NOTIONAL_USDT", "15"))
+        SCALE_REALLOCATE_BRACKETS = (cfg_get("SCALE_REALLOCATE_BRACKETS", "1") == "1")
+        SCALE_LOG = (cfg_get("SCALE_LOG", "1") == "1")
+
+        _SLIP_BY_SYMBOL   = _parse_float_by_symbol(cfg_get("SLIPPAGE_BY_SYMBOL", ""))
+        _TP_BY_SYMBOL     = _parse_float_by_symbol(cfg_get("TP_PCT_BY_SYMBOL", ""))
+        _SL_BY_SYMBOL     = _parse_float_by_symbol(cfg_get("SL_PCT_BY_SYMBOL", ""))
+        _TRAIL_BY_SYMBOL  = _parse_float_by_symbol(cfg_get("TRAIL_PCT_BY_SYMBOL", ""))
+    except Exception as e:
+        logging.warning(f"[RUNTIME_RELOAD_WARN] {e}")
 
 
 
