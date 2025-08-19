@@ -7203,6 +7203,7 @@ async def on_message(message):
                     sym, tf = key.split("|", 1)
                 except Exception:
                     continue
+
                 fallback = float(pos.get("entry_price", 0.0))
                 _paper_close(sym, tf, get_last_price(sym, fallback))
                 n += 1
