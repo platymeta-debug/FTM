@@ -64,6 +64,15 @@ AFTER_CLOSE_PAUSE = (cfg_get("AFTER_CLOSE_PAUSE", "1") == "1")
 DAILY_RESUME_HOUR_KST = int(cfg_get("DAILY_RESUME_HOUR_KST", "11"))
 _LAST_RESUME_YMD = None
 
+# [ANCHOR: PAUSE_BOOT_INIT]
+# Apply default pause only once on boot (global), not per-loop.
+try:
+    if DEFAULT_PAUSE and "__ALL__" not in PAUSE_UNTIL:
+        PAUSE_UNTIL["__ALL__"] = 2**62
+        logging.info("[PAUSE] default all paused on boot (until resume)")
+except Exception as _:
+    pass
+
 
 # === [ANCHOR: OBS_COOLDOWN_CFG] Gatekeeper/Observe/Cooldown Config ===
 def _parse_kv_numbers(val: str | None, default: dict[str, float]) -> dict[str, float]:
@@ -102,6 +111,21 @@ EXIT_DEBUG = os.getenv("EXIT_DEBUG", "0") == "1"
 STRICT_EXIT_NOTIFY = os.getenv("STRICT_EXIT_NOTIFY", "1") == "1"
 PAPER_STRICT_NONZERO = os.getenv("PAPER_STRICT_NONZERO", "0") == "1"
 PAPER_CSV_OPEN_LOG = os.getenv("PAPER_CSV_OPEN_LOG", "1") == "1"
+PAPER_CSV_CLOSE_LOG = os.getenv("PAPER_CSV_CLOSE_LOG", "1") == "1"
+FUTURES_CSV_CLOSE_LOG = os.getenv("FUTURES_CSV_CLOSE_LOG", "1") == "1"
+CLEAR_IDEMP_ON_CLOSEALL = os.getenv("CLEAR_IDEMP_ON_CLOSEALL", "1") == "1"
+
+# [ANCHOR: LAST_PRICE_GLOBALS]
+LAST_PRICE = {}  # symbol -> last/mark price cache
+def set_last_price(symbol: str, price: float) -> None:
+    try: LAST_PRICE[str(symbol).upper()] = float(price)
+    except Exception: pass
+def get_last_price(symbol: str, default_price: float = 0.0) -> float:
+    try:
+        v = LAST_PRICE.get(str(symbol).upper())
+        return float(v) if v is not None else float(default_price)
+    except Exception:
+        return float(default_price)
 
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
@@ -3561,23 +3585,6 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         f"tp_pct={tp_pct:.2f}", f"sl_pct={sl_pct:.2f}", f"tr_pct={tr_pct:.2f}",
         f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
     ])
-    _log_trade_csv(symbol, tf, "OPEN", PAPER_POS[key]["side"], qty, float(last_price), extra=extra)
-
-    # [ANCHOR: POSITION_OPEN_HOOK]
-    if exec_signal == "BUY":
-        highest_price[(symbol, tf)] = float(last_price)
-        lowest_price.pop((symbol, tf), None)
-    else:
-        lowest_price[(symbol, tf)] = float(last_price)
-        highest_price.pop((symbol, tf), None)
-    previous_signal[(symbol, tf)] = exec_signal
-    entry_data[(symbol, tf)] = (float(last_price), datetime.now().strftime("%m월 %d일 %H:%M"))
-
-    extra = ",".join([
-        "mode=paper",
-        f"tp_pct={tp_pct:.2f}", f"sl_pct={sl_pct:.2f}", f"tr_pct={tr_pct:.2f}",
-        f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
-    ])
     if PAPER_CSV_OPEN_LOG:
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
 
@@ -4031,6 +4038,21 @@ def idem_mark(symbol: str, tf: str, candle_ts: int):
     except Exception:
         pass
 
+def idem_clear_symbol_tf(symbol: str, tf: str):
+    """Remove all idempotence marks for (symbol, tf) regardless of candle_ts."""
+    try:
+        prefix = f"{symbol}|{tf}|"
+        keys = [k for k in list(_IDEMP.keys()) if k.startswith(prefix)]
+        for k in keys: _IDEMP.pop(k, None)
+        _save_json(IDEMP_FILE, _IDEMP)
+    except Exception: pass
+
+def idem_clear_all():
+    try:
+        _IDEMP.clear()
+        _save_json(IDEMP_FILE, _IDEMP)
+    except Exception: pass
+
 PAPER_POS_TF_FILE = "logs/paper_positions_tf.json"
 PAPER_POS_TF = _load_json(PAPER_POS_TF_FILE, {})   # key: tf -> symbol (paper 전용)
 
@@ -4069,6 +4091,20 @@ def _paper_close(symbol: str, tf: str, exit_price: float):
             pnl_pct = gross
     except Exception:
         pnl_pct = None
+    # CSV: paper CLOSE
+    try:
+        if PAPER_CSV_CLOSE_LOG:
+            qty0 = float((pos or {}).get("qty", 0.0))
+            extra = ",".join([
+                "mode=paper",
+                (f"pnl_pct={pnl_pct:.4f}" if pnl_pct is not None else "pnl_pct=")
+            ])
+            _log_trade_csv(symbol, tf, "CLOSE", side, qty0, float(exit_price), extra=extra)
+    except Exception as e:
+        log(f"[CSV_CLOSE_WARN] paper {symbol} {tf}: {e}")
+    # IDEMP: allow re-entry after manual/forced close
+    try: idem_clear_symbol_tf(symbol, tf)
+    except Exception: pass
     return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct}
 
 # [ANCHOR: PAPER_PARTIAL_CLOSE_BEGIN]
@@ -4875,6 +4911,13 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
             float(entry), float(exit_price or entry),
             opened_ms=opened_ms, closed_ms=closed_ms
         )
+        # CSV: futures CLOSE
+        try:
+            if FUTURES_CSV_CLOSE_LOG:
+                extra = ",".join(["mode=futures", f"reason={reason}"])
+                _log_trade_csv(symbol, tf, "CLOSE", side, abs(qty), float(exit_price or entry), extra=extra)
+        except Exception as e:
+            log(f"[CSV_CLOSE_WARN] futures {symbol} {tf}: {e}")
 
         # --- B-2: 선물 청산 알림(공통 헬퍼 호출) ---
         try:
@@ -4917,6 +4960,9 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
         FUT_POS.pop(symbol, None); _save_json(OPEN_POS_FILE, FUT_POS)
         if FUT_POS_TF.get(tf) == symbol:
             FUT_POS_TF.pop(tf, None); _save_json(OPEN_TF_FILE, FUT_POS_TF)
+        # IDEMP: allow re-entry after manual/forced close
+        try: idem_clear_symbol_tf(symbol, tf)
+        except Exception: pass
     return ok
 
 async def futures_close_symbol_tf(symbol, tf):
@@ -6218,9 +6264,6 @@ async def on_ready():
                 now_ms = int(time.time()*1000)
                 key_all = PAUSE_UNTIL.get("__ALL__", 0)
                 key_tf = PAUSE_UNTIL.get((symbol_eth, tf), 0)
-                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
-                    PAUSE_UNTIL[(symbol_eth, tf)] = 2**62
-                    key_tf = PAUSE_UNTIL[(symbol_eth, tf)]
                 if now_ms < max(key_all, key_tf):
                     log(f"⏸ {symbol_eth} {tf}: paused until {(max(key_all, key_tf))}")
                     idem_mark(symbol_eth, tf, c_ts)
@@ -6437,6 +6480,8 @@ async def on_ready():
 
                 trigger_mode = trigger_mode_for(tf)
                 log(f"[DEBUG] {symbol_eth} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                try: set_last_price(symbol_eth, display_price)
+                except Exception: pass
                 await handle_trigger(symbol_eth, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 if prev_ts == c_ts and prev_bkt == curr_bkt and (prev_sco is not None) and abs(score - prev_sco) < SCORE_DELTA[tf]:
@@ -6670,9 +6715,6 @@ async def on_ready():
                 now_ms = int(time.time()*1000)
                 key_all = PAUSE_UNTIL.get("__ALL__", 0)
                 key_tf = PAUSE_UNTIL.get((symbol_btc, tf), 0)
-                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
-                    PAUSE_UNTIL[(symbol_btc, tf)] = 2**62
-                    key_tf = PAUSE_UNTIL[(symbol_btc, tf)]
                 if now_ms < max(key_all, key_tf):
                     log(f"⏸ {symbol_btc} {tf}: paused until {(max(key_all, key_tf))}")
                     idem_mark(symbol_btc, tf, c_ts)
@@ -6885,6 +6927,8 @@ async def on_ready():
 
                 trigger_mode = trigger_mode_for(tf)
                 log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+                try: set_last_price(symbol_btc, display_price)
+                except Exception: pass
                 await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 if prev_ts_b == c_ts and prev_bkt_b == curr_bucket and (prev_sco_b is not None) and abs(score - prev_sco_b) < SCORE_DELTA[tf]:
@@ -7082,12 +7126,12 @@ async def _set_pause(symbol: str | None, tf: str | None, minutes: int | None):
 
 @client.event
 async def on_message(message):
-    global os
     if message.author == client.user:
         return
 
     content = message.content.strip()
     parts = content.split()
+    # using global LAST_PRICE cache defined at module scope
 
     # [ANCHOR: CMD_SET_GET_SAVEENV]
     if content.startswith("!set "):
@@ -7168,12 +7212,22 @@ async def on_message(message):
     if content.startswith("!closeall"):
         try:
             n = 0
-            for (sym, tf), pos in list(PAPER_POS.items()):
-                _paper_close(sym, tf, float(LAST_PRICE.get(sym, pos.get("entry_price", 0))))
+            # PAPER_POS key is "SYMBOL|TF" (string). Split safely.
+            for key, pos in list(PAPER_POS.items()):
+                try:
+                    sym, tf = key.split("|", 1)
+                except Exception:
+                    continue
+                fallback = float(pos.get("entry_price", 0.0))
+                _paper_close(sym, tf, get_last_price(sym, fallback))
                 n += 1
             for tfk, sym in list(FUT_POS_TF.items()):
                 await futures_close_all(sym, tfk)
                 n += 1
+            # optional: clear all idempotence marks after mass close
+            if CLEAR_IDEMP_ON_CLOSEALL:
+                try: idem_clear_all()
+                except Exception: pass
             await message.channel.send(f"🟢 closed all ({n})")
         except Exception as e:
             await message.channel.send(f"⚠️ closeall error: {e}")
@@ -7183,7 +7237,7 @@ async def on_message(message):
         try:
             _, sym, tfx = content.split()
             if TRADE_MODE == "paper":
-                _paper_close(sym.upper(), tfx, float(LAST_PRICE.get(sym.upper(), 0)))
+                _paper_close(sym.upper(), tfx, get_last_price(sym.upper(), 0.0))
             else:
                 await futures_close_symbol_tf(sym.upper(), tfx)
             await message.channel.send(f"🟢 closed {sym.upper()} {tfx}")
@@ -7222,7 +7276,8 @@ async def on_message(message):
                 if tr is not None: pos["tr_pct"] = tr
                 FUT_POS[sym] = pos; _save_json(OPEN_POS_FILE, FUT_POS)
                 await _cancel_symbol_conditional_orders(sym)
-                await _ensure_tp_sl_trailing(sym, tfx, float(LAST_PRICE.get(sym, pos.get("entry", 0))), pos.get("side", "LONG"))
+                fallback = float(pos.get("entry", 0.0))
+                await _ensure_tp_sl_trailing(sym, tfx, get_last_price(sym, fallback), pos.get("side", "LONG"))
             await message.channel.send(f"⚙️ risk updated {sym} {tfx} (tp={tp}, sl={sl}, tr={tr})")
         except Exception as e:
             await message.channel.send(f"⚠️ risk error: {e}")
