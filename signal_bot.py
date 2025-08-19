@@ -64,6 +64,15 @@ AFTER_CLOSE_PAUSE = (cfg_get("AFTER_CLOSE_PAUSE", "1") == "1")
 DAILY_RESUME_HOUR_KST = int(cfg_get("DAILY_RESUME_HOUR_KST", "11"))
 _LAST_RESUME_YMD = None
 
+# [ANCHOR: PAUSE_BOOT_INIT]
+# Apply default pause only once on boot (global), not per-loop.
+try:
+    if DEFAULT_PAUSE and "__ALL__" not in PAUSE_UNTIL:
+        PAUSE_UNTIL["__ALL__"] = 2**62
+        logging.info("[PAUSE] default all paused on boot (until resume)")
+except Exception as _:
+    pass
+
 
 # === [ANCHOR: OBS_COOLDOWN_CFG] Gatekeeper/Observe/Cooldown Config ===
 def _parse_kv_numbers(val: str | None, default: dict[str, float]) -> dict[str, float]:
@@ -6218,9 +6227,6 @@ async def on_ready():
                 now_ms = int(time.time()*1000)
                 key_all = PAUSE_UNTIL.get("__ALL__", 0)
                 key_tf = PAUSE_UNTIL.get((symbol_eth, tf), 0)
-                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
-                    PAUSE_UNTIL[(symbol_eth, tf)] = 2**62
-                    key_tf = PAUSE_UNTIL[(symbol_eth, tf)]
                 if now_ms < max(key_all, key_tf):
                     log(f"⏸ {symbol_eth} {tf}: paused until {(max(key_all, key_tf))}")
                     idem_mark(symbol_eth, tf, c_ts)
@@ -6670,9 +6676,6 @@ async def on_ready():
                 now_ms = int(time.time()*1000)
                 key_all = PAUSE_UNTIL.get("__ALL__", 0)
                 key_tf = PAUSE_UNTIL.get((symbol_btc, tf), 0)
-                if DEFAULT_PAUSE and key_all == 0 and key_tf == 0:
-                    PAUSE_UNTIL[(symbol_btc, tf)] = 2**62
-                    key_tf = PAUSE_UNTIL[(symbol_btc, tf)]
                 if now_ms < max(key_all, key_tf):
                     log(f"⏸ {symbol_btc} {tf}: paused until {(max(key_all, key_tf))}")
                     idem_mark(symbol_btc, tf, c_ts)
@@ -7168,7 +7171,12 @@ async def on_message(message):
     if content.startswith("!closeall"):
         try:
             n = 0
-            for (sym, tf), pos in list(PAPER_POS.items()):
+            # PAPER_POS key is "SYMBOL|TF" (string). Split safely.
+            for key, pos in list(PAPER_POS.items()):
+                try:
+                    sym, tf = key.split("|", 1)
+                except Exception:
+                    continue
                 _paper_close(sym, tf, float(LAST_PRICE.get(sym, pos.get("entry_price", 0))))
                 n += 1
             for tfk, sym in list(FUT_POS_TF.items()):
