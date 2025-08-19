@@ -61,9 +61,11 @@ TARGET_SCORE_BY_TF = _parse_kv_numbers(os.getenv("TARGET_SCORE_BY_TF"), {"15m": 
 WAIT_TARGET_SEC = _parse_kv_numbers(os.getenv("WAIT_TARGET_SEC"), {"15m": 0.0, "1h": 0.0, "4h": 0.0, "1d": 0.0})
 TARGET_WAIT_MODE = os.getenv("TARGET_WAIT_MODE", "SOFT").upper()
 GK_DEBUG = os.getenv("GK_DEBUG", "0") == "1"
+
 EXIT_DEBUG = os.getenv("EXIT_DEBUG", "0") == "1"
 STRICT_EXIT_NOTIFY = os.getenv("STRICT_EXIT_NOTIFY", "1") == "1"
 PAPER_STRICT_NONZERO = os.getenv("PAPER_STRICT_NONZERO", "0") == "1"
+
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
 
@@ -256,7 +258,6 @@ def _abs_score(c: dict) -> float:
     except Exception:
         pass
     return 0.0
-
 
 # [ANCHOR: GATEKEEPER_V3_BEGIN]
 def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
