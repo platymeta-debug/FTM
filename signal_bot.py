@@ -934,6 +934,22 @@ entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
 highest_price = {}    # (symbol, tf) -> float
 lowest_price = {}     # (symbol, tf) -> float
 
+# [ANCHOR: LAST_PRICE_GLOBALS]
+LAST_PRICE = {}  # symbol -> last/mark price cache
+
+def set_last_price(symbol: str, price: float) -> None:
+    try:
+        LAST_PRICE[str(symbol).upper()] = float(price)
+    except Exception:
+        pass
+
+def get_last_price(symbol: str, default_price: float = 0.0) -> float:
+    try:
+        v = LAST_PRICE.get(str(symbol).upper())
+        return float(v) if v is not None else float(default_price)
+    except Exception:
+        return float(default_price)
+
 previous_bucket = {'15m': None, '1h': None, '4h': None, '1d': None}
 
 
@@ -6299,6 +6315,11 @@ async def on_ready():
                 snap = await get_price_snapshot(symbol_eth)
                 live_price = snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: LAST_PRICE_UPDATE_ETH]
+                try:
+                    set_last_price(symbol_eth, display_price)
+                except Exception:
+                    pass
                 # [ANCHOR: daily_change_unify_eth]
 
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
@@ -6745,6 +6766,11 @@ async def on_ready():
                 snap = await get_price_snapshot(symbol_btc)
                 live_price = snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: LAST_PRICE_UPDATE_BTC]
+                try:
+                    set_last_price(symbol_btc, display_price)
+                except Exception:
+                    pass
                 # [ANCHOR: daily_change_unify_btc]
 
                 daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
@@ -7218,6 +7244,7 @@ async def on_message(message):
                     sym, tf = key.split("|", 1)
                 except Exception:
                     continue
+
                 fallback = float(pos.get("entry_price", 0.0))
                 _paper_close(sym, tf, get_last_price(sym, fallback))
                 n += 1
