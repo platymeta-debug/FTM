@@ -3384,6 +3384,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                         "last_score": float(cur_score),
                         "last_update_ms": int(time.time()*1000),
                     })
+
                     avg = float(existing_paper["entry_price"])
                     tp_pct = float(existing_paper.get("tp_pct", 0.0))
                     sl_pct = float(existing_paper.get("sl_pct", 0.0))
@@ -3393,6 +3394,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                     else:
                         existing_paper["tp_price"] = (avg * (1 - tp_pct/100.0)) if tp_pct>0 else None
                         existing_paper["sl_price"] = (avg * (1 + sl_pct/100.0)) if sl_pct>0 else None
+
                     PAPER_POS[key] = existing_paper
                     _save_json(PAPER_POS_FILE, PAPER_POS)
                     did_scale = True
@@ -3400,6 +3402,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                     add_qty = await _fut_scale_in(symbol, float(last_price), notional_add, "LONG" if exec_signal=="BUY" else "SHORT")
                     if add_qty > 0:
                         did_scale = True
+
                         fp = FUT_POS.get(symbol, {})
                         old_qty = float(fp.get("qty", 0.0))
                         old_entry = float(fp.get("entry", last_price))
@@ -3416,6 +3419,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                             fp["sl_price"] = (new_entry*(1+sl_pct_fp/100.0)) if sl_pct_fp>0 else None
                         FUT_POS[symbol] = fp
                         _save_json(OPEN_POS_FILE, FUT_POS)
+
                         await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
             if did_scale and SCALE_LOG:
@@ -3434,11 +3438,13 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 closed = await _fut_reduce(symbol, red_qty, "LONG" if exec_signal=="BUY" else "SHORT") if red_qty>0 else 0.0
                 if closed > 0:
                     did_scale = True
+
                     fp = FUT_POS.get(symbol, {})
                     fp_qty = max(0.0, float(fp.get("qty", 0.0)) - closed)
                     fp["qty"] = fp_qty
                     FUT_POS[symbol] = fp
                     _save_json(OPEN_POS_FILE, FUT_POS)
+
                     await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
             if did_scale and SCALE_LOG:
@@ -5164,10 +5170,12 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         else:
             tp_price = float(last) * (1 - tp_pct/100.0) if tp_pct>0 else None
             sl_price = float(last) * (1 + sl_pct/100.0) if sl_pct>0 else None
+
         FUT_POS[symbol].update({
             'tp_pct': tp_pct, 'sl_pct': sl_pct, 'tr_pct': tr_pct,
             'tp_price': tp_price, 'sl_price': sl_price
         })
+
         _save_json(OPEN_POS_FILE, FUT_POS)
         extra = ",".join([
             f"id={(ord_.get('id') if isinstance(ord_, dict) else '')}",
