@@ -65,6 +65,7 @@ DAILY_RESUME_HOUR_KST = int(cfg_get("DAILY_RESUME_HOUR_KST", "11"))
 _LAST_RESUME_YMD = None
 
 # [ANCHOR: PAUSE_BOOT_INIT]
+
 # Apply DEFAULT_PAUSE only once on boot (global), not per-loop
 try:
     if (cfg_get("DEFAULT_PAUSE","1") == "1") and ("__ALL__" not in PAUSE_UNTIL):
@@ -939,6 +940,22 @@ neutral_info = {'15m': None, '1h': None, '4h': None, '1d': None}
 entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
 highest_price = {}    # (symbol, tf) -> float
 lowest_price = {}     # (symbol, tf) -> float
+
+# [ANCHOR: LAST_PRICE_GLOBALS]
+LAST_PRICE = {}  # symbol -> last/mark price cache
+
+def set_last_price(symbol: str, price: float) -> None:
+    try:
+        LAST_PRICE[str(symbol).upper()] = float(price)
+    except Exception:
+        pass
+
+def get_last_price(symbol: str, default_price: float = 0.0) -> float:
+    try:
+        v = LAST_PRICE.get(str(symbol).upper())
+        return float(v) if v is not None else float(default_price)
+    except Exception:
+        return float(default_price)
 
 previous_bucket = {'15m': None, '1h': None, '4h': None, '1d': None}
 
@@ -4130,6 +4147,7 @@ def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = "")
     # CSV: paper CLOSE
     try:
         if PAPER_CSV_CLOSE_LOG:
+
             lev = float((pos or {}).get("lev") or 1.0)
             pnl_on_margin = (pnl_pct*lev) if (pnl_pct is not None) else None
             extra = ",".join([
@@ -4139,6 +4157,7 @@ def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = "")
                 f"reason={exit_reason}"
             ])
             _log_trade_csv(symbol, tf, "CLOSE", side, float((pos or {}).get('qty',0.0)), float(exit_price), extra=extra)
+
     except Exception as e:
         log(f"[CSV_CLOSE_WARN] paper {symbol} {tf}: {e}")
     # IDEMP: allow re-entry after manual/forced close
@@ -5006,8 +5025,10 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
         # CSV: futures CLOSE
         try:
             if FUTURES_CSV_CLOSE_LOG:
+
                 lev = float(pos.get("lev") or 1.0) if isinstance(pos, dict) else 1.0
                 extra = ",".join(["mode=futures", f"lev={lev:.2f}", f"reason={reason}"])
+
                 _log_trade_csv(symbol, tf, "CLOSE", side, abs(qty), float(exit_price or entry), extra=extra)
         except Exception as e:
             log(f"[CSV_CLOSE_WARN] futures {symbol} {tf}: {e}")
@@ -5588,8 +5609,10 @@ def _req_trail_pct(symbol: str, tf: str, tf_map: dict) -> float:
     return _req_float_map(_TRAIL_BY_SYMBOL.get(base, {}), tf_map, tf, 0.0)
 
 # === Trailing helpers (apply to all TFs) ===
+
 TRAIL_ARM_DELTA_MIN_PCT = float(cfg_get("TRAIL_ARM_DELTA_MIN_PCT", "0.0"))
 TRAIL_ARM_DELTA_MIN_PCT_BY_TF = cfg_get("TRAIL_ARM_DELTA_MIN_PCT_BY_TF", "")
+
 
 def _arm_min_for_tf(tf: str) -> float:
     try:
@@ -5612,8 +5635,10 @@ def _trail_lp(entry: float, lp: float | None) -> float:
 
 def _compute_trail(side: str, entry: float, tr_pct: float,
                    hp: float | None, lp: float | None, tf: str):
+
     """Return (trail_price or None, armed(bool), base(float))"""
     ts = float(tr_pct)/100.0 if tr_pct is not None else 0.0
+
     if ts <= 0.0:
         return (None, False, None)
     arm_min = _arm_min_for_tf(tf)/100.0
@@ -5625,6 +5650,7 @@ def _compute_trail(side: str, entry: float, tr_pct: float,
         base = _trail_lp(entry, lp)
         armed = base <= float(entry)*(1.0 - arm_min)
         return ((base*(1.0 + ts)) if armed else None, armed, base)
+
 
 def _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev):
     """Return (eff_tp_pct, eff_sl_pct, eff_tr_pct, mode) where effective % are on price-basis."""
@@ -5641,6 +5667,7 @@ def _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev):
             float(sl_pct) if sl_pct is not None else None,
             float(tr_pct) if tr_pct is not None else None,
             "PRICE_PCT")
+
 
 def _hedge_side_allowed(symbol: str, tf: str, signal: str) -> bool:
     """
@@ -6462,6 +6489,11 @@ async def on_ready():
                 snap = await get_price_snapshot(symbol_eth)
                 live_price = snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: LAST_PRICE_UPDATE_ETH]
+                try:
+                    set_last_price(symbol_eth, display_price)
+                except Exception:
+                    pass
                 # [ANCHOR: daily_change_unify_eth]
 
                 daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
@@ -6658,10 +6690,12 @@ async def on_ready():
 
                 trigger_mode = trigger_mode_for(tf)
                 log(f"[DEBUG] {symbol_eth} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+
                 try:
                     set_last_price(symbol_eth, display_price if 'display_price' in locals() else live_price)
                 except Exception:
                     pass
+
                 await handle_trigger(symbol_eth, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 if prev_ts == c_ts and prev_bkt == curr_bkt and (prev_sco is not None) and abs(score - prev_sco) < SCORE_DELTA[tf]:
@@ -6925,6 +6959,11 @@ async def on_ready():
                 snap = await get_price_snapshot(symbol_btc)
                 live_price = snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
+                # [ANCHOR: LAST_PRICE_UPDATE_BTC]
+                try:
+                    set_last_price(symbol_btc, display_price)
+                except Exception:
+                    pass
                 # [ANCHOR: daily_change_unify_btc]
 
                 daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
@@ -7126,10 +7165,12 @@ async def on_ready():
 
                 trigger_mode = trigger_mode_for(tf)
                 log(f"[DEBUG] {symbol_btc} live={live_price} c_close={c_c} display={display_price} tf={tf} tm={trigger_mode}")
+
                 try:
                     set_last_price(symbol_btc, display_price if 'display_price' in locals() else live_price)
                 except Exception:
                     pass
+
                 await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data)
 
                 if prev_ts_b == c_ts and prev_bkt_b == curr_bucket and (prev_sco_b is not None) and abs(score - prev_sco_b) < SCORE_DELTA[tf]:
@@ -7419,6 +7460,7 @@ async def on_message(message):
                     sym, tf = key.split("|", 1)
                 except Exception:
                     continue
+
                 fallback = float(pos.get("entry_price", 0.0))
                 _paper_close(sym, tf, get_last_price(sym, fallback), "MANUAL")
                 n += 1
@@ -7438,7 +7480,9 @@ async def on_message(message):
         try:
             _, sym, tfx = content.split()
             if TRADE_MODE == "paper":
+
                 _paper_close(sym.upper(), tfx, get_last_price(sym.upper(), 0.0), "MANUAL")
+
             else:
                 await futures_close_symbol_tf(sym.upper(), tfx)
             await message.channel.send(f"🟢 closed {sym.upper()} {tfx}")
@@ -7490,7 +7534,9 @@ async def on_message(message):
                     pos["sl_price"] = (avg*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
                 FUT_POS[sym] = pos; _save_json(OPEN_POS_FILE, FUT_POS)
                 await _cancel_symbol_conditional_orders(sym)
+
                 await _ensure_tp_sl_trailing(sym, tfx, get_last_price(sym, avg), pos.get("side", "LONG"))
+
             await message.channel.send(f"⚙️ risk updated {sym} {tfx} (tp={tp}, sl={sl}, tr={tr})")
         except Exception as e:
             await message.channel.send(f"⚠️ risk error: {e}")
