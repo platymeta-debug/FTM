@@ -469,7 +469,92 @@ def _playbook_adjust_risk(symbol: str, tf: str, side: str,
              "scale_step_mul": sc_step_mul, "scale_reduce_mul": sc_reduce_mul,
              "scale_legs_add": sc_legs_add, "scale_up_shift": up_shift, "scale_down_shift": down_shift,
 
-             "label": label, "eff_w": w}, st)
+            "label": label, "eff_w": w}, st)
+
+
+def _parse_brackets(spec: str, fallback_legs: int) -> list[float]:
+    """
+    spec: "N|w1,w2,...,wN" or "w1,w2,..." (N inferred).
+    Returns normalized weights (sum=1.0) length = N (or fallback_legs if parse fails).
+    """
+    try:
+        if "|" in spec:
+            left, right = spec.split("|", 1)
+            n = int(float(left.strip()))
+            ws = [float(x) for x in right.split(",") if x.strip()!=""]
+        else:
+            ws = [float(x) for x in spec.split(",") if x.strip()!=""]
+            n = len(ws)
+        if n <= 0: n = max(1, int(fallback_legs))
+        if len(ws) < n:  # pad tail equally
+            remain = n - len(ws); ws += [ws[-1] if ws else 1.0]*remain
+        ws = ws[:n]
+        s = sum(ws) or 1.0
+        return [max(0.0, w/s) for w in ws]
+    except Exception:
+        n = max(1, int(fallback_legs))
+        return [1.0/n]*n
+
+
+def _select_brackets_for(symbol: str, side: str, max_legs_eff: int) -> list[float]:
+    """
+    Pick a bracket shape by regime alignment; cap length to max_legs_eff.
+    """
+    st = CTX_STATE.get(symbol) or _compute_context(symbol)
+    spec = SCALE_BRACKETS_DEFAULT
+    try:
+        regime = (st.get("regime") if st else "RANGE") or "RANGE"
+        align = _pb_alignment(regime, (side or "").upper()) if '_pb_alignment' in globals() else 0
+        if regime == "RANGE":
+            spec = SCALE_BRACKETS_RANGE
+        elif align >= 0:
+            spec = SCALE_BRACKETS_ALIGN
+        else:
+            spec = SCALE_BRACKETS_CONTRA
+    except Exception:
+        pass
+    ws = _parse_brackets(spec, max_legs_eff)
+    if len(ws) > max_legs_eff:
+        ws = ws[:max_legs_eff]
+        s = sum(ws) or 1.0
+        ws = [w/s for w in ws]
+    return ws
+
+
+def _should_realloc(prev_ctx: dict|None, new_ctx: dict|None, last_ts: float|None, side: str) -> bool:
+    if not SCALE_REALLOCATE_BRACKETS:
+        return False
+    now = time.time()
+    if last_ts and now - last_ts < SCALE_REALLOC_COOLDOWN_SEC:
+        return False
+    if not (SCALE_REALLOC_ON_ALIGN_CHANGE or SCALE_REALLOC_ON_BIAS_STEP):
+        return False
+    try:
+        p = prev_ctx or {}
+        n = new_ctx or {}
+        if SCALE_REALLOC_ON_ALIGN_CHANGE:
+            def _al(ctx):
+                r = (ctx.get("regime") or "RANGE").upper()
+                s = (side or "").upper()
+                return _pb_alignment(r, s) if '_pb_alignment' in globals() else 0
+            if _al(p) != _al(n):
+                return True
+        if SCALE_REALLOC_ON_BIAS_STEP:
+            steps = [float(x) for x in str(SCALE_REALLOC_BIAS_STEPS).split(",") if x.strip()!=""]
+            pb = abs(float(p.get("ctx_bias", 0.0) if p else 0.0))
+            nb = abs(float(n.get("ctx_bias", 0.0) if n else 0.0))
+            crossed = any((pb < t <= nb) or (nb < t <= pb) for t in steps)
+            if crossed:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _plan_bracket_targets(total_notional: float, ws: list[float]) -> list[float]:
+    s = sum(ws) or 1.0
+    ws = [w/s for w in ws]
+    return [max(0.0, total_notional*w) for w in ws]
 
 
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
@@ -3841,6 +3926,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         tf_base_cap = _margin_for_tf(tf)
         max_cap = tf_base_cap
         did_scale = False
+        base_notional = float((existing_paper or {}).get("plan_total_notional") or (FUT_POS.get(symbol, {}).get("plan_total_notional") if has_futures else 0.0) or (tf_base_cap * lev_used))
 
         side = "LONG" if exec_signal == "BUY" else "SHORT"
         try:
@@ -3867,6 +3953,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         except Exception as e:
             log(f"[PB_SCALE_ERR] {symbol} {tf} {e}")
             SCALE_MAX_LEGS_EFF = SCALE_MAX_LEGS
+        # === Bracket selection for this symbol/tf/side ===
+        try:
+            BRACKETS_WS = _select_brackets_for(symbol, side, max_legs_eff=SCALE_MAX_LEGS_EFF)
+        except Exception as e:
+            log(f"[BRKT_ERR] {symbol} {tf} {e}")
+            BRACKETS_WS = _parse_brackets(SCALE_BRACKETS_DEFAULT, SCALE_MAX_LEGS_EFF)
         log(f"[PB_CAP] {symbol} {tf} alloc_cap={_pb.get('alloc_abs_cap') if _pb else 0} lev_cap={_pb.get('lev_cap') if _pb else 0}")
         log(f"[PB_SCALE] {symbol} {tf} step×{_pb.get('scale_step_mul') if _pb else 1} reduce×{_pb.get('scale_reduce_mul') if _pb else 1} legs+{_pb.get('scale_legs_add') if _pb else 0} upΔ{_pb.get('scale_up_shift') if _pb else 0} downΔ{_pb.get('scale_down_shift') if _pb else 0}")
 
@@ -3890,8 +3982,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
         # SCALE-IN (same side + improving)
         if same_side and (cur_score - last_score) >= up_thr and legs < int(SCALE_MAX_LEGS_EFF):
-            add_base = tf_base_cap * step_pct
-            used_base = float((existing_paper or {}).get("used_base_margin") or 0.0)
+            pos_ref = existing_paper if has_paper else FUT_POS.get(symbol, {})
+            brk_idx = int(legs)
+            targets = _plan_bracket_targets(base_notional, BRACKETS_WS)
+            new_leg_notional = max(0.0, targets[brk_idx] - sum(l.get("notional",0.0) for l in pos_ref.get("legs", [])[:brk_idx+1]))
+            if new_leg_notional <= 0:
+                new_leg_notional = base_notional * step_pct  # safe fallback
+            add_base = new_leg_notional / max(lev_used, 1e-9)
+            used_base = float((pos_ref or {}).get("used_base_margin") or 0.0)
             add_base = max(0.0, min(add_base, max_cap - used_base))
             notional_add = add_base * lev_used
             if notional_add >= SCALE_MIN_ADD_NOTIONAL and add_base > 0.0:
@@ -3911,6 +4009,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                         "last_score": float(cur_score),
                         "last_update_ms": int(time.time()*1000),
                     })
+
+                    try:
+                        existing_paper.setdefault("legs", [])
+                        existing_paper["legs"].append({"notional": float(new_leg_notional), "price": last_price, "ts": time.time()})
+                    except Exception:
+                        pass
 
                     avg = float(existing_paper["entry_price"])
                     tp_pct = float(existing_paper.get("tp_pct", 0.0))
@@ -3954,14 +4058,32 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
         # SCALE-OUT (same side + weakening)
         elif same_side and (last_score - cur_score) >= dn_thr:
+            pos_ref = existing_paper if has_paper else FUT_POS.get(symbol, {})
+            current_notional = (float(existing_paper.get("qty") or 0.0) * float(last_price)) if has_paper else (fut_qty * float(last_price))
+            try:
+                targets = _plan_bracket_targets(base_notional, BRACKETS_WS)
+                legs = list(pos_ref.get("legs", []))
+                reduce_size = 0.0
+                for i in range(len(legs)-1, -1, -1):
+                    cur = float(legs[i].get("notional", 0.0))
+                    tgt = float(targets[i] if i < len(targets) else 0.0)
+                    excess = max(0.0, cur - tgt)
+                    if excess <= 0:
+                        continue
+                    take = min(excess, current_notional * red_pct - reduce_size)
+                    reduce_size += take
+                    if reduce_size >= current_notional * red_pct:
+                        break
+                if reduce_size <= 0:
+                    reduce_size = current_notional * red_pct
+            except Exception:
+                reduce_size = current_notional * red_pct
             if TRADE_MODE == "paper":
-                cur_qty = float(existing_paper.get("qty") or 0.0)
-                red_qty = cur_qty * red_pct
+                red_qty = reduce_size / float(last_price)
                 info = _paper_reduce(symbol, tf, red_qty, float(last_price)) if red_qty>0 else None
                 if info: did_scale = True
             else:
-                # reduceOnly partial close based on current futures qty
-                red_qty = fut_qty * red_pct
+                red_qty = reduce_size / float(last_price)
                 closed = await _fut_reduce(symbol, red_qty, "LONG" if exec_signal=="BUY" else "SHORT") if red_qty>0 else 0.0
                 if closed > 0:
                     did_scale = True
@@ -3974,8 +4096,53 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
                     await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
+            try:
+                pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else None
+                if isinstance(pos, dict):
+                    need = float(reduce_size)
+                    legs = list(pos.get("legs", []))
+                    for i in range(len(legs)-1, -1, -1):
+                        take = min(need, float(legs[i].get("notional",0.0)))
+                        legs[i]["notional"] = max(0.0, float(legs[i].get("notional",0.0)) - take)
+                        need -= take
+                        if need <= 1e-9: break
+                    pos["legs"] = [l for l in legs if l.get("notional",0.0) > 0]
+            except Exception:
+                pass
+
             if did_scale and SCALE_LOG:
                 log(f"🔽 scale-out {symbol} {tf}: -{red_pct*100:.1f}% qty at {last_price:.2f} (Δscore={last_score-cur_score:.2f})")
+
+        # === Periodic rebalance across brackets (paper: execute; futures: log plan) ===
+        try:
+            pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+            if isinstance(pos, dict) and SCALE_REALLOCATE_BRACKETS:
+                prev_ctx = pos.get("last_ctx"); new_ctx = CTX_STATE.get(symbol) or _compute_context(symbol)
+                last_ts  = float(pos.get("last_realloc_ts") or 0.0)
+                if _should_realloc(prev_ctx, new_ctx, last_ts, side):
+                    base_total = float(pos.get("plan_total_notional") or base_notional)
+                    ws = BRACKETS_WS
+                    targets = _plan_bracket_targets(base_total, ws)
+                    legs = list(pos.get("legs", []))
+                    while len(legs) < len(targets):
+                        legs.append({"notional": 0.0, "price": last_price, "ts": time.time()})
+                    deltas = [float(targets[i]) - float(legs[i].get("notional",0.0)) for i in range(len(targets))]
+                    plan = [(i, d) for i,d in enumerate(deltas) if abs(d) >= SCALE_REALLOC_MIN_USDT]
+                    if plan:
+                        log(f"[BRKT_REALLOC] {symbol} {tf} side={side} plan={plan} targets={targets}")
+                        if TRADE_MODE=='paper':
+                            for i,d in plan:
+                                legs[i]["notional"] = max(0.0, legs[i].get("notional",0.0) + d)
+                                legs[i]["ts"] = time.time(); legs[i]["price"] = last_price
+                            pos["legs"] = [l for l in legs if l.get("notional",0.0) > 0]
+                        else:
+                            pass
+                        pos["last_ctx"] = new_ctx
+                        pos["last_realloc_ts"] = time.time()
+                    else:
+                        pos["last_ctx"] = new_ctx
+        except Exception as e:
+            log(f"[BRKT_REALLOC_ERR] {symbol} {tf} {e}")
 
         # update last_score memory
         try: EXEC_STATE[("last_score", symbol, tf)] = float(cur_score)
@@ -4072,7 +4239,18 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if PAPER_CSV_OPEN_LOG:
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
 
-    # [ANCHOR: POSITION_OPEN_HOOK]
+# [ANCHOR: POSITION_OPEN_HOOK]
+    # --- Bracket legs state on open ---
+    try:
+        pos_obj = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+        if isinstance(pos_obj, dict):
+            # persist legs array and last-realloc metadata
+            pos_obj.setdefault("legs", [])  # list of {"notional":..., "price":..., "ts":...}
+            pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(last_price)))
+            pos_obj.setdefault("last_ctx", CTX_STATE.get(symbol))
+            pos_obj.setdefault("last_realloc_ts", 0.0)
+    except Exception:
+        pass
     # initialize trailing baseline at entry (per (symbol, tf))
     try:
         k2 = (symbol, tf)
@@ -4168,7 +4346,22 @@ SCALE_DN_DELTA = _parse_pct_map2(cfg_get("SCALE_DOWN_SCORE_DELTA", "15m:0.6,1h:0
 SCALE_STEP_PCT = _parse_pct_map2(cfg_get("SCALE_STEP_PCT", "15m:0.25,1h:0.25,4h:0.25,1d:0.25"))
 SCALE_REDUCE_PCT = _parse_pct_map2(cfg_get("SCALE_REDUCE_PCT", "15m:0.20,1h:0.20,4h:0.20,1d:0.20"))
 SCALE_MIN_ADD_NOTIONAL = float(cfg_get("SCALE_MIN_ADD_NOTIONAL_USDT", "15"))
-SCALE_REALLOCATE_BRACKETS = (cfg_get("SCALE_REALLOCATE_BRACKETS", "1") == "1")  # re-arm TP/SL/Trail after scaling
+# ==== Rebalancing Brackets (regime-aware scaling allocation) ====
+# Enable fine-grained bracket reallocation (supersedes old boolean if set)
+SCALE_REALLOCATE_BRACKETS = (cfg_get("SCALE_REALLOCATE_BRACKETS", "1") == "1")
+# Bracket specs: "legs|w1,w2,w3" (weights sum doesn't need to be 1; we normalize)
+SCALE_BRACKETS_DEFAULT = cfg_get("SCALE_BRACKETS_DEFAULT", "3|0.50,0.30,0.20")
+SCALE_BRACKETS_ALIGN   = cfg_get("SCALE_BRACKETS_ALIGN",   "4|0.45,0.25,0.20,0.10")
+SCALE_BRACKETS_CONTRA  = cfg_get("SCALE_BRACKETS_CONTRA",  "2|0.60,0.40")
+SCALE_BRACKETS_RANGE   = cfg_get("SCALE_BRACKETS_RANGE",   "3|0.40,0.35,0.25")
+# Reallocation triggers (any true → consider rebalance)
+SCALE_REALLOC_ON_ALIGN_CHANGE = (cfg_get("SCALE_REALLOC_ON_ALIGN_CHANGE", "1") == "1")
+SCALE_REALLOC_ON_BIAS_STEP    = (cfg_get("SCALE_REALLOC_ON_BIAS_STEP",    "1") == "1")
+SCALE_REALLOC_BIAS_STEPS      = cfg_get("SCALE_REALLOC_BIAS_STEPS",       "0.33,0.66")
+# Cooldown to avoid thrashing
+SCALE_REALLOC_COOLDOWN_SEC    = int(float(cfg_get("SCALE_REALLOC_COOLDOWN_SEC", "600")))
+# Minimum per-bracket notional (USDT) to actually rebalance; below → skip/noise
+SCALE_REALLOC_MIN_USDT        = float(cfg_get("SCALE_REALLOC_MIN_USDT", "10"))
 SCALE_LOG = (cfg_get("SCALE_LOG", "1") == "1")
 # [ANCHOR: SCALE_CFG_END]
 
@@ -6072,6 +6265,16 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
 
 
         # [ANCHOR: POSITION_OPEN_HOOK]
+        # --- Bracket legs state on open ---
+        try:
+            pos_obj = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+            if isinstance(pos_obj, dict):
+                pos_obj.setdefault("legs", [])
+                pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(last)))
+                pos_obj.setdefault("last_ctx", CTX_STATE.get(symbol))
+                pos_obj.setdefault("last_realloc_ts", 0.0)
+        except Exception:
+            pass
         # initialize trailing baseline at entry (per (symbol, tf))
         try:
             k2 = (symbol, tf)
@@ -8046,7 +8249,13 @@ async def on_message(message):
             lines.append(f"• SCALE_STEP_PCT: {cfg_get('SCALE_STEP_PCT')}")
             lines.append(f"• SCALE_REDUCE_PCT: {cfg_get('SCALE_REDUCE_PCT')}")
             lines.append(f"• SCALE_MIN_ADD_NOTIONAL_USDT: {cfg_get('SCALE_MIN_ADD_NOTIONAL_USDT')}")
-            lines.append(f"• SCALE_REALLOCATE_BRACKETS: {cfg_get('SCALE_REALLOCATE_BRACKETS')}")
+            lines.append(f"• SCALE_REALLOCATE_BRACKETS: {int(SCALE_REALLOCATE_BRACKETS)}")
+            lines.append(f"• SCALE_BRACKETS_DEFAULT: {SCALE_BRACKETS_DEFAULT}")
+            lines.append(f"• SCALE_BRACKETS_ALIGN / CONTRA / RANGE: {SCALE_BRACKETS_ALIGN} / {SCALE_BRACKETS_CONTRA} / {SCALE_BRACKETS_RANGE}")
+            lines.append(f"• SCALE_REALLOC_ON_ALIGN_CHANGE: {int(SCALE_REALLOC_ON_ALIGN_CHANGE)}")
+            lines.append(f"• SCALE_REALLOC_ON_BIAS_STEP: {int(SCALE_REALLOC_ON_BIAS_STEP)}  (steps={SCALE_REALLOC_BIAS_STEPS})")
+            lines.append(f"• SCALE_REALLOC_COOLDOWN_SEC: {SCALE_REALLOC_COOLDOWN_SEC}")
+            lines.append(f"• SCALE_REALLOC_MIN_USDT: {SCALE_REALLOC_MIN_USDT}")
             lines.append(f"• SLIPPAGE_BY_SYMBOL: {cfg_get('SLIPPAGE_BY_SYMBOL')}")
             lines.append(f"• TP_PCT_BY_SYMBOL: {cfg_get('TP_PCT_BY_SYMBOL')}")
             lines.append(f"• SL_PCT_BY_SYMBOL: {cfg_get('SL_PCT_BY_SYMBOL')}")
