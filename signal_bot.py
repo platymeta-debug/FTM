@@ -378,9 +378,11 @@ def _playbook_adjust_risk(symbol: str, tf: str, side: str,
                           tp_pct: float|None, sl_pct: float|None, tr_pct: float|None,
                           lev: float|None, alloc_frac: float|None) -> tuple[dict, dict|None]:
     """
+
     Returns ({tp, sl, tr, lev_cap, alloc_mul, alloc_abs_cap,
               scale_step_mul, scale_reduce_mul, scale_legs_add,
               scale_up_shift, scale_down_shift, label, eff_w}, ctx_state)
+
     Multiplies raw % (on-margin targets) BEFORE leverage→price conversion.
     Intensity scales by |ctx_bias| * PB_INTENSITY.
     """
@@ -413,6 +415,7 @@ def _playbook_adjust_risk(symbol: str, tf: str, side: str,
     adj_tr = None if tr_pct is None else _lerp(float(tr_pct), float(tr_pct)*tr_mul, w)
     adj_alloc_mul = _lerp(1.0, alloc_mul, w)
     eff_lev_cap = float(lev_cap or 0.0)  # 0 means no cap
+
     # ------ hard caps (allocation & leverage) ------
     if PLAYBOOK_HARD_LIMITS:
         if regime == "RANGE":
@@ -465,6 +468,7 @@ def _playbook_adjust_risk(symbol: str, tf: str, side: str,
              "alloc_abs_cap": float(alloc_abs_cap or 0.0),
              "scale_step_mul": sc_step_mul, "scale_reduce_mul": sc_reduce_mul,
              "scale_legs_add": sc_legs_add, "scale_up_shift": up_shift, "scale_down_shift": down_shift,
+
              "label": label, "eff_w": w}, st)
 
 
@@ -4252,6 +4256,7 @@ PB_RANGE_LEV_CAP        = float(cfg_get("PB_RANGE_LEV_CAP", "5"))
 # How strongly context bias (|CTX_BIAS| in [0,1]) scales multipliers toward the regime profile
 PB_INTENSITY            = float(cfg_get("PB_INTENSITY", "1.00"))  # 0..1 (1 = full effect)
 
+
 # ==== Playbook hard limits & scaling overrides ====
 PLAYBOOK_HARD_LIMITS     = (cfg_get("PLAYBOOK_HARD_LIMITS", "1") == "1")
 # Absolute allocation caps per trade (USDT notionals); 0=disabled
@@ -4281,6 +4286,7 @@ PB_RANGE_SCALE_UP_DELTA_SHIFT   = float(cfg_get("PB_RANGE_SCALE_UP_DELTA_SHIFT",
 PB_ALIGN_SCALE_DOWN_DELTA_SHIFT  = float(cfg_get("PB_ALIGN_SCALE_DOWN_DELTA_SHIFT", "0.00"))
 PB_CONTRA_SCALE_DOWN_DELTA_SHIFT = float(cfg_get("PB_CONTRA_SCALE_DOWN_DELTA_SHIFT", "-0.05"))
 PB_RANGE_SCALE_DOWN_DELTA_SHIFT  = float(cfg_get("PB_RANGE_SCALE_DOWN_DELTA_SHIFT", "0.00"))
+
 
 def _bucketize(score: float|None):
     if score is None:
@@ -4497,6 +4503,7 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
         _pb_w = _pb.get("eff_w", 0.0)
         _pb_alloc_mul = float(_pb.get("alloc_mul", 1.0))
         _pb_lev_cap = float(_pb.get("lev_cap", 0.0))
+
         _pb_cap = float(_pb.get("alloc_abs_cap", 0.0))
     except Exception:
         _pb_label = "PB_ERR"; _pb_w = 0.0; _pb_alloc_mul = 1.0; _pb_lev_cap = 0.0; _pb_cap = 0.0
@@ -4513,6 +4520,7 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
             lev_used = int(_pb_lev_cap)
     except Exception:
         pass
+
 
     # 수량(미리보기)
     qty = 0.0
@@ -5426,6 +5434,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
         except Exception:
             pass
 
+
         try:
             if ALERT_CTX_LINES and '_pb' in locals() and _pb:
                 cap_str = ""
@@ -5437,6 +5446,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
                 lines.append(f"• 플레이북(확장):{cap_str}{sc_str}")
         except Exception:
             pass
+
 
         if ALERT_CTX_LINES:
             try:
@@ -5949,6 +5959,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         _pb_w     = _pb.get("eff_w", 0.0)
         _pb_alloc_mul = float(_pb.get("alloc_mul", 1.0))
         _pb_lev_cap   = float(_pb.get("lev_cap", 0.0))
+
         _pb_cap       = float(_pb.get("alloc_abs_cap", 0.0))
     except Exception as e:
         log(f"[PB_ERR] {symbol} {tf} {e}")
@@ -5957,9 +5968,11 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     log(f"[PB_CAP] {symbol} {tf} alloc_cap={_pb.get('alloc_abs_cap') if '_pb' in locals() and _pb else 0} lev_cap={_pb.get('lev_cap') if '_pb' in locals() and _pb else 0}")
     log(f"[PB_SCALE] {symbol} {tf} step×{_pb.get('scale_step_mul') if '_pb' in locals() and _pb else 1} reduce×{_pb.get('scale_reduce_mul') if '_pb' in locals() and _pb else 1} legs+{_pb.get('scale_legs_add') if '_pb' in locals() and _pb else 0} upΔ{_pb.get('scale_up_shift') if '_pb' in locals() and _pb else 0} downΔ{_pb.get('scale_down_shift') if '_pb' in locals() and _pb else 0}")
 
+
     eff_margin = base_margin * frac * (_pb_alloc_mul if '_pb_alloc_mul' in locals() else 1.0)
     if eff_margin > base_margin:
         eff_margin = base_margin
+
     try:
         if _pb_cap > 0:
             eff_margin = min(eff_margin, _pb_cap)
@@ -5973,6 +5986,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             lev = _pb_lev_cap2
     except Exception:
         pass
+
 
     # 디버그 로그(옵션)
     if _DEBUG_ALLOC:
