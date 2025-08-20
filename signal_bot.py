@@ -149,16 +149,18 @@ def get_last_price(symbol: str, default_price: float = 0.0) -> float:
 CTX_STATE: dict[str, dict] = {}
 
 def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
-    """Try multiple loaders; return list of (ts, open, high, low, close, volume)."""
-    try:
-        if 'get_ohlcv' in globals():
-            return get_ohlcv(symbol, tf, limit=limit)
-        if 'fetch_ohlcv' in globals():
-            return fetch_ohlcv(symbol, tf, limit=limit)
-        if 'get_recent_ohlc_series' in globals():
-            return get_recent_ohlc_series(symbol, tf, limit=limit)
-    except Exception:
-        pass
+    """Try multiple loaders; ALWAYS return list of [ts, o, h, l, c, v]."""
+    providers = []
+    if 'get_ohlcv' in globals(): providers.append(lambda: get_ohlcv(symbol, tf, limit=limit))
+    if 'fetch_ohlcv' in globals(): providers.append(lambda: fetch_ohlcv(symbol, tf, limit=limit))
+    if 'get_recent_ohlc_series' in globals(): providers.append(lambda: get_recent_ohlc_series(symbol, tf, limit=limit))
+    for fn in providers:
+        try:
+            raw = fn()
+            rows = _ensure_ohlcv_list(raw)
+            if rows: return rows
+        except Exception:
+            continue
     return []
 
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
@@ -220,6 +222,48 @@ def _outlier_guard(clamped: float, bar: dict) -> bool:
         return delta > OUTLIER_MAX_1M
     except Exception:
         return False
+
+# --- Normalize OHLCV to list-of-lists: [ts, open, high, low, close, volume] ---
+def _ensure_ohlcv_list(data):
+    """
+    Accepts list/tuple of rows OR pandas.DataFrame.
+    Returns [] if cannot normalize.
+    """
+    try:
+        # 1) Already sequence of rows
+        if isinstance(data, (list, tuple)):
+            if len(data) == 0: return []
+            # row is list-like and first element looks like timestamp -> assume OK
+            if isinstance(data[0], (list, tuple)) and len(data[0]) >= 5:
+                return [list(r[:6]) + [0.0] * max(0, 6-len(r)) for r in data]
+        # 2) Pandas DataFrame-like
+        if hasattr(data, "empty") and hasattr(data, "columns"):
+            if getattr(data, "empty", False): return []
+            cols = [str(c).lower() for c in list(data.columns)]
+            # try name-based mapping
+            def _find(*names, default_idx=None):
+                for nm in names:
+                    if nm in cols: return cols.index(nm)
+                return default_idx
+            i_ts  = _find("timestamp","time","ts","open_time", default_idx=0)
+            i_o   = _find("open",  default_idx=1)
+            i_h   = _find("high",  default_idx=2)
+            i_l   = _find("low",   default_idx=3)
+            i_c   = _find("close", default_idx=4)
+            i_v   = _find("volume","vol", default_idx=5)
+            vals = data.values.tolist()
+            out = []
+            for r in vals:
+                try:
+                    ts = float(r[i_ts]); o=float(r[i_o]); h=float(r[i_h]); l=float(r[i_l]); c=float(r[i_c])
+                    v  = float(r[i_v]) if i_v is not None and i_v < len(r) else 0.0
+                    out.append([ts, o, h, l, c, v])
+                except Exception:
+                    continue
+            return out
+    except Exception:
+        return []
+    return []
 
 
 def _linreg_y(x: list[float], y: list[float]):
@@ -292,7 +336,8 @@ def _compute_context(symbol: str) -> dict|None:
         if st and (now - st.get("ts", 0) < CTX_TTL_SEC):
             return st
         rows = _load_ohlcv(symbol, REGIME_TF, limit=max(200, REGIME_LOOKBACK+5))
-        if not rows or len(rows) < max(60, REGIME_LOOKBACK//2):
+        # rows must be list now; guard length only
+        if len(rows) < max(60, REGIME_LOOKBACK//2):
             return None
         closes = [float(r[4]) for r in rows]
         highs  = [float(r[2]) for r in rows]
@@ -344,7 +389,8 @@ def _compute_context(symbol: str) -> dict|None:
         log(f"[CTX] {symbol} {summary}")
         return st
     except Exception as e:
-        log(f"[CTX_ERR] {symbol} {e}")
+        src = type(rows).__name__ if 'rows' in locals() else 'N/A'
+        log(f"[CTX_ERR] {symbol} src={src} err={e}")
         return None
 
 
@@ -469,7 +515,183 @@ def _playbook_adjust_risk(symbol: str, tf: str, side: str,
              "scale_step_mul": sc_step_mul, "scale_reduce_mul": sc_reduce_mul,
              "scale_legs_add": sc_legs_add, "scale_up_shift": up_shift, "scale_down_shift": down_shift,
 
-             "label": label, "eff_w": w}, st)
+            "label": label, "eff_w": w}, st)
+
+
+def _parse_brackets(spec: str, fallback_legs: int) -> list[float]:
+    """
+    spec: "N|w1,w2,...,wN" or "w1,w2,..." (N inferred).
+    Returns normalized weights (sum=1.0) length = N (or fallback_legs if parse fails).
+    """
+    try:
+        if "|" in spec:
+            left, right = spec.split("|", 1)
+            n = int(float(left.strip()))
+            ws = [float(x) for x in right.split(",") if x.strip()!=""]
+        else:
+            ws = [float(x) for x in spec.split(",") if x.strip()!=""]
+            n = len(ws)
+        if n <= 0: n = max(1, int(fallback_legs))
+        if len(ws) < n:  # pad tail equally
+            remain = n - len(ws); ws += [ws[-1] if ws else 1.0]*remain
+        ws = ws[:n]
+        s = sum(ws) or 1.0
+        return [max(0.0, w/s) for w in ws]
+    except Exception:
+        n = max(1, int(fallback_legs))
+        return [1.0/n]*n
+
+
+def _select_brackets_for(symbol: str, side: str, max_legs_eff: int) -> list[float]:
+    """
+    Pick a bracket shape by regime alignment; cap length to max_legs_eff.
+    """
+    st = CTX_STATE.get(symbol) or _compute_context(symbol)
+    spec = SCALE_BRACKETS_DEFAULT
+    try:
+        regime = (st.get("regime") if st else "RANGE") or "RANGE"
+        align = _pb_alignment(regime, (side or "").upper()) if '_pb_alignment' in globals() else 0
+        if regime == "RANGE":
+            spec = SCALE_BRACKETS_RANGE
+        elif align >= 0:
+            spec = SCALE_BRACKETS_ALIGN
+        else:
+            spec = SCALE_BRACKETS_CONTRA
+    except Exception:
+        pass
+    ws = _parse_brackets(spec, max_legs_eff)
+    if len(ws) > max_legs_eff:
+        ws = ws[:max_legs_eff]
+        s = sum(ws) or 1.0
+        ws = [w/s for w in ws]
+    return ws
+
+
+def _should_realloc(prev_ctx: dict|None, new_ctx: dict|None, last_ts: float|None, side: str) -> bool:
+    if not SCALE_REALLOCATE_BRACKETS:
+        return False
+    now = time.time()
+    if last_ts and now - last_ts < SCALE_REALLOC_COOLDOWN_SEC:
+        return False
+    if not (SCALE_REALLOC_ON_ALIGN_CHANGE or SCALE_REALLOC_ON_BIAS_STEP):
+        return False
+    try:
+        p = prev_ctx or {}
+        n = new_ctx or {}
+        if SCALE_REALLOC_ON_ALIGN_CHANGE:
+            def _al(ctx):
+                r = (ctx.get("regime") or "RANGE").upper()
+                s = (side or "").upper()
+                return _pb_alignment(r, s) if '_pb_alignment' in globals() else 0
+            if _al(p) != _al(n):
+                return True
+        if SCALE_REALLOC_ON_BIAS_STEP:
+            steps = [float(x) for x in str(SCALE_REALLOC_BIAS_STEPS).split(",") if x.strip()!=""]
+            pb = abs(float(p.get("ctx_bias", 0.0) if p else 0.0))
+            nb = abs(float(n.get("ctx_bias", 0.0) if n else 0.0))
+            crossed = any((pb < t <= nb) or (nb < t <= pb) for t in steps)
+            if crossed:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _plan_bracket_targets(total_notional: float, ws: list[float]) -> list[float]:
+    s = sum(ws) or 1.0
+    ws = [w/s for w in ws]
+    return [max(0.0, total_notional*w) for w in ws]
+
+
+# === Futures reallocation executors ===
+def _qty_from_notional(symbol: str, notional: float, price: float) -> float:
+    if price <= 0 or abs(notional) <= 0:
+        return 0.0
+    q = float(abs(notional) / price)
+    try:
+        if 'qty_round' in globals():
+            q = qty_round(symbol, q)
+    except Exception:
+        pass
+    return q
+
+
+async def _futures_exec_delta(symbol: str, tf: str, side: str, delta_usdt: float, ref_price: float, note: str):
+    """
+    Execute a delta on futures:
+      LONG:  +usdt => BUY add;  -usdt => SELL reduceOnly
+      SHORT: +usdt => SELL add; -usdt => BUY  reduceOnly
+    """
+    if not REALLOC_FUTURES_EXECUTE:
+        log(f"[REALLOC_SKIP] {symbol} {tf} side={side} Δ=${delta_usdt:.2f} (exec off)")
+        return False
+    if abs(delta_usdt) < max(1e-9, float(SCALE_REALLOC_MIN_USDT)):
+        log(f"[REALLOC_SKIP] {symbol} {tf} tiny Δ=${delta_usdt:.2f}")
+        return False
+    qty = _qty_from_notional(symbol, abs(delta_usdt), max(ref_price, 1e-9))
+    if REALLOC_MIN_QTY > 0 and qty < REALLOC_MIN_QTY:
+        log(f"[REALLOC_SKIP] {symbol} {tf} qty<{REALLOC_MIN_QTY} ({qty})")
+        return False
+    sideU = (side or "").upper()
+    is_reduce = (delta_usdt < 0)
+    if sideU == "LONG":
+        ord_side = "BUY" if not is_reduce else "SELL"
+    else:
+        ord_side = "SELL" if not is_reduce else "BUY"
+    reduce_only = bool(is_reduce)
+    ok = False; err = None
+    for _ in range(max(1, REALLOC_MAX_RETRIES)):
+        try:
+            if 'futures_market_order' in globals():
+                res = await futures_market_order(symbol, ord_side, qty, reduce_only=reduce_only, comment=f"REALLOC/{tf}/{note}")
+            elif 'futures_place_order' in globals():
+                res = await futures_place_order(symbol, ord_side, qty, order_type="market", reduce_only=reduce_only, comment=f"REALLOC/{tf}/{note}")
+            else:
+                if reduce_only and 'futures_close_symbol_tf' in globals():
+                    await futures_close_symbol_tf(symbol, tf, sideU, ref_price, reason=f"REALLOC-{note}")
+                    res = {"status": "closed"}
+                else:
+                    res = {"status": "logged"}
+            ok = True
+            try:
+                if CSV_SCALE_EVENTS:
+                    kind = "SCALE_REDUCE" if is_reduce else "SCALE_ADD"
+                    _csv_log_scale_event(symbol, tf, kind, sideU, qty, ref_price, note)
+            except Exception:
+                pass
+            log(f"[REALLOC_EXEC] {symbol} {tf} {ord_side} qty={qty} reduceOnly={reduce_only} note={note} res={res.get('status','ok') if isinstance(res,dict) else 'ok'}")
+            break
+        except Exception as e:
+            err = e
+            log(f"[REALLOC_ERR] {symbol} {tf} {e}")
+            try:
+                time.sleep(REALLOC_RETRY_SLEEP_SEC)
+            except Exception:
+                pass
+    return ok
+
+
+def append_line_csv(filename: str, line: str):
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open(os.path.join("logs", filename), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        log(f"[CSV_APPEND_ERR] {filename} {e}")
+
+
+def _csv_log_scale_event(symbol: str, tf: str, kind: str, side: str, qty: float, px: float, note: str):
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        line = f"{ts},{symbol},{tf},{kind},{side},{qty:.6f},{px:.4f},mode=futures,note={note}"
+        append_line_csv("futures_trades.csv", line)
+    except Exception as e:
+        log(f"[CSV_SCALE_ERR] {symbol} {tf} {e}")
+
+
+# small helper label for scale ops
+def _scale_note_label(i: int, delta: float) -> str:
+    return f"leg#{i}{'+' if delta>=0 else '-'}${abs(delta):.0f}"
 
 
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
@@ -3841,6 +4063,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         tf_base_cap = _margin_for_tf(tf)
         max_cap = tf_base_cap
         did_scale = False
+        base_notional = float((existing_paper or {}).get("plan_total_notional") or (FUT_POS.get(symbol, {}).get("plan_total_notional") if has_futures else 0.0) or (tf_base_cap * lev_used))
 
         side = "LONG" if exec_signal == "BUY" else "SHORT"
         try:
@@ -3867,6 +4090,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         except Exception as e:
             log(f"[PB_SCALE_ERR] {symbol} {tf} {e}")
             SCALE_MAX_LEGS_EFF = SCALE_MAX_LEGS
+        # === Bracket selection for this symbol/tf/side ===
+        try:
+            BRACKETS_WS = _select_brackets_for(symbol, side, max_legs_eff=SCALE_MAX_LEGS_EFF)
+        except Exception as e:
+            log(f"[BRKT_ERR] {symbol} {tf} {e}")
+            BRACKETS_WS = _parse_brackets(SCALE_BRACKETS_DEFAULT, SCALE_MAX_LEGS_EFF)
         log(f"[PB_CAP] {symbol} {tf} alloc_cap={_pb.get('alloc_abs_cap') if _pb else 0} lev_cap={_pb.get('lev_cap') if _pb else 0}")
         log(f"[PB_SCALE] {symbol} {tf} step×{_pb.get('scale_step_mul') if _pb else 1} reduce×{_pb.get('scale_reduce_mul') if _pb else 1} legs+{_pb.get('scale_legs_add') if _pb else 0} upΔ{_pb.get('scale_up_shift') if _pb else 0} downΔ{_pb.get('scale_down_shift') if _pb else 0}")
 
@@ -3890,8 +4119,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
         # SCALE-IN (same side + improving)
         if same_side and (cur_score - last_score) >= up_thr and legs < int(SCALE_MAX_LEGS_EFF):
-            add_base = tf_base_cap * step_pct
-            used_base = float((existing_paper or {}).get("used_base_margin") or 0.0)
+            pos_ref = existing_paper if has_paper else FUT_POS.get(symbol, {})
+            brk_idx = int(legs)
+            targets = _plan_bracket_targets(base_notional, BRACKETS_WS)
+            new_leg_notional = max(0.0, targets[brk_idx] - sum(l.get("notional",0.0) for l in pos_ref.get("legs", [])[:brk_idx+1]))
+            if new_leg_notional <= 0:
+                new_leg_notional = base_notional * step_pct  # safe fallback
+            add_base = new_leg_notional / max(lev_used, 1e-9)
+            used_base = float((pos_ref or {}).get("used_base_margin") or 0.0)
             add_base = max(0.0, min(add_base, max_cap - used_base))
             notional_add = add_base * lev_used
             if notional_add >= SCALE_MIN_ADD_NOTIONAL and add_base > 0.0:
@@ -3911,6 +4146,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                         "last_score": float(cur_score),
                         "last_update_ms": int(time.time()*1000),
                     })
+
+                    try:
+                        existing_paper.setdefault("legs", [])
+                        existing_paper["legs"].append({"notional": float(new_leg_notional), "price": last_price, "ts": time.time()})
+                    except Exception:
+                        pass
 
                     avg = float(existing_paper["entry_price"])
                     tp_pct = float(existing_paper.get("tp_pct", 0.0))
@@ -3949,19 +4190,44 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
                         await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
+                        try:
+                            if TRADE_MODE=='futures' and CSV_SCALE_EVENTS:
+                                kind = "SCALE_ADD"
+                                _csv_log_scale_event(symbol, tf, kind, side, float(add_qty if 'add_qty' in locals() else 0.0), float(last_price), "SCALE_ADD")
+                        except Exception:
+                            pass
+
             if did_scale and SCALE_LOG:
                 log(f"🔼 scale-in {symbol} {tf}: +{add_base:.2f} base (lev×{lev_used}) at {last_price:.2f} (Δscore={cur_score-last_score:.2f})")
 
         # SCALE-OUT (same side + weakening)
         elif same_side and (last_score - cur_score) >= dn_thr:
+            pos_ref = existing_paper if has_paper else FUT_POS.get(symbol, {})
+            current_notional = (float(existing_paper.get("qty") or 0.0) * float(last_price)) if has_paper else (fut_qty * float(last_price))
+            try:
+                targets = _plan_bracket_targets(base_notional, BRACKETS_WS)
+                legs = list(pos_ref.get("legs", []))
+                reduce_size = 0.0
+                for i in range(len(legs)-1, -1, -1):
+                    cur = float(legs[i].get("notional", 0.0))
+                    tgt = float(targets[i] if i < len(targets) else 0.0)
+                    excess = max(0.0, cur - tgt)
+                    if excess <= 0:
+                        continue
+                    take = min(excess, current_notional * red_pct - reduce_size)
+                    reduce_size += take
+                    if reduce_size >= current_notional * red_pct:
+                        break
+                if reduce_size <= 0:
+                    reduce_size = current_notional * red_pct
+            except Exception:
+                reduce_size = current_notional * red_pct
             if TRADE_MODE == "paper":
-                cur_qty = float(existing_paper.get("qty") or 0.0)
-                red_qty = cur_qty * red_pct
+                red_qty = reduce_size / float(last_price)
                 info = _paper_reduce(symbol, tf, red_qty, float(last_price)) if red_qty>0 else None
                 if info: did_scale = True
             else:
-                # reduceOnly partial close based on current futures qty
-                red_qty = fut_qty * red_pct
+                red_qty = reduce_size / float(last_price)
                 closed = await _fut_reduce(symbol, red_qty, "LONG" if exec_signal=="BUY" else "SHORT") if red_qty>0 else 0.0
                 if closed > 0:
                     did_scale = True
@@ -3974,8 +4240,66 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
                     await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
+                    try:
+                        if TRADE_MODE=='futures' and CSV_SCALE_EVENTS:
+                            kind = "SCALE_REDUCE"
+                            _csv_log_scale_event(symbol, tf, kind, side, float(closed if 'closed' in locals() else 0.0), float(last_price), "SCALE_REDUCE")
+                    except Exception:
+                        pass
+
+            try:
+                pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else None
+                if isinstance(pos, dict):
+                    need = float(reduce_size)
+                    legs = list(pos.get("legs", []))
+                    for i in range(len(legs)-1, -1, -1):
+                        take = min(need, float(legs[i].get("notional",0.0)))
+                        legs[i]["notional"] = max(0.0, float(legs[i].get("notional",0.0)) - take)
+                        need -= take
+                        if need <= 1e-9: break
+                    pos["legs"] = [l for l in legs if l.get("notional",0.0) > 0]
+            except Exception:
+                pass
+
             if did_scale and SCALE_LOG:
                 log(f"🔽 scale-out {symbol} {tf}: -{red_pct*100:.1f}% qty at {last_price:.2f} (Δscore={last_score-cur_score:.2f})")
+
+        # === Periodic rebalance across brackets (paper: execute; futures: log plan) ===
+        try:
+            pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+            if isinstance(pos, dict) and SCALE_REALLOCATE_BRACKETS:
+                prev_ctx = pos.get("last_ctx"); new_ctx = CTX_STATE.get(symbol) or _compute_context(symbol)
+                last_ts  = float(pos.get("last_realloc_ts") or 0.0)
+                if _should_realloc(prev_ctx, new_ctx, last_ts, side):
+                    base_total = float(pos.get("plan_total_notional") or base_notional)
+                    ws = BRACKETS_WS
+                    targets = _plan_bracket_targets(base_total, ws)
+                    legs = list(pos.get("legs", []))
+                    while len(legs) < len(targets):
+                        legs.append({"notional": 0.0, "price": last_price, "ts": time.time()})
+                    deltas = [float(targets[i]) - float(legs[i].get("notional",0.0)) for i in range(len(targets))]
+                    plan = [(i, d) for i,d in enumerate(deltas) if abs(d) >= SCALE_REALLOC_MIN_USDT]
+                    if plan:
+                        log(f"[BRKT_REALLOC] {symbol} {tf} side={side} plan={plan} targets={targets}")
+                        if TRADE_MODE=='paper':
+                            for i,d in plan:
+                                legs[i]["notional"] = max(0.0, legs[i].get("notional",0.0) + d)
+                                legs[i]["ts"] = time.time(); legs[i]["price"] = last_price
+                            pos["legs"] = [l for l in legs if l.get("notional",0.0) > 0]
+                        else:
+                            # Futures live execution: issue reduceOnly/add market orders per plan
+                            if REALLOC_FUTURES_EXECUTE:
+                                for i, d_usdt in plan:
+                                    note = f"BRKT_REALLOC:{_scale_note_label(i, d_usdt) if '_scale_note_label' in globals() else 'leg'+str(i)}"
+                                    await _futures_exec_delta(symbol, tf, side, float(d_usdt), float(last_price), note)
+                            else:
+                                log(f"[BRKT_REALLOC_SKIP] {symbol} {tf} exec=off plan={plan}")
+                        pos["last_ctx"] = new_ctx
+                        pos["last_realloc_ts"] = time.time()
+                    else:
+                        pos["last_ctx"] = new_ctx
+        except Exception as e:
+            log(f"[BRKT_REALLOC_ERR] {symbol} {tf} {e}")
 
         # update last_score memory
         try: EXEC_STATE[("last_score", symbol, tf)] = float(cur_score)
@@ -4072,7 +4396,18 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if PAPER_CSV_OPEN_LOG:
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
 
-    # [ANCHOR: POSITION_OPEN_HOOK]
+# [ANCHOR: POSITION_OPEN_HOOK]
+    # --- Bracket legs state on open ---
+    try:
+        pos_obj = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+        if isinstance(pos_obj, dict):
+            # persist legs array and last-realloc metadata
+            pos_obj.setdefault("legs", [])  # list of {"notional":..., "price":..., "ts":...}
+            pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(last_price)))
+            pos_obj.setdefault("last_ctx", CTX_STATE.get(symbol))
+            pos_obj.setdefault("last_realloc_ts", 0.0)
+    except Exception:
+        pass
     # initialize trailing baseline at entry (per (symbol, tf))
     try:
         k2 = (symbol, tf)
@@ -4168,7 +4503,29 @@ SCALE_DN_DELTA = _parse_pct_map2(cfg_get("SCALE_DOWN_SCORE_DELTA", "15m:0.6,1h:0
 SCALE_STEP_PCT = _parse_pct_map2(cfg_get("SCALE_STEP_PCT", "15m:0.25,1h:0.25,4h:0.25,1d:0.25"))
 SCALE_REDUCE_PCT = _parse_pct_map2(cfg_get("SCALE_REDUCE_PCT", "15m:0.20,1h:0.20,4h:0.20,1d:0.20"))
 SCALE_MIN_ADD_NOTIONAL = float(cfg_get("SCALE_MIN_ADD_NOTIONAL_USDT", "15"))
-SCALE_REALLOCATE_BRACKETS = (cfg_get("SCALE_REALLOCATE_BRACKETS", "1") == "1")  # re-arm TP/SL/Trail after scaling
+# ==== Rebalancing Brackets (regime-aware scaling allocation) ====
+# Enable fine-grained bracket reallocation (supersedes old boolean if set)
+SCALE_REALLOCATE_BRACKETS = (cfg_get("SCALE_REALLOCATE_BRACKETS", "1") == "1")
+# Bracket specs: "legs|w1,w2,w3" (weights sum doesn't need to be 1; we normalize)
+SCALE_BRACKETS_DEFAULT = cfg_get("SCALE_BRACKETS_DEFAULT", "3|0.50,0.30,0.20")
+SCALE_BRACKETS_ALIGN   = cfg_get("SCALE_BRACKETS_ALIGN",   "4|0.45,0.25,0.20,0.10")
+SCALE_BRACKETS_CONTRA  = cfg_get("SCALE_BRACKETS_CONTRA",  "2|0.60,0.40")
+SCALE_BRACKETS_RANGE   = cfg_get("SCALE_BRACKETS_RANGE",   "3|0.40,0.35,0.25")
+# Reallocation triggers (any true → consider rebalance)
+SCALE_REALLOC_ON_ALIGN_CHANGE = (cfg_get("SCALE_REALLOC_ON_ALIGN_CHANGE", "1") == "1")
+SCALE_REALLOC_ON_BIAS_STEP    = (cfg_get("SCALE_REALLOC_ON_BIAS_STEP",    "1") == "1")
+SCALE_REALLOC_BIAS_STEPS      = cfg_get("SCALE_REALLOC_BIAS_STEPS",       "0.33,0.66")
+# Cooldown to avoid thrashing
+SCALE_REALLOC_COOLDOWN_SEC    = int(float(cfg_get("SCALE_REALLOC_COOLDOWN_SEC", "600")))
+# Minimum per-bracket notional (USDT) to actually rebalance; below → skip/noise
+SCALE_REALLOC_MIN_USDT        = float(cfg_get("SCALE_REALLOC_MIN_USDT", "10"))
+# ==== Futures Rebalance Execution (reduceOnly / market) ====
+REALLOC_FUTURES_EXECUTE   = (cfg_get("REALLOC_FUTURES_EXECUTE", "1") == "1")
+REALLOC_ORDER_TYPE        = cfg_get("REALLOC_ORDER_TYPE", "market").lower()   # market only (default)
+REALLOC_MIN_QTY           = float(cfg_get("REALLOC_MIN_QTY", "0"))            # 0 = off
+REALLOC_MAX_RETRIES       = int(float(cfg_get("REALLOC_MAX_RETRIES", "2")))
+REALLOC_RETRY_SLEEP_SEC   = float(cfg_get("REALLOC_RETRY_SLEEP_SEC", "0.5"))
+CSV_SCALE_EVENTS          = (cfg_get("CSV_SCALE_EVENTS", "1") == "1")
 SCALE_LOG = (cfg_get("SCALE_LOG", "1") == "1")
 # [ANCHOR: SCALE_CFG_END]
 
@@ -6072,6 +6429,16 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
 
 
         # [ANCHOR: POSITION_OPEN_HOOK]
+        # --- Bracket legs state on open ---
+        try:
+            pos_obj = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+            if isinstance(pos_obj, dict):
+                pos_obj.setdefault("legs", [])
+                pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(last)))
+                pos_obj.setdefault("last_ctx", CTX_STATE.get(symbol))
+                pos_obj.setdefault("last_realloc_ts", 0.0)
+        except Exception:
+            pass
         # initialize trailing baseline at entry (per (symbol, tf))
         try:
             k2 = (symbol, tf)
@@ -8046,7 +8413,18 @@ async def on_message(message):
             lines.append(f"• SCALE_STEP_PCT: {cfg_get('SCALE_STEP_PCT')}")
             lines.append(f"• SCALE_REDUCE_PCT: {cfg_get('SCALE_REDUCE_PCT')}")
             lines.append(f"• SCALE_MIN_ADD_NOTIONAL_USDT: {cfg_get('SCALE_MIN_ADD_NOTIONAL_USDT')}")
-            lines.append(f"• SCALE_REALLOCATE_BRACKETS: {cfg_get('SCALE_REALLOCATE_BRACKETS')}")
+            lines.append(f"• SCALE_REALLOCATE_BRACKETS: {int(SCALE_REALLOCATE_BRACKETS)}")
+            lines.append(f"• SCALE_BRACKETS_DEFAULT: {SCALE_BRACKETS_DEFAULT}")
+            lines.append(f"• SCALE_BRACKETS_ALIGN / CONTRA / RANGE: {SCALE_BRACKETS_ALIGN} / {SCALE_BRACKETS_CONTRA} / {SCALE_BRACKETS_RANGE}")
+            lines.append(f"• SCALE_REALLOC_ON_ALIGN_CHANGE: {int(SCALE_REALLOC_ON_ALIGN_CHANGE)}")
+            lines.append(f"• SCALE_REALLOC_ON_BIAS_STEP: {int(SCALE_REALLOC_ON_BIAS_STEP)}  (steps={SCALE_REALLOC_BIAS_STEPS})")
+            lines.append(f"• SCALE_REALLOC_COOLDOWN_SEC: {SCALE_REALLOC_COOLDOWN_SEC}")
+            lines.append(f"• SCALE_REALLOC_MIN_USDT: {SCALE_REALLOC_MIN_USDT}")
+            lines.append(f"• REALLOC_FUTURES_EXECUTE: {int(REALLOC_FUTURES_EXECUTE)}")
+            lines.append(f"• REALLOC_MIN_QTY: {REALLOC_MIN_QTY}")
+            lines.append(f"• REALLOC_MAX_RETRIES: {REALLOC_MAX_RETRIES}")
+            lines.append(f"• REALLOC_RETRY_SLEEP_SEC: {REALLOC_RETRY_SLEEP_SEC}")
+            lines.append(f"• CSV_SCALE_EVENTS: {int(CSV_SCALE_EVENTS)}")
             lines.append(f"• SLIPPAGE_BY_SYMBOL: {cfg_get('SLIPPAGE_BY_SYMBOL')}")
             lines.append(f"• TP_PCT_BY_SYMBOL: {cfg_get('TP_PCT_BY_SYMBOL')}")
             lines.append(f"• SL_PCT_BY_SYMBOL: {cfg_get('SL_PCT_BY_SYMBOL')}")
