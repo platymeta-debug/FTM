@@ -557,6 +557,99 @@ def _plan_bracket_targets(total_notional: float, ws: list[float]) -> list[float]
     return [max(0.0, total_notional*w) for w in ws]
 
 
+
+# === Futures reallocation executors ===
+def _qty_from_notional(symbol: str, notional: float, price: float) -> float:
+    if price <= 0 or abs(notional) <= 0:
+        return 0.0
+    q = float(abs(notional) / price)
+    try:
+        if 'qty_round' in globals():
+            q = qty_round(symbol, q)
+    except Exception:
+        pass
+    return q
+
+
+async def _futures_exec_delta(symbol: str, tf: str, side: str, delta_usdt: float, ref_price: float, note: str):
+    """
+    Execute a delta on futures:
+      LONG:  +usdt => BUY add;  -usdt => SELL reduceOnly
+      SHORT: +usdt => SELL add; -usdt => BUY  reduceOnly
+    """
+    if not REALLOC_FUTURES_EXECUTE:
+        log(f"[REALLOC_SKIP] {symbol} {tf} side={side} Δ=${delta_usdt:.2f} (exec off)")
+        return False
+    if abs(delta_usdt) < max(1e-9, float(SCALE_REALLOC_MIN_USDT)):
+        log(f"[REALLOC_SKIP] {symbol} {tf} tiny Δ=${delta_usdt:.2f}")
+        return False
+    qty = _qty_from_notional(symbol, abs(delta_usdt), max(ref_price, 1e-9))
+    if REALLOC_MIN_QTY > 0 and qty < REALLOC_MIN_QTY:
+        log(f"[REALLOC_SKIP] {symbol} {tf} qty<{REALLOC_MIN_QTY} ({qty})")
+        return False
+    sideU = (side or "").upper()
+    is_reduce = (delta_usdt < 0)
+    if sideU == "LONG":
+        ord_side = "BUY" if not is_reduce else "SELL"
+    else:
+        ord_side = "SELL" if not is_reduce else "BUY"
+    reduce_only = bool(is_reduce)
+    ok = False; err = None
+    for _ in range(max(1, REALLOC_MAX_RETRIES)):
+        try:
+            if 'futures_market_order' in globals():
+                res = await futures_market_order(symbol, ord_side, qty, reduce_only=reduce_only, comment=f"REALLOC/{tf}/{note}")
+            elif 'futures_place_order' in globals():
+                res = await futures_place_order(symbol, ord_side, qty, order_type="market", reduce_only=reduce_only, comment=f"REALLOC/{tf}/{note}")
+            else:
+                if reduce_only and 'futures_close_symbol_tf' in globals():
+                    await futures_close_symbol_tf(symbol, tf, sideU, ref_price, reason=f"REALLOC-{note}")
+                    res = {"status": "closed"}
+                else:
+                    res = {"status": "logged"}
+            ok = True
+            try:
+                if CSV_SCALE_EVENTS:
+                    kind = "SCALE_REDUCE" if is_reduce else "SCALE_ADD"
+                    _csv_log_scale_event(symbol, tf, kind, sideU, qty, ref_price, note)
+            except Exception:
+                pass
+            log(f"[REALLOC_EXEC] {symbol} {tf} {ord_side} qty={qty} reduceOnly={reduce_only} note={note} res={res.get('status','ok') if isinstance(res,dict) else 'ok'}")
+            break
+        except Exception as e:
+            err = e
+            log(f"[REALLOC_ERR] {symbol} {tf} {e}")
+            try:
+                time.sleep(REALLOC_RETRY_SLEEP_SEC)
+            except Exception:
+                pass
+    return ok
+
+
+def append_line_csv(filename: str, line: str):
+    try:
+        os.makedirs("logs", exist_ok=True)
+        with open(os.path.join("logs", filename), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception as e:
+        log(f"[CSV_APPEND_ERR] {filename} {e}")
+
+
+def _csv_log_scale_event(symbol: str, tf: str, kind: str, side: str, qty: float, px: float, note: str):
+    try:
+        ts = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        line = f"{ts},{symbol},{tf},{kind},{side},{qty:.6f},{px:.4f},mode=futures,note={note}"
+        append_line_csv("futures_trades.csv", line)
+    except Exception as e:
+        log(f"[CSV_SCALE_ERR] {symbol} {tf} {e}")
+
+
+# small helper label for scale ops
+def _scale_note_label(i: int, delta: float) -> str:
+    return f"leg#{i}{'+' if delta>=0 else '-'}${abs(delta):.0f}"
+
+
+
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
 def _fetch_recent_bar_1m(symbol: str):
     """
@@ -4053,6 +4146,13 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
                         await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
+                        try:
+                            if TRADE_MODE=='futures' and CSV_SCALE_EVENTS:
+                                kind = "SCALE_ADD"
+                                _csv_log_scale_event(symbol, tf, kind, side, float(add_qty if 'add_qty' in locals() else 0.0), float(last_price), "SCALE_ADD")
+                        except Exception:
+                            pass
+
             if did_scale and SCALE_LOG:
                 log(f"🔼 scale-in {symbol} {tf}: +{add_base:.2f} base (lev×{lev_used}) at {last_price:.2f} (Δscore={cur_score-last_score:.2f})")
 
@@ -4096,6 +4196,15 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
                     await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
+
+                    try:
+                        if TRADE_MODE=='futures' and CSV_SCALE_EVENTS:
+                            kind = "SCALE_REDUCE"
+                            _csv_log_scale_event(symbol, tf, kind, side, float(closed if 'closed' in locals() else 0.0), float(last_price), "SCALE_REDUCE")
+                    except Exception:
+                        pass
+
+
             try:
                 pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else None
                 if isinstance(pos, dict):
@@ -4136,7 +4245,15 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                                 legs[i]["ts"] = time.time(); legs[i]["price"] = last_price
                             pos["legs"] = [l for l in legs if l.get("notional",0.0) > 0]
                         else:
-                            pass
+
+                            # Futures live execution: issue reduceOnly/add market orders per plan
+                            if REALLOC_FUTURES_EXECUTE:
+                                for i, d_usdt in plan:
+                                    note = f"BRKT_REALLOC:{_scale_note_label(i, d_usdt) if '_scale_note_label' in globals() else 'leg'+str(i)}"
+                                    await _futures_exec_delta(symbol, tf, side, float(d_usdt), float(last_price), note)
+                            else:
+                                log(f"[BRKT_REALLOC_SKIP] {symbol} {tf} exec=off plan={plan}")
+
                         pos["last_ctx"] = new_ctx
                         pos["last_realloc_ts"] = time.time()
                     else:
@@ -4362,6 +4479,13 @@ SCALE_REALLOC_BIAS_STEPS      = cfg_get("SCALE_REALLOC_BIAS_STEPS",       "0.33,
 SCALE_REALLOC_COOLDOWN_SEC    = int(float(cfg_get("SCALE_REALLOC_COOLDOWN_SEC", "600")))
 # Minimum per-bracket notional (USDT) to actually rebalance; below → skip/noise
 SCALE_REALLOC_MIN_USDT        = float(cfg_get("SCALE_REALLOC_MIN_USDT", "10"))
+# ==== Futures Rebalance Execution (reduceOnly / market) ====
+REALLOC_FUTURES_EXECUTE   = (cfg_get("REALLOC_FUTURES_EXECUTE", "1") == "1")
+REALLOC_ORDER_TYPE        = cfg_get("REALLOC_ORDER_TYPE", "market").lower()   # market only (default)
+REALLOC_MIN_QTY           = float(cfg_get("REALLOC_MIN_QTY", "0"))            # 0 = off
+REALLOC_MAX_RETRIES       = int(float(cfg_get("REALLOC_MAX_RETRIES", "2")))
+REALLOC_RETRY_SLEEP_SEC   = float(cfg_get("REALLOC_RETRY_SLEEP_SEC", "0.5"))
+CSV_SCALE_EVENTS          = (cfg_get("CSV_SCALE_EVENTS", "1") == "1")
 SCALE_LOG = (cfg_get("SCALE_LOG", "1") == "1")
 # [ANCHOR: SCALE_CFG_END]
 
@@ -8256,6 +8380,11 @@ async def on_message(message):
             lines.append(f"• SCALE_REALLOC_ON_BIAS_STEP: {int(SCALE_REALLOC_ON_BIAS_STEP)}  (steps={SCALE_REALLOC_BIAS_STEPS})")
             lines.append(f"• SCALE_REALLOC_COOLDOWN_SEC: {SCALE_REALLOC_COOLDOWN_SEC}")
             lines.append(f"• SCALE_REALLOC_MIN_USDT: {SCALE_REALLOC_MIN_USDT}")
+            lines.append(f"• REALLOC_FUTURES_EXECUTE: {int(REALLOC_FUTURES_EXECUTE)}")
+            lines.append(f"• REALLOC_MIN_QTY: {REALLOC_MIN_QTY}")
+            lines.append(f"• REALLOC_MAX_RETRIES: {REALLOC_MAX_RETRIES}")
+            lines.append(f"• REALLOC_RETRY_SLEEP_SEC: {REALLOC_RETRY_SLEEP_SEC}")
+            lines.append(f"• CSV_SCALE_EVENTS: {int(CSV_SCALE_EVENTS)}")
             lines.append(f"• SLIPPAGE_BY_SYMBOL: {cfg_get('SLIPPAGE_BY_SYMBOL')}")
             lines.append(f"• TP_PCT_BY_SYMBOL: {cfg_get('TP_PCT_BY_SYMBOL')}")
             lines.append(f"• SL_PCT_BY_SYMBOL: {cfg_get('SL_PCT_BY_SYMBOL')}")
