@@ -123,12 +123,13 @@ RISK_INTERPRET_MODE = cfg_get("RISK_INTERPRET_MODE", "MARGIN_RETURN").upper()
 APPLY_LEV_TO_TRAIL  = (cfg_get("APPLY_LEV_TO_TRAIL", "1") == "1")
 
 # === Unified exit evaluation config (applies to ALL TFs) ===
-# Exit resolution is always evaluated on 1m bars for consistency
+
 EXIT_RESOLUTION = cfg_get("EXIT_RESOLUTION", "1m").lower()  # must be "1m"
-EXIT_EVAL_MODE = cfg_get("EXIT_EVAL_MODE", "TOUCH").upper()  # TOUCH | CLOSE (on 1m)
-# Which price feed to read before clamping. We will NOT allow raw "mark" to trigger exits.
+EXIT_EVAL_MODE  = cfg_get("EXIT_EVAL_MODE", "TOUCH").upper()  # TOUCH | CLOSE (on 1m)
+# Which price feed to read before clamping. 'mark' is not allowed to trigger directly (we clamp anyway).
 EXIT_PRICE_SOURCE = cfg_get("EXIT_PRICE_SOURCE", "last").lower()  # last | index | mark(→forced last)
-# 1m outlier spike guard (fraction, e.g., 0.03=3% vs previous 1m close); set 0 to disable
+# 1m outlier spike guard (fraction, e.g., 0.03=3% vs 1m open/close); 0 disables
+
 OUTLIER_MAX_1M = float(cfg_get("OUTLIER_MAX_1M", "0.03"))
 
 # Global last price cache
@@ -143,11 +144,13 @@ def get_last_price(symbol: str, default_price: float = 0.0) -> float:
     except Exception:
         return float(default_price)
 
-# === Exit resolution helpers (1m bar fetch + sanitize) ===
+
+# === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
 def _fetch_recent_bar_1m(symbol: str):
     """
     Return dict {open, high, low, close} for the latest 1m bar.
-    Reuse existing OHLCV cache/fetchers if available.
+    Reuse existing OHLCV cache/fetchers if available; safe fallback to last price.
+
     """
     try:
         # Try common helpers first
@@ -166,34 +169,37 @@ def _fetch_recent_bar_1m(symbol: str):
     lp = get_last_price(symbol, 0.0)
     return {"open": lp, "high": lp, "low": lp, "close": lp}
 
-def _raw_exit_price(symbol: str, last: float|None = None) -> float:
-    # honor EXIT_PRICE_SOURCE, but never let 'mark' directly drive exits
+
+def _raw_exit_price(symbol: str, last_hint: float|None = None) -> float:
+    # honor EXIT_PRICE_SOURCE, but never let 'mark' directly drive exits (we'll clamp anyway)
     try:
         src = EXIT_PRICE_SOURCE
-        if src == "mark":
-            src = "last"  # forbid raw mark; we will clamp below
+
         if src == "index" and 'get_index_price' in globals():
             return float(get_index_price(symbol))
     except Exception:
         pass
-    return float(last if last is not None else get_last_price(symbol, 0.0))
 
-def _sanitize_exit_price(symbol: str, approx_last: float|None = None):
+    # 'mark' → force to last (will be clamped to current 1m H/L)
+    return float(last_hint if last_hint is not None else get_last_price(symbol, 0.0))
+
+def _sanitize_exit_price(symbol: str, last_hint: float|None = None):
     """
-    Returns (clamped, bar) where bar is dict(open,high,low,close) of the current 1m bar.
-    We clamp price to [low, high] to avoid unseen spikes, then apply an outlier guard vs prev close/open.
+    Returns (clamped, bar), where bar is dict(open,high,low,close) of the *current* 1m bar.
+    We clamp price to [low, high] to avoid unseen spikes.
     """
     bar = _fetch_recent_bar_1m(symbol)
-    last_raw = _raw_exit_price(symbol, approx_last)
-    # Clamp to current 1m bar range
+    last_raw = _raw_exit_price(symbol, last_hint)
+
     hi, lo = float(bar["high"]), float(bar["low"])
     clamped = max(min(float(last_raw), hi), lo)
     return clamped, bar
 
 def _outlier_guard(clamped: float, bar: dict) -> bool:
     """
-    Return True if the price move should be considered an outlier that we must ignore for this minute.
-    We compare to current 1m bar open (proxy for prev close in streaming).
+
+    True → skip this minute as outlier (|Δ| > OUTLIER_MAX_1M vs 1m open/close).
+
     """
     try:
         if OUTLIER_MAX_1M <= 0:
@@ -3699,11 +3705,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     # initialize trailing baseline at entry (per (symbol, tf))
     try:
         k2 = (symbol, tf)
-        if side.upper() == "LONG":
-            highest_price[k2] = float(last_price)
+        entry_price = float(last_price)
+        if str(side).upper() == "LONG":
+            highest_price[k2] = entry_price
             lowest_price.pop(k2, None)
         else:
-            lowest_price[k2] = float(last_price)
+            lowest_price[k2] = entry_price
             highest_price.pop(k2, None)
     except Exception:
         pass
@@ -5515,11 +5522,12 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         # initialize trailing baseline at entry (per (symbol, tf))
         try:
             k2 = (symbol, tf)
-            if side.upper() == 'LONG':
-                highest_price[k2] = float(last)
+            entry_price = float(last)
+            if str(side).upper() == 'LONG':
+                highest_price[k2] = entry_price
                 lowest_price.pop(k2, None)
             else:
-                lowest_price[k2] = float(last)
+                lowest_price[k2] = entry_price
                 highest_price.pop(k2, None)
         except Exception:
             pass
@@ -5747,8 +5755,12 @@ def _eval_exit(symbol: str, tf: str, side: str,
                tp_price: float|None, sl_price: float|None,
                tr_pct: float|None, key2: tuple):
     """
-    Returns (should_exit: bool, reason: str, trigger_price: float, dbg: str)
-    Uses 1m bar and EXIT_EVAL_MODE (TOUCH | CLOSE). Price is sanitized/clamped.
+
+    Returns: (should_exit: bool, reason: str, trigger_price: float, dbg: str)
+    - Uses 1m bar and EXIT_EVAL_MODE (TOUCH | CLOSE)
+    - Price is sanitized/clamped; outlier-guarded
+    - Trailing uses _compute_trail() (armed + base guard)
+
     """
     clamped, bar = _sanitize_exit_price(symbol, last_price_hint)
     if _outlier_guard(clamped, bar):
@@ -5774,15 +5786,20 @@ def _eval_exit(symbol: str, tf: str, side: str,
         if tp_price: tp_hit = lo <= float(tp_price)
         if sl_price: sl_hit = hi >= float(sl_price)
         if trail_px and armed: tr_hit = hi >= float(trail_px)
+
+    # conflict resolution: SL > TRAIL > TP (more conservative first)
     reason = None
-    if tr_hit: reason = "TRAIL"
+    if   sl_hit: reason = "SL"
+    elif tr_hit: reason = "TRAIL"
     elif tp_hit: reason = "TP"
-    elif sl_hit: reason = "SL"
+
     dbg = (f"1m ohlc=({bar['open']:.6f},{bar['high']:.6f},{bar['low']:.6f},{bar['close']:.6f}) "
            f"p={p:.6f} clamp={clamped:.6f} armed={armed} base={base} "
            f"tp={tp_price} sl={sl_price} tr={tr_pct} trail_px={trail_px}")
     if reason:
-        trig = (float(trail_px) if reason=="TRAIL" else (float(tp_price) if reason=="TP" else float(sl_price)))
+
+        trig = (float(sl_price) if reason=="SL" else (float(trail_px) if reason=="TRAIL" else float(tp_price)))
+
         return (True, reason, trig, dbg)
     return (False, "NONE", p, dbg)
 
@@ -6646,32 +6663,27 @@ async def on_ready():
                 highest_price[key2] = max(float(highest_price.get(key2, 0.0)), float(_bar1m["high"]))
                 lowest_price[key2]  = min(float(lowest_price.get(key2, 1e30)), float(_bar1m["low"]))
 
-                # Unified exit evaluation (TP/SL/Trail) using 1m resolution
-                if (str(previous).startswith('BUY') or str(previous).startswith('SELL')) and entry_data.get(key2):
-                    entry_price, entry_time = entry_data.get(key2)
-                    side = 'LONG' if previous == 'BUY' else 'SHORT'
-                    tp_pct = _req_tp_pct(symbol_eth, tf, (take_profit_pct or {}))
-                    sl_pct = _req_sl_pct(symbol_eth, tf, (HARD_STOP_PCT or {}))
-                    tr_pct = _req_trail_pct(symbol_eth, tf, (trailing_stop_pct or {}))
-                    lev = _req_leverage(symbol_eth, tf)
-                    eff_tp_pct, eff_sl_pct, eff_tr_pct, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev)
-                    if side == 'LONG':
-                        tp_price = (entry_price*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                        sl_price = (entry_price*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-                    else:
-                        tp_price = (entry_price*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                        sl_price = (entry_price*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-                    tr_pct_eff = eff_tr_pct
+
+                # === Unified exit evaluation on 1m (ALL TFs) ===
+                last_price = float(display_price if 'display_price' in locals() else live_price)
+                try: set_last_price(symbol_eth, last_price)
+                except Exception: pass
+                pos = PAPER_POS.get(f"{symbol_eth}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol_eth)
+                if pos:
+                    side = str(pos.get("side","" )).upper()
+                    entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                    tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
+                    tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
                     ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2)
                     log(f"[EXIT_CHECK] {symbol_eth} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
                     if ok_exit:
-                        exit_reason = 'TRAIL' if reason=='TRAIL' else ('TP' if reason=='TP' else 'SL')
-                        if TRADE_MODE == 'paper':
-                            info = _paper_close(symbol_eth, tf, trig_px, exit_reason)
+                        exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
+                        if TRADE_MODE=='paper':
+                            info = _paper_close(symbol_eth, tf, float(trig_px), exit_reason)
                             if info:
-                                await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=trig_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'))
-                        elif TRADE_MODE == 'futures':
-                            await futures_close_all(symbol_eth, tf, exit_price=trig_px, reason=exit_reason)
+                                await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'))
+                        else:
+                            await futures_close_all(symbol_eth, tf, exit_price=float(trig_px), reason=exit_reason)
                         continue
 
 
@@ -7002,36 +7014,27 @@ async def on_ready():
                 previous = previous_signal.get(key2)
 
 
-                # Unified exit evaluation (TP/SL/Trail) using 1m resolution
-                if previous in ['BUY', 'SELL']:
-                    _ep = entry_data.get(key2) or (None, None)
-                    entry_price = _ep[0]
-                    entry_time  = _ep[1]
-                    if entry_price is None:
-                        continue
-                    side = 'LONG' if previous == 'BUY' else 'SHORT'
-                    tp_pct = _req_tp_pct(symbol_btc, tf, (take_profit_pct or {}))
-                    sl_pct = _req_sl_pct(symbol_btc, tf, (HARD_STOP_PCT or {}))
-                    tr_pct = _req_trail_pct(symbol_btc, tf, (trailing_stop_pct or {}))
-                    lev = _req_leverage(symbol_btc, tf)
-                    eff_tp_pct, eff_sl_pct, eff_tr_pct, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev)
-                    if side == 'LONG':
-                        tp_price = (entry_price*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                        sl_price = (entry_price*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-                    else:
-                        tp_price = (entry_price*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                        sl_price = (entry_price*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-                    tr_pct_eff = eff_tr_pct
+
+                # === Unified exit evaluation on 1m (ALL TFs) ===
+                last_price = float(display_price if 'display_price' in locals() else live_price)
+                try: set_last_price(symbol_btc, last_price)
+                except Exception: pass
+                pos = PAPER_POS.get(f"{symbol_btc}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol_btc)
+                if pos:
+                    side = str(pos.get("side","" )).upper()
+                    entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                    tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
+                    tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
                     ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2)
                     log(f"[EXIT_CHECK] {symbol_btc} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
                     if ok_exit:
-                        exit_reason = 'TRAIL' if reason=='TRAIL' else ('TP' if reason=='TP' else 'SL')
-                        if TRADE_MODE == 'paper':
-                            info = _paper_close(symbol_btc, tf, trig_px, exit_reason)
+                        exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
+                        if TRADE_MODE=='paper':
+                            info = _paper_close(symbol_btc, tf, float(trig_px), exit_reason)
                             if info:
-                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=trig_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'))
-                        elif TRADE_MODE == 'futures':
-                            await futures_close_all(symbol_btc, tf, exit_price=trig_px, reason=exit_reason)
+                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'))
+                        else:
+                            await futures_close_all(symbol_btc, tf, exit_price=float(trig_px), reason=exit_reason)
                         continue
 
 
