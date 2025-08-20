@@ -123,11 +123,13 @@ RISK_INTERPRET_MODE = cfg_get("RISK_INTERPRET_MODE", "MARGIN_RETURN").upper()
 APPLY_LEV_TO_TRAIL  = (cfg_get("APPLY_LEV_TO_TRAIL", "1") == "1")
 
 # === Unified exit evaluation config (applies to ALL TFs) ===
+
 EXIT_RESOLUTION = cfg_get("EXIT_RESOLUTION", "1m").lower()  # must be "1m"
 EXIT_EVAL_MODE  = cfg_get("EXIT_EVAL_MODE", "TOUCH").upper()  # TOUCH | CLOSE (on 1m)
 # Which price feed to read before clamping. 'mark' is not allowed to trigger directly (we clamp anyway).
 EXIT_PRICE_SOURCE = cfg_get("EXIT_PRICE_SOURCE", "last").lower()  # last | index | mark(→forced last)
 # 1m outlier spike guard (fraction, e.g., 0.03=3% vs 1m open/close); 0 disables
+
 OUTLIER_MAX_1M = float(cfg_get("OUTLIER_MAX_1M", "0.03"))
 
 # Global last price cache
@@ -354,6 +356,74 @@ def _adjust_score_with_ctx(symbol: str, tf: str, base_score: float) -> tuple[flo
     ctx = float(st.get("ctx_bias", 0.0))
     adj = base_score * (1 + CTX_ALPHA*ctx*sgn) - CTX_BETA*max(0.0, -ctx*sgn)
     return (adj, st)
+
+
+# === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
+def _fetch_recent_bar_1m(symbol: str):
+    """
+    Return dict {open, high, low, close} for the latest 1m bar.
+    Reuse existing OHLCV cache/fetchers if available; safe fallback to last price.
+
+    """
+    try:
+        # Try common helpers first
+        if 'get_ohlcv' in globals():
+            ohlc = get_ohlcv(symbol, "1m", limit=1)[-1]
+            return {"open": float(ohlc[1]), "high": float(ohlc[2]), "low": float(ohlc[3]), "close": float(ohlc[4])}
+        if 'fetch_ohlcv' in globals():
+            ohlc = fetch_ohlcv(symbol, "1m", limit=1)[-1]
+            return {"open": float(ohlc[1]), "high": float(ohlc[2]), "low": float(ohlc[3]), "close": float(ohlc[4])}
+        if 'get_recent_ohlc' in globals():
+            b = get_recent_ohlc(symbol, "1m")
+            return {"open": float(b["open"]), "high": float(b["high"]), "low": float(b["low"]), "close": float(b["close"]) }
+    except Exception:
+        pass
+    # Fallback: use last price cache to emulate a flat bar
+    lp = get_last_price(symbol, 0.0)
+    return {"open": lp, "high": lp, "low": lp, "close": lp}
+
+
+def _raw_exit_price(symbol: str, last_hint: float|None = None) -> float:
+    # honor EXIT_PRICE_SOURCE, but never let 'mark' directly drive exits (we'll clamp anyway)
+    try:
+        src = EXIT_PRICE_SOURCE
+
+        if src == "index" and 'get_index_price' in globals():
+            return float(get_index_price(symbol))
+    except Exception:
+        pass
+
+    # 'mark' → force to last (will be clamped to current 1m H/L)
+    return float(last_hint if last_hint is not None else get_last_price(symbol, 0.0))
+
+def _sanitize_exit_price(symbol: str, last_hint: float|None = None):
+    """
+    Returns (clamped, bar), where bar is dict(open,high,low,close) of the *current* 1m bar.
+    We clamp price to [low, high] to avoid unseen spikes.
+    """
+    bar = _fetch_recent_bar_1m(symbol)
+    last_raw = _raw_exit_price(symbol, last_hint)
+
+    hi, lo = float(bar["high"]), float(bar["low"])
+    clamped = max(min(float(last_raw), hi), lo)
+    return clamped, bar
+
+def _outlier_guard(clamped: float, bar: dict) -> bool:
+    """
+
+    True → skip this minute as outlier (|Δ| > OUTLIER_MAX_1M vs 1m open/close).
+
+    """
+    try:
+        if OUTLIER_MAX_1M <= 0:
+            return False
+        ref = float(bar.get("open") or bar.get("close") or clamped)
+        if ref <= 0:
+            return False
+        delta = abs(clamped - ref) / ref
+        return delta > OUTLIER_MAX_1M
+    except Exception:
+        return False
 
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
@@ -5934,10 +6004,12 @@ def _eval_exit(symbol: str, tf: str, side: str,
                tp_price: float|None, sl_price: float|None,
                tr_pct: float|None, key2: tuple):
     """
+
     Returns: (should_exit: bool, reason: str, trigger_price: float, dbg: str)
     - Uses 1m bar and EXIT_EVAL_MODE (TOUCH | CLOSE)
     - Price is sanitized/clamped; outlier-guarded
     - Trailing uses _compute_trail() (armed + base guard)
+
     """
     clamped, bar = _sanitize_exit_price(symbol, last_price_hint)
     if _outlier_guard(clamped, bar):
@@ -5963,16 +6035,20 @@ def _eval_exit(symbol: str, tf: str, side: str,
         if tp_price: tp_hit = lo <= float(tp_price)
         if sl_price: sl_hit = hi >= float(sl_price)
         if trail_px and armed: tr_hit = hi >= float(trail_px)
+
     # conflict resolution: SL > TRAIL > TP (more conservative first)
     reason = None
     if   sl_hit: reason = "SL"
     elif tr_hit: reason = "TRAIL"
     elif tp_hit: reason = "TP"
+
     dbg = (f"1m ohlc=({bar['open']:.6f},{bar['high']:.6f},{bar['low']:.6f},{bar['close']:.6f}) "
            f"p={p:.6f} clamp={clamped:.6f} armed={armed} base={base} "
            f"tp={tp_price} sl={sl_price} tr={tr_pct} trail_px={trail_px}")
     if reason:
+
         trig = (float(sl_price) if reason=="SL" else (float(trail_px) if reason=="TRAIL" else float(tp_price)))
+
         return (True, reason, trig, dbg)
     return (False, "NONE", p, dbg)
 
@@ -6856,6 +6932,7 @@ async def on_ready():
                 highest_price[key2] = max(float(highest_price.get(key2, 0.0)), float(_bar1m["high"]))
                 lowest_price[key2]  = min(float(lowest_price.get(key2, 1e30)), float(_bar1m["low"]))
 
+
                 # === Unified exit evaluation on 1m (ALL TFs) ===
                 last_price = float(display_price if 'display_price' in locals() else live_price)
                 try: set_last_price(symbol_eth, last_price)
@@ -7224,6 +7301,7 @@ async def on_ready():
                 # --- 게이트 (ETH와 동일 로직) ---
                 key2 = (symbol_btc, tf)
                 previous = previous_signal.get(key2)
+
 
 
                 # === Unified exit evaluation on 1m (ALL TFs) ===
