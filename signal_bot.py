@@ -358,6 +358,64 @@ def _adjust_score_with_ctx(symbol: str, tf: str, base_score: float) -> tuple[flo
     return (adj, st)
 
 
+def _lerp(a: float, b: float, w: float) -> float:
+    w = max(0.0, min(1.0, w))
+    return a + (b - a) * w
+
+
+def _pb_alignment(regime: str, side: str) -> int:
+    """+1 aligned, -1 contra, 0 neutral (RANGE treated separately)."""
+    r = (regime or "").upper(); s = (side or "").upper()
+    if r == "RANGE": return 0
+    if r == "TREND_UP":
+        return +1 if s == "LONG" else -1
+    if r == "TREND_DOWN":
+        return +1 if s == "SHORT" else -1
+    return 0
+
+
+def _playbook_adjust_risk(symbol: str, tf: str, side: str,
+                          tp_pct: float|None, sl_pct: float|None, tr_pct: float|None,
+                          lev: float|None, alloc_frac: float|None) -> tuple[dict, dict|None]:
+    """
+    Returns ({tp,sl,tr,lev_cap,alloc_mul,label,eff_w}, ctx_state)
+    Multiplies raw % (on-margin targets) BEFORE leverage→price conversion.
+    Intensity scales by |ctx_bias| * PB_INTENSITY.
+    """
+    if not PLAYBOOK_ENABLE:
+        return ({"tp": tp_pct, "sl": sl_pct, "tr": tr_pct,
+                 "lev_cap": 0.0, "alloc_mul": 1.0, "label": "PB_OFF", "eff_w": 0.0}, None)
+    st = CTX_STATE.get(symbol) or _compute_context(symbol)
+    if not st:
+        return ({"tp": tp_pct, "sl": sl_pct, "tr": tr_pct,
+                 "lev_cap": 0.0, "alloc_mul": 1.0, "label": "PB_NCTX", "eff_w": 0.0}, None)
+    regime = st.get("regime", "RANGE")
+    bias = float(st.get("ctx_bias", 0.0))
+    w = max(0.0, min(1.0, abs(bias) * PB_INTENSITY))
+    sideU = (side or "").upper()
+    # Choose base profile
+    if regime == "RANGE":
+        tp_mul = PB_RANGE_TP_MUL; sl_mul = PB_RANGE_SL_MUL; tr_mul = PB_RANGE_TR_MUL
+        alloc_mul = PB_RANGE_ALLOC_MUL; lev_cap = PB_RANGE_LEV_CAP; label = "PB_RANGE"
+    else:
+        align = _pb_alignment(regime, sideU)
+        if align >= 0:
+            tp_mul = PB_ALIGN_TP_MUL; sl_mul = PB_ALIGN_SL_MUL; tr_mul = PB_ALIGN_TR_MUL
+            alloc_mul = PB_ALIGN_ALLOC_MUL; lev_cap = PB_ALIGN_LEV_CAP; label = "PB_ALIGN" if align>0 else "PB_NEUTRAL"
+        else:
+            tp_mul = PB_CONTRA_TP_MUL; sl_mul = PB_CONTRA_SL_MUL; tr_mul = PB_CONTRA_TR_MUL
+            alloc_mul = PB_CONTRA_ALLOC_MUL; lev_cap = PB_CONTRA_LEV_CAP; label = "PB_CONTRA"
+    # Lerp from 1.0 toward profile by intensity w
+    adj_tp = None if tp_pct is None else _lerp(float(tp_pct), float(tp_pct)*tp_mul, w)
+    adj_sl = None if sl_pct is None else _lerp(float(sl_pct), float(sl_pct)*sl_mul, w)
+    adj_tr = None if tr_pct is None else _lerp(float(tr_pct), float(tr_pct)*tr_mul, w)
+    adj_alloc_mul = _lerp(1.0, alloc_mul, w)
+    eff_lev_cap = float(lev_cap or 0.0)  # 0 means no cap
+    return ({"tp": adj_tp, "sl": adj_sl, "tr": adj_tr,
+             "lev_cap": eff_lev_cap, "alloc_mul": adj_alloc_mul,
+             "label": label, "eff_w": w}, st)
+
+
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
 def _fetch_recent_bar_1m(symbol: str):
     """
@@ -3870,6 +3928,13 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     eff_margin  = alloc["eff_margin"]
     lev_used    = alloc["lev_used"]
     qty         = alloc["qty"]
+    tp_pct      = alloc.get("tp_pct")
+    sl_pct      = alloc.get("sl_pct")
+    tr_pct      = alloc.get("tr_pct")
+    lev         = alloc.get("lev_used")
+    _pb_label   = alloc.get("pb_label")
+    _pb_w       = alloc.get("pb_w")
+    _pb_alloc_mul = alloc.get("pb_alloc_mul")
 
 
     side = "LONG" if exec_signal == "BUY" else "SHORT"
@@ -3888,9 +3953,6 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
     }
     # (NEW) persist risk to paper JSON and CSV
-    tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
-    sl_pct = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
-    tr_pct = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
     slip   = _req_slippage_pct(symbol, tf)
     eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
     if PAPER_POS[key]["side"] == "LONG":
@@ -3911,16 +3973,18 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     _save_json(PAPER_POS_FILE, PAPER_POS)
     # also write OPEN row for paper mode
     extra = ",".join([
-        f"mode={'paper' if TRADE_MODE=='paper' else 'futures'}",
-        f"lev={float(lev_used or 1.0):.2f}", f"risk_mode={RISK_INTERPRET_MODE}",
-        f"tp_pct={(tp_pct if tp_pct is not None else '')}",
-        f"sl_pct={(sl_pct if sl_pct is not None else '')}",
-        f"tr_pct={(tr_pct if tr_pct is not None else '')}",
-        f"eff_tp_pct={(eff_tp_pct if eff_tp_pct is not None else '')}",
-        f"eff_sl_pct={(eff_sl_pct if eff_sl_pct is not None else '')}",
-        f"eff_tr_pct={(tr_pct_eff if tr_pct_eff is not None else '')}",
-        f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
-    ])
+          f"mode={'paper' if TRADE_MODE=='paper' else 'futures'}",
+          f"lev={float(lev_used or 1.0):.2f}", f"risk_mode={RISK_INTERPRET_MODE}",
+          f"tp_pct={(tp_pct if tp_pct is not None else '')}",
+          f"sl_pct={(sl_pct if sl_pct is not None else '')}",
+          f"tr_pct={(tr_pct if tr_pct is not None else '')}",
+          f"eff_tp_pct={(eff_tp_pct if eff_tp_pct is not None else '')}",
+          f"eff_sl_pct={(eff_sl_pct if eff_sl_pct is not None else '')}",
+          f"eff_tr_pct={(tr_pct_eff if tr_pct_eff is not None else '')}",
+          f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}",
+          f"pb_label={_pb_label if '_pb_label' in locals() else ''}",
+          f"pb_alloc_mul={_pb_alloc_mul if '_pb_alloc_mul' in locals() else ''}"
+      ])
     if PAPER_CSV_OPEN_LOG:
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
 
@@ -3949,7 +4013,8 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         qty=qty,
         base_margin=base_margin, eff_margin=eff_margin,
         lev_used=lev_used,
-        score=EXEC_STATE.get(('score', symbol, tf))
+        score=EXEC_STATE.get(('score', symbol, tf)),
+        pb_label=_pb_label, pb_w=_pb_w, pb_alloc_mul=_pb_alloc_mul
     )
 
     # [ANCHOR: IDEMP_MARK_BEFORE_RETURN]
@@ -4083,6 +4148,29 @@ CTX_BETA            = float(cfg_get("CTX_BETA", "0.50"))
 REGIME_PLAYBOOK     = (cfg_get("REGIME_PLAYBOOK", "1") == "1")
 ALERT_CTX_LINES     = (cfg_get("ALERT_CTX_LINES", "1") == "1")
 CTX_TTL_SEC         = int(float(cfg_get("CTX_TTL_SEC", "300")))
+
+# ==== Regime Playbook (risk & sizing auto-tuning) ====
+PLAYBOOK_ENABLE         = (cfg_get("PLAYBOOK_ENABLE", "1") == "1")
+# Base multipliers when signal is ALIGNED with regime direction (LONG vs TREND_UP, SHORT vs TREND_DOWN)
+PB_ALIGN_TP_MUL         = float(cfg_get("PB_ALIGN_TP_MUL", "1.25"))
+PB_ALIGN_SL_MUL         = float(cfg_get("PB_ALIGN_SL_MUL", "1.15"))  # wider stop in trend
+PB_ALIGN_TR_MUL         = float(cfg_get("PB_ALIGN_TR_MUL", "1.20"))  # looser trail in trend
+PB_ALIGN_ALLOC_MUL      = float(cfg_get("PB_ALIGN_ALLOC_MUL", "1.25"))
+PB_ALIGN_LEV_CAP        = float(cfg_get("PB_ALIGN_LEV_CAP", "0"))    # 0=disabled (no extra cap)
+# Base multipliers when signal is CONTRA to regime direction (counter-trend)
+PB_CONTRA_TP_MUL        = float(cfg_get("PB_CONTRA_TP_MUL", "0.75"))
+PB_CONTRA_SL_MUL        = float(cfg_get("PB_CONTRA_SL_MUL", "0.70")) # tighter stop counter-trend
+PB_CONTRA_TR_MUL        = float(cfg_get("PB_CONTRA_TR_MUL", "0.60")) # tighter trail counter-trend
+PB_CONTRA_ALLOC_MUL     = float(cfg_get("PB_CONTRA_ALLOC_MUL", "0.60"))
+PB_CONTRA_LEV_CAP       = float(cfg_get("PB_CONTRA_LEV_CAP", "5"))
+# RANGE regime multipliers (mean-reversion friendly defaults)
+PB_RANGE_TP_MUL         = float(cfg_get("PB_RANGE_TP_MUL", "0.80"))
+PB_RANGE_SL_MUL         = float(cfg_get("PB_RANGE_SL_MUL", "0.60"))
+PB_RANGE_TR_MUL         = float(cfg_get("PB_RANGE_TR_MUL", "0.60"))
+PB_RANGE_ALLOC_MUL      = float(cfg_get("PB_RANGE_ALLOC_MUL", "0.80"))
+PB_RANGE_LEV_CAP        = float(cfg_get("PB_RANGE_LEV_CAP", "5"))
+# How strongly context bias (|CTX_BIAS| in [0,1]) scales multipliers toward the regime profile
+PB_INTENSITY            = float(cfg_get("PB_INTENSITY", "1.00"))  # 0..1 (1 = full effect)
 
 def _bucketize(score: float|None):
     if score is None:
@@ -4278,10 +4366,11 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
     frac = min(1.0, sf * mf)
     if all_align and _FULL_ON_ALL:
         frac = 1.0
-    eff_margin = base_margin * frac
-
-    # 레버리지
-    req_lev = int(_req_leverage(symbol, tf))                         # ← 변경
+    side = "LONG" if signal == "BUY" else "SHORT"
+    tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
+    sl_pct = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
+    tr_pct = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
+    req_lev = int(_req_leverage(symbol, tf))
     lev_used = req_lev
     if ex:
         try:
@@ -4289,16 +4378,30 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
             lev_used = int(_clamp(req_lev, 1, int(limits.get('max_lev') or 125)))
         except Exception:
             pass
+    try:
+        _pb, _ = _playbook_adjust_risk(symbol, tf, side, tp_pct, sl_pct, tr_pct, lev_used, None)
+        tp_pct = _pb.get("tp", tp_pct)
+        sl_pct = _pb.get("sl", sl_pct)
+        tr_pct = _pb.get("tr", tr_pct)
+        _pb_label = _pb.get("label", "PB_OFF")
+        _pb_w = _pb.get("eff_w", 0.0)
+        _pb_alloc_mul = float(_pb.get("alloc_mul", 1.0))
+        _pb_lev_cap = float(_pb.get("lev_cap", 0.0))
+        if _pb_lev_cap > 0 and float(lev_used) > _pb_lev_cap:
+            lev_used = int(_pb_lev_cap)
+    except Exception:
+        _pb_label = "PB_ERR"; _pb_w = 0.0; _pb_alloc_mul = 1.0
+    eff_margin = base_margin * frac * _pb_alloc_mul
+    if eff_margin > base_margin:
+        eff_margin = base_margin
 
     # 수량(미리보기)
     qty = 0.0
     try:
         if price and eff_margin and lev_used:
             qty = (float(eff_margin) * float(lev_used)) / float(price)
-            # ex가 있으면 정밀도 반올림
             if ex:
                 qty = _fut_amount_to_precision(ex, symbol, qty)
-            # min notional은 알림에선 강제하지 않음(체결로직에서 이미 검증)
     except Exception:
         qty = 0.0
 
@@ -4309,7 +4412,13 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
         'mf': float(mf),
         'all_align': bool(all_align),
         'lev_used': int(lev_used),
-        'qty': float(qty)
+        'qty': float(qty),
+        'tp_pct': tp_pct,
+        'sl_pct': sl_pct,
+        'tr_pct': tr_pct,
+        'pb_label': _pb_label,
+        'pb_w': _pb_w,
+        'pb_alloc_mul': _pb_alloc_mul
     }
 
 
@@ -4870,7 +4979,11 @@ async def _fut_rearm_brackets(symbol:str, tf:str, last_price:float, side:str):
     except Exception as e:
         logging.warning(f"[FUT_REARM_CANCEL_WARN] {symbol}: {e}")
     try:
-        await _place_protect_orders(FUT_EXCHANGE, symbol, tf, side, float(last_price))
+        pos = FUT_POS.get(symbol) or {}
+        await _place_protect_orders(
+            FUT_EXCHANGE, symbol, tf, side, float(last_price),
+            tp_pct=pos.get("tp_pct"), sl_pct=pos.get("sl_pct"), tr_pct=pos.get("tr_pct")
+        )
     except Exception as e:
         logging.error(f"[FUT_REARM_ERR] {symbol}: {e}")
 # [ANCHOR: FUT_SCALE_HELPERS_END]
@@ -5039,7 +5152,7 @@ async def _log_pnl(ex, symbol, tf, close_reason, side, qty, entry_price, exit_pr
 
 
 
-async def _place_protect_orders(ex, symbol, tf, side, entry_price):
+async def _place_protect_orders(ex, symbol, tf, side, entry_price, tp_pct=None, sl_pct=None, tr_pct=None):
     """
     TP/SL/Trailing — 심볼×TF 오버라이드 반영.
     듀얼(헤지) 모드면 positionSide 명시.
@@ -5049,9 +5162,12 @@ async def _place_protect_orders(ex, symbol, tf, side, entry_price):
     sl_map = (HARD_STOP_PCT or {})
     tr_map = (trailing_stop_pct or {})  # <-- 대문자 금지
 
-    tp_pct = _req_tp_pct(symbol, tf, tp_map)
-    sl_pct = _req_sl_pct(symbol, tf, sl_map)
-    tr_pct = _req_trail_pct(symbol, tf, tr_map)
+    if tp_pct is None:
+        tp_pct = _req_tp_pct(symbol, tf, tp_map)
+    if sl_pct is None:
+        sl_pct = _req_sl_pct(symbol, tf, sl_map)
+    if tr_pct is None:
+        tr_pct = _req_trail_pct(symbol, tf, tr_map)
 
     tp_price = sl_price = None
     tp_order = sl_order = None
@@ -5120,7 +5236,8 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
                               price: float, qty: float|None,
                               base_margin: float|None=None, eff_margin: float|None=None,
                               lev_used: int|None=None,
-                              score: float|None=None):
+                              score: float|None=None,
+                              pb_label: str|None=None, pb_w: float=0.0, pb_alloc_mul: float=1.0):
     """
     진입 알림: 모드/가격/레버리지/강도/상위TF/배분(총자본→TF배분→강도×MTF→최종)/수량·노치오날
     """
@@ -5183,6 +5300,12 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             lines.append(f"• 강도: {strength_label} (계수 ×{sf:.2f})")
         if mf is not None:
             lines.append(f"• 상위TF: {align_text} (계수 ×{mf:.2f}" + (" · ALL" if all_align else "") + ")")
+
+        try:
+            if pb_label and ALERT_CTX_LINES:
+                lines.append(f"• 플레이북: { pb_label } (강도 { pb_w:.2f }, 배분×{ pb_alloc_mul:.2f })")
+        except Exception:
+            pass
 
         if ALERT_CTX_LINES:
             try:
@@ -5680,7 +5803,31 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     if all_align and _FULL_ON_ALL:
         frac = 1.0
 
-    eff_margin = base_margin * frac
+    side = "LONG" if exec_signal == "BUY" else "SHORT"
+    tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
+    sl_pct = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
+    tr_pct = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
+    lev = _req_leverage(symbol, tf)
+    # === Playbook: adjust risk % and allocation by regime context ===
+    try:
+        _pb, _ctx_used = _playbook_adjust_risk(symbol, tf, side, tp_pct, sl_pct, tr_pct, lev, None)
+        tp_pct = _pb.get("tp", tp_pct)
+        sl_pct = _pb.get("sl", sl_pct)
+        tr_pct = _pb.get("tr", tr_pct)
+        _pb_label = _pb.get("label", "PB_OFF")
+        _pb_w     = _pb.get("eff_w", 0.0)
+        _pb_alloc_mul = float(_pb.get("alloc_mul", 1.0))
+        _pb_lev_cap   = float(_pb.get("lev_cap", 0.0))
+        if _pb_lev_cap > 0 and float(lev or 1.0) > _pb_lev_cap:
+            lev = _pb_lev_cap
+    except Exception as e:
+        log(f"[PB_ERR] {symbol} {tf} {e}")
+        _pb_label = "PB_ERR"; _pb_w = 0.0; _pb_alloc_mul = 1.0; _pb_lev_cap = 0.0
+    log(f"[PB] {symbol} {tf} side={side} label={_pb_label} w={_pb_w:.2f} tp={tp_pct} sl={sl_pct} tr={tr_pct} alloc×{_pb_alloc_mul:.2f} lev_cap={_pb_lev_cap}")
+
+    eff_margin = base_margin * frac * (_pb_alloc_mul if '_pb_alloc_mul' in locals() else 1.0)
+    if eff_margin > base_margin:
+        eff_margin = base_margin
 
     # 디버그 로그(옵션)
     if _DEBUG_ALLOC:
@@ -5725,10 +5872,6 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             FUT_POS_TF[tf] = symbol
             _save_json(OPEN_TF_FILE, FUT_POS_TF)
 
-        tp_pct = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
-        sl_pct = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
-        tr_pct = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
-        lev = _req_leverage(symbol, tf)
         eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev)
         if side == 'LONG':
             tp_price = (float(last) * (1 + (eff_tp_pct or 0)/100)) if eff_tp_pct else None
@@ -5748,7 +5891,9 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             f"eff_tp_pct={(eff_tp_pct if eff_tp_pct is not None else '')}",
             f"eff_sl_pct={(eff_sl_pct if eff_sl_pct is not None else '')}",
             f"eff_tr_pct={(tr_pct_eff if tr_pct_eff is not None else '')}",
-            f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}"
+            f"tp_price={(tp_price if tp_price else '')}", f"sl_price={(sl_price if sl_price else '')}",
+            f"pb_label={_pb_label if '_pb_label' in locals() else ''}",
+            f"pb_alloc_mul={_pb_alloc_mul if '_pb_alloc_mul' in locals() else ''}"
         ])
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last, extra=extra)
 
@@ -5784,27 +5929,17 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         entry_data[(symbol, tf)] = (float(last), datetime.now().strftime("%m월 %d일 %H:%M"))
 
         # 보호 주문(TP/SL) 동시 등록
-        await _place_protect_orders(ex, symbol, tf, side, float(last))
+        await _place_protect_orders(ex, symbol, tf, side, float(last), tp_pct=tp_pct, sl_pct=sl_pct, tr_pct=tr_pct)
 
         # (체결 후) 디스코드 알림
         try:
-            base_margin = _margin_for_tf(tf)
-            req_lev = int(TF_LEVERAGE.get(tf, FUT_LEVERAGE))
-            limits  = _market_limits(ex, symbol)
-            lev_used = int(_clamp(req_lev, 1, int(limits.get('max_lev') or 125)))
             await _notify_trade_entry(
                 symbol, tf, exec_signal, mode="futures",
                 price=float(last), qty=float(qty),
-                base_margin=float(base_margin),
-                eff_margin=float(
-                    base_margin * min(
-                        1.0,
-                        _strength_factor(signal, EXEC_STATE.get(('score', symbol, tf)))
-                        * _mtf_factor(symbol, tf, signal)[0]
-                    )
-                ),
-                lev_used=lev_used,
-                score=EXEC_STATE.get(('score', symbol, tf))
+                base_margin=float(base_margin), eff_margin=float(eff_margin),
+                lev_used=int(lev),
+                score=EXEC_STATE.get(('score', symbol, tf)),
+                pb_label=_pb_label, pb_w=_pb_w, pb_alloc_mul=_pb_alloc_mul
             )
             # 🔒 같은 캔들 재진입 방지 플래그
             if candle_ts is not None:
@@ -7773,6 +7908,17 @@ async def on_message(message):
             lines.append(f"• REGIME_PLAYBOOK: {int(REGIME_PLAYBOOK)}")
             lines.append(f"• ALERT_CTX_LINES: {int(ALERT_CTX_LINES)}")
             lines.append(f"• CTX_TTL_SEC: {CTX_TTL_SEC}")
+            lines.append(f"• PLAYBOOK_ENABLE: {int(PLAYBOOK_ENABLE)}")
+            lines.append(f"• PB_ALIGN_TP_MUL/SL/TR: {PB_ALIGN_TP_MUL}/{PB_ALIGN_SL_MUL}/{PB_ALIGN_TR_MUL}")
+            lines.append(f"• PB_ALIGN_ALLOC_MUL: {PB_ALIGN_ALLOC_MUL}")
+            lines.append(f"• PB_ALIGN_LEV_CAP: {PB_ALIGN_LEV_CAP}")
+            lines.append(f"• PB_CONTRA_TP_MUL/SL/TR: {PB_CONTRA_TP_MUL}/{PB_CONTRA_SL_MUL}/{PB_CONTRA_TR_MUL}")
+            lines.append(f"• PB_CONTRA_ALLOC_MUL: {PB_CONTRA_ALLOC_MUL}")
+            lines.append(f"• PB_CONTRA_LEV_CAP: {PB_CONTRA_LEV_CAP}")
+            lines.append(f"• PB_RANGE_TP_MUL/SL/TR: {PB_RANGE_TP_MUL}/{PB_RANGE_SL_MUL}/{PB_RANGE_TR_MUL}")
+            lines.append(f"• PB_RANGE_ALLOC_MUL: {PB_RANGE_ALLOC_MUL}")
+            lines.append(f"• PB_RANGE_LEV_CAP: {PB_RANGE_LEV_CAP}")
+            lines.append(f"• PB_INTENSITY: {PB_INTENSITY}")
             lines.append(f"• RISK_INTERPRET_MODE: {RISK_INTERPRET_MODE}")
             lines.append(f"• APPLY_LEV_TO_TRAIL: {int(APPLY_LEV_TO_TRAIL)}")
             lines.append(f"• PAPER_CSV_CLOSE_LOG: {int(PAPER_CSV_CLOSE_LOG)}")
