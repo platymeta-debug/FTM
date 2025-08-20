@@ -149,16 +149,18 @@ def get_last_price(symbol: str, default_price: float = 0.0) -> float:
 CTX_STATE: dict[str, dict] = {}
 
 def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
-    """Try multiple loaders; return list of (ts, open, high, low, close, volume)."""
-    try:
-        if 'get_ohlcv' in globals():
-            return get_ohlcv(symbol, tf, limit=limit)
-        if 'fetch_ohlcv' in globals():
-            return fetch_ohlcv(symbol, tf, limit=limit)
-        if 'get_recent_ohlc_series' in globals():
-            return get_recent_ohlc_series(symbol, tf, limit=limit)
-    except Exception:
-        pass
+    """Try multiple loaders; ALWAYS return list of [ts, o, h, l, c, v]."""
+    providers = []
+    if 'get_ohlcv' in globals(): providers.append(lambda: get_ohlcv(symbol, tf, limit=limit))
+    if 'fetch_ohlcv' in globals(): providers.append(lambda: fetch_ohlcv(symbol, tf, limit=limit))
+    if 'get_recent_ohlc_series' in globals(): providers.append(lambda: get_recent_ohlc_series(symbol, tf, limit=limit))
+    for fn in providers:
+        try:
+            raw = fn()
+            rows = _ensure_ohlcv_list(raw)
+            if rows: return rows
+        except Exception:
+            continue
     return []
 
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
@@ -220,6 +222,48 @@ def _outlier_guard(clamped: float, bar: dict) -> bool:
         return delta > OUTLIER_MAX_1M
     except Exception:
         return False
+
+# --- Normalize OHLCV to list-of-lists: [ts, open, high, low, close, volume] ---
+def _ensure_ohlcv_list(data):
+    """
+    Accepts list/tuple of rows OR pandas.DataFrame.
+    Returns [] if cannot normalize.
+    """
+    try:
+        # 1) Already sequence of rows
+        if isinstance(data, (list, tuple)):
+            if len(data) == 0: return []
+            # row is list-like and first element looks like timestamp -> assume OK
+            if isinstance(data[0], (list, tuple)) and len(data[0]) >= 5:
+                return [list(r[:6]) + [0.0] * max(0, 6-len(r)) for r in data]
+        # 2) Pandas DataFrame-like
+        if hasattr(data, "empty") and hasattr(data, "columns"):
+            if getattr(data, "empty", False): return []
+            cols = [str(c).lower() for c in list(data.columns)]
+            # try name-based mapping
+            def _find(*names, default_idx=None):
+                for nm in names:
+                    if nm in cols: return cols.index(nm)
+                return default_idx
+            i_ts  = _find("timestamp","time","ts","open_time", default_idx=0)
+            i_o   = _find("open",  default_idx=1)
+            i_h   = _find("high",  default_idx=2)
+            i_l   = _find("low",   default_idx=3)
+            i_c   = _find("close", default_idx=4)
+            i_v   = _find("volume","vol", default_idx=5)
+            vals = data.values.tolist()
+            out = []
+            for r in vals:
+                try:
+                    ts = float(r[i_ts]); o=float(r[i_o]); h=float(r[i_h]); l=float(r[i_l]); c=float(r[i_c])
+                    v  = float(r[i_v]) if i_v is not None and i_v < len(r) else 0.0
+                    out.append([ts, o, h, l, c, v])
+                except Exception:
+                    continue
+            return out
+    except Exception:
+        return []
+    return []
 
 
 def _linreg_y(x: list[float], y: list[float]):
@@ -292,7 +336,8 @@ def _compute_context(symbol: str) -> dict|None:
         if st and (now - st.get("ts", 0) < CTX_TTL_SEC):
             return st
         rows = _load_ohlcv(symbol, REGIME_TF, limit=max(200, REGIME_LOOKBACK+5))
-        if not rows or len(rows) < max(60, REGIME_LOOKBACK//2):
+        # rows must be list now; guard length only
+        if len(rows) < max(60, REGIME_LOOKBACK//2):
             return None
         closes = [float(r[4]) for r in rows]
         highs  = [float(r[2]) for r in rows]
@@ -344,7 +389,8 @@ def _compute_context(symbol: str) -> dict|None:
         log(f"[CTX] {symbol} {summary}")
         return st
     except Exception as e:
-        log(f"[CTX_ERR] {symbol} {e}")
+        src = type(rows).__name__ if 'rows' in locals() else 'N/A'
+        log(f"[CTX_ERR] {symbol} src={src} err={e}")
         return None
 
 
