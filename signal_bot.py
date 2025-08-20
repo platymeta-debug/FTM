@@ -557,6 +557,7 @@ def _plan_bracket_targets(total_notional: float, ws: list[float]) -> list[float]
     return [max(0.0, total_notional*w) for w in ws]
 
 
+
 # === Futures reallocation executors ===
 def _qty_from_notional(symbol: str, notional: float, price: float) -> float:
     if price <= 0 or abs(notional) <= 0:
@@ -646,6 +647,7 @@ def _csv_log_scale_event(symbol: str, tf: str, kind: str, side: str, qty: float,
 # small helper label for scale ops
 def _scale_note_label(i: int, delta: float) -> str:
     return f"leg#{i}{'+' if delta>=0 else '-'}${abs(delta):.0f}"
+
 
 
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
@@ -4194,12 +4196,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
                     await _fut_rearm_brackets(symbol, tf, float(last_price), "LONG" if exec_signal=="BUY" else "SHORT")
 
+
                     try:
                         if TRADE_MODE=='futures' and CSV_SCALE_EVENTS:
                             kind = "SCALE_REDUCE"
                             _csv_log_scale_event(symbol, tf, kind, side, float(closed if 'closed' in locals() else 0.0), float(last_price), "SCALE_REDUCE")
                     except Exception:
                         pass
+
 
             try:
                 pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else None
@@ -4241,6 +4245,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                                 legs[i]["ts"] = time.time(); legs[i]["price"] = last_price
                             pos["legs"] = [l for l in legs if l.get("notional",0.0) > 0]
                         else:
+
                             # Futures live execution: issue reduceOnly/add market orders per plan
                             if REALLOC_FUTURES_EXECUTE:
                                 for i, d_usdt in plan:
@@ -4248,6 +4253,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                                     await _futures_exec_delta(symbol, tf, side, float(d_usdt), float(last_price), note)
                             else:
                                 log(f"[BRKT_REALLOC_SKIP] {symbol} {tf} exec=off plan={plan}")
+
                         pos["last_ctx"] = new_ctx
                         pos["last_realloc_ts"] = time.time()
                     else:
