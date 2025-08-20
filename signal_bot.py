@@ -223,6 +223,67 @@ def _outlier_guard(clamped: float, bar: dict) -> bool:
     except Exception:
         return False
 
+
+# [ANCHOR: EXIT_EVAL_HELPERS_BEGIN]
+EXIT_FILL_MODE = cfg_get("EXIT_FILL_MODE", "bar_bound").lower()  # bar_bound | threshold
+
+def _eff_pct_from_env(tf: str, pct: float, apply_leverage: bool = True) -> float:
+    """PRICE_PCT vs MARGIN_RETURN 모드 해석"""
+    try:
+        if RISK_INTERPRET_MODE == "MARGIN_RETURN" and apply_leverage:
+            lev = float(TF_LEVERAGE.get(tf, 1))
+            return float(pct) / max(lev, 1.0)
+        return float(pct)
+    except Exception:
+        return float(pct)
+
+def _eval_exit_touch(side: str, entry: float, tf: str, bar: dict):
+    """
+    보호체크 전용의 간이 TOUCH 로직 (TRAIL 제외).
+    returns: (hit:bool, reason:str|None, trigger_price:float|None)
+    """
+    hi, lo = float(bar["high"]), float(bar["low"])
+    tp_pct = _eff_pct_from_env(tf, (take_profit_pct or {}).get(tf, 0.0))
+    sl_pct = _eff_pct_from_env(tf, (HARD_STOP_PCT or {}).get(tf, 0.0))
+    if entry <= 0:
+        return False, None, None
+    if str(side).upper() == "LONG":
+        tp_price = entry * (1.0 + tp_pct / 100.0)
+        sl_price = entry * (1.0 - sl_pct / 100.0)
+        if lo <= sl_price:
+            return True, "SL", sl_price
+        if hi >= tp_price:
+            return True, "TP", tp_price
+    elif str(side).upper() == "SHORT":
+        tp_price = entry * (1.0 - tp_pct / 100.0)
+        sl_price = entry * (1.0 + sl_pct / 100.0)
+        if hi >= sl_price:
+            return True, "SL", sl_price
+        if lo <= tp_price:
+            return True, "TP", tp_price
+    return False, None, None
+
+def _choose_exec_price(reason: str, side: str, trig_px: float, bar: dict) -> float:
+    """
+    EXIT_FILL_MODE에 따라 실제 기록할 '종결가' 선택.
+    - threshold: 임계값 그대로
+    - bar_bound: 분봉 경계값으로 치환
+    """
+    hi, lo = float(bar["high"]), float(bar["low"])
+    if EXIT_FILL_MODE == "threshold":
+        return float(trig_px)
+    side = str(side).upper()
+    reason = (reason or "").upper()
+    if reason == "TRAIL":
+        return lo if side == "LONG" else hi
+    if reason == "SL":
+        return max(trig_px, lo) if side == "LONG" else min(trig_px, hi)
+    if reason == "TP":
+        return min(trig_px, hi) if side == "LONG" else max(trig_px, lo)
+    return max(min(trig_px, hi), lo)
+# [ANCHOR: EXIT_EVAL_HELPERS_END]
+
+
 # --- Normalize OHLCV to list-of-lists: [ts, open, high, low, close, volume] ---
 def _ensure_ohlcv_list(data):
     """
@@ -4007,21 +4068,37 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     pos = (PAPER_POS or {}).get(key)
     if pos:
         side  = str(pos.get("side", "")).upper()
-        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
+        entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+
+        # 1) 현재가 힌트 수집 (mark 허용하되, '직접 트리거'는 금지하고 클램핑에만 사용)
         snap_curr = await get_price_snapshot(symbol)
-        curr = snap_curr.get("mark") or snap_curr.get("mid") or snap_curr.get("last") or last_price
-        hit, reason = _eval_tp_sl(side, float(entry), float(curr), tf)
-        if hit:
-            info = _paper_close(symbol, tf, float(last_price), reason)
-            if info:
-                await _notify_trade_exit(symbol, tf, side=info["side"], entry_price=info["entry_price"], exit_price=float(last_price), reason=(reason or "TP/SL"), mode="paper", pnl_pct=info.get("pnl_pct"))
-            log(f"⏭ {symbol} {tf}: exited by {reason}, skip new entry this tick")
-            log(f"⏭ {symbol} {tf}: skip reason=PROTECT")
-            return
+        curr_hint = (snap_curr.get("last")
+                     or snap_curr.get("mid")
+                     or snap_curr.get("mark")
+                     or last_price)
+
+        # 2) 1분봉 기준 클램핑 & 이상치 가드
+        clamped, bar = _sanitize_exit_price(symbol, last_hint=float(curr_hint or 0.0))
+        if _outlier_guard(clamped, bar):
+            log(f"[PROTECT] skip minute(outlier): {symbol} {tf}")
         else:
-            log(f"⏭ {symbol} {tf}: open pos exists → skip new entry")
-            log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
-            return
+            # 3) TOUCH 모드의 통합 종료평가 (보호체크 전용, TRAIL은 무시)
+            hit, reason, trig_px = _eval_exit_touch(side=side, entry=entry, tf=tf, bar=bar)
+            if hit:
+                exec_px = _choose_exec_price(reason, side, trig_px, bar)
+                info = _paper_close(symbol, tf, exec_px)
+                if info:
+                    await _notify_trade_exit(
+                        symbol, tf,
+                        side=info["side"],
+                        entry_price=info["entry_price"],
+                        exit_price=exec_px,
+                        reason=(reason or "TP/SL")
+                    )
+                return
+        log(f"⏭ {symbol} {tf}: open pos exists → skip new entry")
+        log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
+        return
 
     # ① 라우팅 검사 (먼저)
     if not _route_allows(symbol, tf):
