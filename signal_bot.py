@@ -4602,7 +4602,7 @@ def capital_save_state():
             return
         _ensure_parent_dir(CAPITAL_STATE_PATH)
         with open(CAPITAL_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"capital": capital_get(), "ts": _dt.datetime.utcnow().isoformat()+"Z"}, f)
+            json.dump({"capital": capital_get(), "ts": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00","Z")}, f)
     except Exception as e:
         log(f"[CAPITAL] save_state warn: {e}")
 
@@ -4642,7 +4642,7 @@ def capital_ledger_write(event: str, **kw):
     if not CAPITAL_LEDGER_ENABLE:
         return
     try:
-        now = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc).isoformat()
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
         row = {
             "ts_utc": now,
             "event": event,
