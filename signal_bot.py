@@ -62,6 +62,77 @@ def capital_apply_realized_pnl(delta_usd: float, fees_usd: float = 0.0):
         return  # 실거래는 거래소 잔고 소스오브트루스
     _CAPITAL = float((_CAPITAL or 0.0) + float(delta_usd) - float(fees_usd))
 
+
+# [ANCHOR: ALLOC_UPNL_HELPERS_BEGIN]  << ADD NEW >>
+# --- env for allocation with UPNL ---
+ALLOC_USE_UPNL       = int(os.getenv("ALLOC_USE_UPNL", "0") or 0)
+ALLOC_UPNL_MODE      = os.getenv("ALLOC_UPNL_MODE", "NET").upper()
+ALLOC_UPNL_W_POS     = float(os.getenv("ALLOC_UPNL_W_POS", "0.5") or 0.5)
+ALLOC_UPNL_W_NEG     = float(os.getenv("ALLOC_UPNL_W_NEG", "1.25") or 1.25)
+ALLOC_UPNL_EMA_ALPHA = float(os.getenv("ALLOC_UPNL_EMA_ALPHA", "0.0") or 0.0)
+ALLOC_UPNL_CLAMP_PCT = float(os.getenv("ALLOC_UPNL_CLAMP_PCT", "20") or 20.0)
+ALLOC_DEBUG          = int(os.getenv("ALLOC_DEBUG", "0") or 0)
+
+_UPNL_EMA_CACHE = {"val": None}
+
+def _ema_update(key: str, x: float, alpha: float):
+    if alpha <= 0:
+        return x
+    v = _UPNL_EMA_CACHE.get(key)
+    if v is None:
+        _UPNL_EMA_CACHE[key] = x
+        return x
+    v = alpha * x + (1 - alpha) * v
+    _UPNL_EMA_CACHE[key] = v
+    return v
+
+def _upnl_weighted_component(upnl_raw: float) -> float:
+    """
+    UPNL을 모드/가중/스무딩/클램프로 가공해 '기여분'을 산출.
+    반환값은 '달러' 단위로 base 자본에 더해짐.
+    """
+    up = float(upnl_raw or 0.0)
+    # 스무딩(전역 하나로 관리; 필요하면 TF키 등으로 분리 확장)
+    up_s = _ema_update("UPNL", up, ALLOC_UPNL_EMA_ALPHA)
+
+    pos = max(up_s, 0.0)
+    neg = min(up_s, 0.0)
+
+    if ALLOC_UPNL_MODE == "POS_ONLY":
+        contrib = pos * ALLOC_UPNL_W_POS
+    elif ALLOC_UPNL_MODE == "NEG_ONLY":
+        contrib = neg * ALLOC_UPNL_W_NEG
+    elif ALLOC_UPNL_MODE == "ASYM":
+        contrib = pos * ALLOC_UPNL_W_POS + neg * ALLOC_UPNL_W_NEG
+    else:  # NET
+        # NET은 부호 신경 안 쓰고 동일 가중을 원하면 W_POS 사용
+        w = ALLOC_UPNL_W_POS
+        contrib = up_s * w
+
+    return float(contrib)
+
+def planning_capital_for_allocation(exchange=None) -> tuple[float, float, float]:
+    """
+    배분용 계획자본 계산.
+    returns: (base_cap, upnl_contrib_capped, planning_cap)
+    """
+    # base는 미실현 제외(이중반영 방지)
+    base = capital_get(include_upnl=False, exchange=exchange)
+    if not ALLOC_USE_UPNL:
+        return base, 0.0, max(base, 0.0)
+
+    upnl_net = _calc_total_upnl(exchange=exchange)
+    contrib  = _upnl_weighted_component(upnl_net)
+
+    # 기여 한도(클램프): base * CLAMP%
+    lim = abs(base) * (ALLOC_UPNL_CLAMP_PCT / 100.0)
+    contrib_capped = max(min(contrib,  lim), -lim)
+
+    plan = max(base + contrib_capped, 0.0)
+    return float(base), float(contrib_capped), float(plan)
+# [ANCHOR: ALLOC_UPNL_HELPERS_END]
+
+
 def _refresh_exchange_capital(exchange=None) -> Optional[float]:
     """실거래 모드: 잔고에서 총자본 읽기 (거래소별 자유자재 응용)"""
     try:
@@ -5917,19 +5988,24 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             align_text = "-"
 
         # [ANCHOR: ENTRY_ALLOC_CALC]  << REPLACE BLOCK >>
-        # 총자본은 항상 최신값으로
-        total_cap = capital_get(exchange=GLOBAL_EXCHANGE)
-        tf_pct    = float(ALLOC_TF.get(tf, 0.0)) * 100.0
-        base_margin = max(round(total_cap * tf_pct / 100.0, 2), 0.0)
 
-        alloc_pct = tf_pct / 100.0 if total_cap > 0 else None
+        # 1) 계획자본 계산 (base, upnl 기여, planning)
+        base_cap, upnl_contrib, plan_cap = planning_capital_for_allocation(exchange=GLOBAL_EXCHANGE)
+
+        # 2) TF 배정
+        tf_pct    = float(ALLOC_TF.get(tf, 0.0)) * 100.0
+        base_margin = max(round(plan_cap * tf_pct / 100.0, 2), 0.0)
+
+        # 3) 참조용
+        alloc_pct = tf_pct / 100.0 if base_cap > 0 else None
         use_frac  = None
         notional  = None
         if eff_margin and base_margin > 0:
-            use_frac = float(eff_margin) / float(base_margin)    # 강도×MTF 적용 후 실제 사용 비율
+            use_frac = float(eff_margin) / float(base_margin)
+
         if eff_margin and lev_used:
             try:
-                notional = float(eff_margin) * int(lev_used)         # 레버리지 적용 노치오날
+                notional = float(eff_margin) * int(lev_used)
             except Exception:
                 pass
 
@@ -5980,8 +6056,15 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
 
         # 배분 브레이크다운
         # ① 총자본 → TF배정
-        if total_cap and alloc_pct is not None:
-            lines.append(f"• 배분(1): 총자본 {_fmt_usd(total_cap)} → TF배정 {_fmt_usd(base_margin)} ({tf_pct:.2f}%)")
+
+        if base_cap and alloc_pct is not None:
+            lines.append(f"• 배분(1): 총자본 {_fmt_usd(base_cap)} → TF배정 {_fmt_usd(base_margin)} ({tf_pct:.2f}%)")
+            if ALLOC_USE_UPNL and ALLOC_DEBUG:
+                sign = "+" if upnl_contrib >= 0 else "-"
+                lines.append(
+                    f"• 배분(1a): UPNL 기여({sign}) {_fmt_usd(abs(upnl_contrib))} → 계획자본 {_fmt_usd(plan_cap)}"
+                )
+
         elif base_margin:
             lines.append(f"• 배분(1): TF배정 {_fmt_usd(base_margin)}")
 
@@ -8995,6 +9078,9 @@ if __name__ == "__main__":
     exchange = GLOBAL_EXCHANGE
     capital_bootstrap(exchange)
     log(f"[BOOT] CAPITAL: source={CAPITAL_SOURCE}, base={capital_get(exchange=exchange):,.2f} {CAPITAL_EXCHANGE_CCY}")
+
+    log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
+
     # [ANCHOR: BOOT_ENV_SUMMARY]
     try:
         log("[BOOT] ENV SUMMARY: "
