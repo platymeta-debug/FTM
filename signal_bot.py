@@ -4853,12 +4853,12 @@ async def safe_price_hint(symbol:str):
     """
     스냅샷 후보 우선순위 → 값 선택 → (필요 시) 1m 캔들로 클램프 + 이상치 가드
     """
-    snap = await _fetch_with_retry(get_price_snapshot, symbol)
 
+    snap = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
 
     # ✅ None 가드 + 옵션 폴백
+    if not isinstance(snap, dict) or not snap:
 
-    if not isinstance(snap, dict):
         if os.getenv("PRICE_FALLBACK_ON_NONE", "1") == "1":
             try:
                 df = get_ohlcv(symbol, "1m", limit=1)
@@ -4872,13 +4872,15 @@ async def safe_price_hint(symbol:str):
     # 후보 가격 선택
     cand = None
     for k in PRICE_FALLBACK_ORDER:
-        v = (snap or {}).get(k)
+        v = snap.get(k)
+
         if v is not None:
             cand = float(v); break
 
     # mark 직접사용 제한 → last 있으면 last로 클램프
-    if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and ((snap or {}).get("mark") == cand):
-        last = (snap or {}).get("last")
+
+    if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and (snap.get("mark") == cand):
+        last = snap.get("last")
         if last is not None:
 
             cand = float(last)
@@ -4888,8 +4890,9 @@ async def safe_price_hint(symbol:str):
     # 이상치면 1회 재조회(✅ None 가드)
     if _outlier_guard(clamped, bar):
 
-        snap2 = await _fetch_with_retry(get_price_snapshot, symbol)
-        cand2 = float(((snap2 or {}).get("last") or (snap2 or {}).get("mid") or cand or 0.0))
+        snap2 = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
+        cand2 = float(snap2.get("last") or snap2.get("mid") or cand or 0.0)
+
         clamped, bar = _sanitize_exit_price(symbol, cand2)
 
     return clamped, bar
@@ -7620,9 +7623,9 @@ def get_open_positions_iter():
 async def _dash_render_text():
 
     st = _daily_state_load() or {}  # ← Nonesafe
-
     cap_realized = capital_get()
     rows, totals = await gather_positions_upnl()  # ← async 버전만 사용
+
 
     eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE","live") or "live").lower()
     if eq_mode == "live":
@@ -7636,7 +7639,10 @@ async def _dash_render_text():
     lines.append(f"Day PnL: {st.get('realized_usdt',0):+.2f} USDT ({st.get('realized_pct',0):+.2f}%) | closes={st.get('closes',0)}")
 
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL","1")=="1":
-        lines.append(f"Open UPNL: {totals['upnl_usdt_sum']:+.2f} USDT ({totals['upnl_pct_on_equity']:+.2f}% of equity)")
+        lines.append(
+            f"Open UPNL: {float((totals or {}).get('upnl_usdt_sum',0.0)):+.2f} USDT "
+            f"({float((totals or {}).get('upnl_pct_on_equity',0.0)):+.2f}% of equity)"
+        )
         lines.append(f"Open UPNL Detail: {len(rows)} pos | sort={os.getenv('DASHBOARD_SORT')}")
 
     lines.append("— open positions —" if rows else "— no open positions —")
@@ -7671,15 +7677,17 @@ async def _dash_loop(client):
             if msg:
                 await msg.edit(content=txt)
             if PRESENCE_ENABLE:
-                eq = eq_now
+
+                eq  = float(eq_now)
                 day = float((st or {}).get("realized_usdt", 0.0))
+                ou  = float((totals or {}).get("upnl_usdt_sum", 0.0))
+                await client.change_presence(
+                    activity=discord.Activity(
+                        type=discord.ActivityType.watching,
+                        name=f"Eq ${eq:,.0f} | Day {day:+.0f} | Open {ou:+.0f}"
+                    )
+                )
 
-                ou = float((totals or {}).get("upnl_usdt_sum", 0.0))
-
-                await client.change_presence(activity=discord.Activity(
-                    type=discord.ActivityType.watching,
-                    name=f"Eq ${eq:,.0f} | Day {day:+.0f} | Open {ou:+.0f}"
-                ))
         except Exception as e:
             log(f"[DASH] warn: {e}")
         await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
