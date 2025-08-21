@@ -4798,6 +4798,115 @@ async def safe_price_hint(symbol:str):
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
+
+# [ANCHOR: DASH_ADV_HELPERS_BEGIN]
+import json as _json, pathlib as _pathlib, math as _math
+
+DASHBOARD_MAE_MFE = int(os.getenv("DASHBOARD_MAE_MFE","1") or 1)
+DASHBOARD_RISK_BAR = int(os.getenv("DASHBOARD_RISK_BAR","1") or 1)
+RISK_WARN_NEAR_SL_PCT = float(os.getenv("RISK_WARN_NEAR_SL_PCT","0.5") or 0.5)
+RISK_BAR_WIDTH = int(os.getenv("RISK_BAR_WIDTH","12") or 12)
+POS_STATS_STATE_PATH = os.getenv("POS_STATS_STATE_PATH","./data/pos_stats.json")
+
+DASHBOARD_FUNDING = int(os.getenv("DASHBOARD_FUNDING","1") or 1)
+FUNDING_COUNTDOWN_ONLY = int(os.getenv("FUNDING_COUNTDOWN_ONLY","1") or 1)
+FUNDING_EXCHANGE_HINT = os.getenv("FUNDING_EXCHANGE_HINT","")
+
+# 포지션별 극값/MAE/MFE 저장소 (세션 지속)
+_POS_STATS = None
+
+def _pos_stats_key(symbol:str, tf:str, side:str, entry:float, qty:float) -> str:
+    return f"{symbol}|{tf}|{side}|{entry:.8f}|{qty:.8f}"
+
+def _pos_stats_load():
+    global _POS_STATS
+    if _POS_STATS is not None: return _POS_STATS
+    try:
+        with open(POS_STATS_STATE_PATH,"r",encoding="utf-8") as f:
+            _POS_STATS = _json.load(f)
+    except Exception:
+        _POS_STATS = {}
+    return _POS_STATS
+
+def _pos_stats_save():
+    try:
+        _pathlib.Path(POS_STATS_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(POS_STATS_STATE_PATH,"w",encoding="utf-8") as f:
+            _json.dump(_POS_STATS,f,ensure_ascii=False)
+    except Exception as e:
+        log(f"[DASH] pos_stats save warn: {e}")
+
+def _update_mae_mfe(symbol:str, tf:str, side:str, entry:float, last:float, qty:float, lev:float):
+    """
+    MAE/MFE (% on margin) 추정: 진입 이후 최저/최고 가격을 추적해 ROE%로 환산.
+    """
+    if not DASHBOARD_MAE_MFE: return (0.0, 0.0)
+    st = _pos_stats_load()
+    k = _pos_stats_key(symbol, tf, side, entry, qty)
+    node = st.get(k) or {"lo": entry, "hi": entry}
+    node["lo"] = min(node["lo"], last)
+    node["hi"] = max(node["hi"], last)
+    st[k] = node
+
+    # 변동률(%) × 방향 × 레버리지
+    def _roe(p:float):
+        chg_pct = (p - entry)/entry*100.0
+        mult = (1.0 if side.upper()=="LONG" else -1.0)
+        return chg_pct*mult*float(lev or 1.0)
+
+    mae = min(_roe(node["lo"]), _roe(node["hi"]))  # 최악값(손실쪽)
+    mfe = max(_roe(node["lo"]), _roe(node["hi"]))  # 최고값(이익쪽)
+    return mae, mfe
+
+def _risk_bar_pct(dist_to_sl_pct: float, dist_to_tp_pct: float) -> str:
+    """
+    거리 기반 텍스트 바: [■■■▢▢▢] 형태.
+    dist_to_* 는 '현재가로부터 남은 거리(%)' (양수).
+    """
+    if not DASHBOARD_RISK_BAR: return ""
+    span = (dist_to_sl_pct + dist_to_tp_pct)
+    if span <= 0:
+        return ""
+    # SL쪽 가까울수록 왼쪽 채움이 적게 보이게 (SL=0이면 거의 빈 칸)
+    filled = int(max(0, min(RISK_BAR_WIDTH, (dist_to_sl_pct/span)*RISK_BAR_WIDTH)))
+    empty = RISK_BAR_WIDTH - filled
+    return "〔" + ("■"*filled) + ("▢"*empty) + "〕"
+
+def _warn_icon(dist_to_sl_pct: float) -> str:
+    try:
+        return " ⚠️" if dist_to_sl_pct <= RISK_WARN_NEAR_SL_PCT else ""
+    except Exception:
+        return ""
+
+async def _funding_hint(symbol:str) -> str:
+    """
+    펀딩 카운트다운/추정. 거래소 API 유무에 따라 best-effort.
+    반환 예: 'FUND 05:12' or 'FUND 05:12 / +0.0100%'
+    """
+    if not DASHBOARD_FUNDING:
+        return ""
+    try:
+        # 프로젝트에 이미 연결된 클라이언트/헬퍼가 있으면 사용.
+        # 여기서는 의존성 피하려고 best-effort 가짜 헬퍼를 사용하거나, 없으면 빈 문자열.
+        # ex) next_funding_ts, predicted_rate = await fetch_funding_info(symbol, hint=FUNDING_EXCHANGE_HINT)
+        next_funding_ts = None
+        predicted_rate = None
+        # 없으면 N/A
+        if not next_funding_ts:
+            return ""
+        # 카운트다운
+        now = datetime.now(timezone.utc).timestamp()
+        sec = max(0, int(next_funding_ts - now))
+        hh, mm = sec//3600, (sec%3600)//60
+        if FUNDING_COUNTDOWN_ONLY or predicted_rate is None:
+            return f" FUND {hh:02d}:{mm:02d}"
+        else:
+            return f" FUND {hh:02d}:{mm:02d} / {predicted_rate:+.4f}%"
+    except Exception:
+        return ""
+# [ANCHOR: DASH_ADV_HELPERS_END]
+
+
 # [ANCHOR: DASH_UPNL_HELPERS_BEGIN]
 from typing import List, Dict, Tuple
 
@@ -4816,7 +4925,10 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     """
     열린 포지션을 순회하며 1분봉 가드가 적용된 가격으로 UPNL/ROE를 계산, 합계/정렬 정보까지 반환
     returns (rows, totals)
-      rows: [{symbol, tf, side, qty, entry, last, lev, upnl_usdt, upnl_pct_on_margin, notional}]
+
+      rows: [{symbol, tf, side, qty, entry, last, lev, upnl_usdt, upnl_pct_on_margin,
+              notional, mae_pct, mfe_pct, dist_sl_pct, dist_tp_pct, riskbar, warn, fund}]
+
       totals: {upnl_usdt_sum, upnl_pct_on_equity}
     """
     rows: List[Dict] = []
@@ -4844,6 +4956,31 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
         })
         upnl_sum += upnl
 
+
+        # === MAE/MFE 업데이트 ===
+        mae_pct, mfe_pct = _update_mae_mfe(symbol, tf, side, entry, last, qty, lev)
+
+        # === SL/TP까지 거리(%) 추정 ===
+        dist_sl_pct, dist_tp_pct = None, None
+        slp = pos.get("sl") or pos.get("sl_price")
+        tpp = pos.get("tp") or pos.get("tp_price")
+        if slp and tpp:
+            # 현재가 기준 남은 거리(%), 음수면 이미 지나침
+            dist_sl_pct = abs((last - float(slp))/last*100.0)
+            dist_tp_pct = abs((float(tpp) - last)/last*100.0)
+        riskbar = _risk_bar_pct(dist_sl_pct or 0.0, dist_tp_pct or 0.0)
+        warn = _warn_icon(dist_sl_pct or 999.0)
+
+        # === 펀딩 힌트 ===
+        fund = await _funding_hint(symbol)
+
+        rows[-1].update({
+            "mae_pct": mae_pct, "mfe_pct": mfe_pct,
+            "dist_sl_pct": dist_sl_pct, "dist_tp_pct": dist_tp_pct,
+            "riskbar": riskbar, "warn": warn, "fund": fund
+        })
+
+
     # 정렬
     mode = (os.getenv("DASHBOARD_SORT","by_notional") or "by_notional").lower()
     if mode == "by_upnl":
@@ -4859,6 +4996,9 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
         "upnl_usdt_sum": upnl_sum,
         "upnl_pct_on_equity": (upnl_sum / eq_base * 100.0)
     }
+
+    _pos_stats_save()
+
     return rows, totals
 # [ANCHOR: DASH_UPNL_HELPERS_END]
 
@@ -7328,15 +7468,31 @@ async def _dash_render_text():
 
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL","1")=="1":
         lines.append(f"Open UPNL: {totals['upnl_usdt_sum']:+.2f} USDT ({totals['upnl_pct_on_equity']:+.2f}% of equity)")
+        lines.append(f"Open UPNL Detail: {len(rows)} pos | sort={os.getenv('DASHBOARD_SORT')}")
+
 
     lines.append("— open positions —" if rows else "— no open positions —")
 
     show_usdt = os.getenv("DASHBOARD_SHOW_POS_USDT","1")=="1"
+    show_mae = DASHBOARD_MAE_MFE
+    show_risk = DASHBOARD_RISK_BAR
+
+
     for r in rows:
         base = (f"{r['symbol']} {r['tf']} {r['side']} {r['qty']:.4f} @ {r['entry']:.2f} "
                 f"→ {r['last']:.2f} ×{r['lev']:g} | UPNL {r['upnl_pct_on_margin']:+.2f}%")
         if show_usdt:
             base += f" / {r['upnl_usdt']:+.2f} USDT"
+        if show_mae:
+            base += f" | MAE {r.get('mae_pct',0.0):+.2f}% · MFE {r.get('mfe_pct',0.0):+.2f}%"
+        if show_risk and (r.get('dist_sl_pct') is not None) and (r.get('dist_tp_pct') is not None):
+            base += f" {r.get('riskbar','')}"
+            base += f" SL {r['dist_sl_pct']:.2f}% · TP {r['dist_tp_pct']:.2f}%"
+            base += r.get('warn','')
+        # 펀딩
+        base += r.get('fund','')
+
+
         lines.append(base)
 
     return "\n".join(lines), st, eq_now, totals
