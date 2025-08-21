@@ -7223,8 +7223,15 @@ def get_open_positions_summary():
                 qty = float(pos.get("qty") or 0.0)
                 entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
                 last = get_last_price(sym, entry)
-                pnl = ((last - entry) / entry * 100.0) if entry>0 else 0.0
-                out.append(f"{sym} {tf} {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl:+.2f}%")
+
+                chg_px_pct = ((last - entry) / entry * 100.0) if entry > 0 else 0.0
+                side_mult = 1.0 if side == "LONG" else -1.0
+                lev_used = float(pos.get("lev") or 1.0)
+                pnl_pct_on_margin = chg_px_pct * side_mult * lev_used
+                out.append(
+                    f"{sym} {tf} {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl_pct_on_margin:+.2f}%"
+                )
+
             except Exception:
                 continue
         for sym, pos in (FUT_POS or {}).items():
@@ -7233,8 +7240,15 @@ def get_open_positions_summary():
                 qty = float(pos.get("qty") or 0.0)
                 entry = float(pos.get("entry") or 0.0)
                 last = get_last_price(sym, entry)
-                pnl = ((last - entry) / entry * 100.0) if entry>0 else 0.0
-                out.append(f"{sym} FUT {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl:+.2f}%")
+
+                chg_px_pct = ((last - entry) / entry * 100.0) if entry > 0 else 0.0
+                side_mult = 1.0 if side == "LONG" else -1.0
+                lev_used = float(pos.get("lev") or 1.0)
+                pnl_pct_on_margin = chg_px_pct * side_mult * lev_used
+                out.append(
+                    f"{sym} FUT {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl_pct_on_margin:+.2f}%"
+                )
+
             except Exception:
                 continue
     except Exception:
