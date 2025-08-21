@@ -4798,6 +4798,7 @@ async def safe_price_hint(symbol:str):
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
+
 # [ANCHOR: DASH_ADV_HELPERS_BEGIN]
 import json as _json, pathlib as _pathlib, math as _math
 
@@ -4905,6 +4906,7 @@ async def _funding_hint(symbol:str) -> str:
         return ""
 # [ANCHOR: DASH_ADV_HELPERS_END]
 
+
 # [ANCHOR: DASH_UPNL_HELPERS_BEGIN]
 from typing import List, Dict, Tuple
 
@@ -4923,8 +4925,10 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     """
     열린 포지션을 순회하며 1분봉 가드가 적용된 가격으로 UPNL/ROE를 계산, 합계/정렬 정보까지 반환
     returns (rows, totals)
+
       rows: [{symbol, tf, side, qty, entry, last, lev, upnl_usdt, upnl_pct_on_margin,
               notional, mae_pct, mfe_pct, dist_sl_pct, dist_tp_pct, riskbar, warn, fund}]
+
       totals: {upnl_usdt_sum, upnl_pct_on_equity}
     """
     rows: List[Dict] = []
@@ -4952,6 +4956,7 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
         })
         upnl_sum += upnl
 
+
         # === MAE/MFE 업데이트 ===
         mae_pct, mfe_pct = _update_mae_mfe(symbol, tf, side, entry, last, qty, lev)
 
@@ -4975,6 +4980,7 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
             "riskbar": riskbar, "warn": warn, "fund": fund
         })
 
+
     # 정렬
     mode = (os.getenv("DASHBOARD_SORT","by_notional") or "by_notional").lower()
     if mode == "by_upnl":
@@ -4990,7 +4996,9 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
         "upnl_usdt_sum": upnl_sum,
         "upnl_pct_on_equity": (upnl_sum / eq_base * 100.0)
     }
+
     _pos_stats_save()
+
     return rows, totals
 # [ANCHOR: DASH_UPNL_HELPERS_END]
 
@@ -7462,11 +7470,13 @@ async def _dash_render_text():
         lines.append(f"Open UPNL: {totals['upnl_usdt_sum']:+.2f} USDT ({totals['upnl_pct_on_equity']:+.2f}% of equity)")
         lines.append(f"Open UPNL Detail: {len(rows)} pos | sort={os.getenv('DASHBOARD_SORT')}")
 
+
     lines.append("— open positions —" if rows else "— no open positions —")
 
     show_usdt = os.getenv("DASHBOARD_SHOW_POS_USDT","1")=="1"
     show_mae = DASHBOARD_MAE_MFE
     show_risk = DASHBOARD_RISK_BAR
+
 
     for r in rows:
         base = (f"{r['symbol']} {r['tf']} {r['side']} {r['qty']:.4f} @ {r['entry']:.2f} "
@@ -7481,6 +7491,7 @@ async def _dash_render_text():
             base += r.get('warn','')
         # 펀딩
         base += r.get('fund','')
+
 
         lines.append(base)
 
