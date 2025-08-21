@@ -7581,10 +7581,12 @@ def get_open_positions_iter():
         # 디스크/거래소 하이드레이션이 늦는 경우를 대비한 1회 폴백
         try:
             _hydrate_from_disk()
+
+            paper = PAPER_POS or {}
+            fut   = FUT_POS or {}
         except Exception:
             pass
-        paper = PAPER_POS or {}
-        fut   = FUT_POS or {}
+
     try:
         for key, pos in paper.items():
             try:
@@ -7616,12 +7618,18 @@ def get_open_positions_iter():
     return out
 
 async def _dash_render_text():
-    st = _daily_state_load()
+
+    st = _daily_state_load() or {}  # ← Nonesafe
+
     cap_realized = capital_get()
     rows, totals = await gather_positions_upnl()  # ← async 버전만 사용
 
     eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE","live") or "live").lower()
-    eq_now = cap_realized + totals["upnl_usdt_sum"] if eq_mode=="live" else cap_realized
+    if eq_mode == "live":
+        eq_now = float(cap_realized) + float((totals or {}).get("upnl_usdt_sum", 0.0))
+    else:
+        eq_now = float(cap_realized)
+
 
     lines = []
     lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode=="live" else " (realized)"))
@@ -7665,7 +7673,9 @@ async def _dash_loop(client):
             if PRESENCE_ENABLE:
                 eq = eq_now
                 day = float((st or {}).get("realized_usdt", 0.0))
-                ou = totals["upnl_usdt_sum"]
+
+                ou = float((totals or {}).get("upnl_usdt_sum", 0.0))
+
                 await client.change_presence(activity=discord.Activity(
                     type=discord.ActivityType.watching,
                     name=f"Eq ${eq:,.0f} | Day {day:+.0f} | Open {ou:+.0f}"
