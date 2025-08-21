@@ -5071,6 +5071,10 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     upnl_sum = 0.0
     # 포지션 소스: 페이퍼/실거래 공용 요약 유틸 사용 (프로젝트 내 존재). 없다면 PAPER_POS를 직접 순회.
     for pos in get_open_positions_iter():
+
+        if os.getenv("DASH_TRACE","0")=="1":
+            assert isinstance(pos, dict), f"gather() pos type={type(pos).__name__}"
+
         symbol = pos["symbol"]; tf = pos["tf"]
         entry  = float(pos.get("entry_price") or pos.get("entry") or 0.0)
         lev    = float(pos.get("lev") or 1.0)
@@ -7625,6 +7629,13 @@ async def _dash_render_text():
     st = _daily_state_load() or {}  # ← Nonesafe
     cap_realized = capital_get()
     rows, totals = await gather_positions_upnl()  # ← async 버전만 사용
+    if os.getenv("DASH_TRACE","0")=="1":
+        assert isinstance(st, dict), f"DASH st type={type(st).__name__}"
+        assert isinstance(totals, dict), f"DASH totals type={type(totals).__name__}"
+        assert isinstance(rows, list), f"DASH rows type={type(rows).__name__}"
+        bad = [(i, type(r).__name__) for i, r in enumerate(rows) if not isinstance(r, dict)]
+        if bad:
+            raise TypeError(f"DASH rows bad entries: {bad[:5]}")
 
 
     eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE","live") or "live").lower()
@@ -7672,11 +7683,20 @@ async def _dash_loop(client):
     if not DASHBOARD_ENABLE: return
     while True:
         try:
+            if os.getenv("DASH_TRACE","0")=="1":
+                log("[DASH:TRACE] enter loop")
             msg = await _dash_get_or_create_message(client)
+            if os.getenv("DASH_TRACE","0")=="1":
+                log(f"[DASH:TRACE] have_msg={bool(msg)}")
             txt, st, eq_now, totals = await _dash_render_text()
+            if os.getenv("DASH_TRACE","0")=="1":
+                log(f"[DASH:TRACE] render_ok types st={type(st).__name__}, totals={type(totals).__name__}")
             if msg:
                 await msg.edit(content=txt)
             if PRESENCE_ENABLE:
+
+                if os.getenv("DASH_TRACE","0")=="1":
+                    log("[DASH:TRACE] before presence")
 
                 eq  = float(eq_now)
                 day = float((st or {}).get("realized_usdt", 0.0))
@@ -7689,7 +7709,13 @@ async def _dash_loop(client):
                 )
 
         except Exception as e:
+            if os.getenv("DASH_TRACE","0")=="1":
+                import traceback
+                tb = traceback.format_exc()
+                log(f"[DASH][TRACE] stack:\n{tb}")
             log(f"[DASH] warn: {e}")
+            await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
+            continue
         await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
 
 
