@@ -4074,6 +4074,24 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=NEUTRAL")
         return
 
+    # [ADD] Kill-switch guard
+    if signal in ("BUY","SELL") and _panic_active():
+        log(f"[PANIC] skip entry {symbol} {tf} due to panic flag")
+        return
+
+    # [ADD] Daily limit guard (entry 차단)
+    if signal in ("BUY","SELL"):
+        ok, reason = _daily_limits_ok(capital_get())
+        if not ok:
+            log(f"[DAILY-LIMIT] skip entry {symbol} {tf}: {reason} -> action={DAILY_LIMIT_ACTION}")
+            if DAILY_LIMIT_ACTION == "pause":
+                await cmd_pause_all()
+            elif DAILY_LIMIT_ACTION == "panic":
+                _panic_on()
+                if PANIC_FORCE_CLOSE:
+                    await close_all_positions(reason="PANIC")
+            return
+
     # [ANCHOR: PROTECTIVE_CHECK_BEFORE_ENTRY]
     key = f"{symbol}|{tf}"
     pos = (PAPER_POS or {}).get(key)
@@ -4432,6 +4450,15 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
 
+
+    market_symbol = symbol
+    if ENFORCE_MARKET_RULES:
+        qty = _amount_to_precision(GLOBAL_EXCHANGE, market_symbol, qty) if TICK_ENFORCE else qty
+        px  = _price_to_precision(GLOBAL_EXCHANGE, market_symbol, float(last_price)) if TICK_ENFORCE else float(last_price)
+        if not _min_notional_ok(GLOBAL_EXCHANGE, market_symbol, px, qty):
+            log(f"[RULES] skip: notional {px*qty:.4f} < min")
+            return
+        last_price = px
 
     side = "LONG" if exec_signal == "BUY" else "SHORT"
 
@@ -5598,6 +5625,101 @@ def _hydrate_from_disk():
         log(f"[HYDRATE] warn: {e}")
 # [ANCHOR: HYDRATE_FROM_DISK_END]
 
+# === [ADD] Safety / Daily limits / Kill-switch (singleton) ===
+from datetime import datetime, timezone, timedelta
+import json, os, pathlib, math
+
+KILL_SWITCH_ENABLE   = os.getenv("KILL_SWITCH_ENABLE","1")=="1"
+PANIC_FLAG_PATH      = os.getenv("PANIC_FLAG_PATH","./data/panic.flag")
+PANIC_CANCEL_OPEN    = os.getenv("PANIC_CANCEL_OPEN_ORDERS","1")=="1"
+PANIC_FORCE_CLOSE    = os.getenv("PANIC_FORCE_CLOSE","0")=="1"
+
+DAILY_MAX_LOSS_USDT  = float(os.getenv("DAILY_MAX_LOSS_USDT","0") or 0)
+DAILY_MAX_LOSS_PCT   = float(os.getenv("DAILY_MAX_LOSS_PCT","0") or 0)
+DAILY_MAX_CLOSES     = int(os.getenv("DAILY_MAX_CLOSES","0") or 0)
+DAILY_LIMIT_ACTION   = (os.getenv("DAILY_LIMIT_ACTION","pause") or "pause").lower()
+DAILY_RESET_HOUR_KST = int(os.getenv("DAILY_RESET_HOUR_KST","9") or 9)
+
+ENFORCE_MARKET_RULES = os.getenv("ENFORCE_MARKET_RULES","1")=="1"
+MIN_NOTIONAL         = float(os.getenv("MIN_NOTIONAL","5") or 5)
+TICK_ENFORCE         = os.getenv("TICK_ENFORCE","1")=="1"
+
+TRADE_CSV_PATH       = os.getenv("TRADE_CSV_PATH","./logs/trades.csv")
+CAPITAL_CSV_PATH     = os.getenv("CAPITAL_CSV_PATH","./logs/capital_ledger.csv")
+
+DASHBOARD_ENABLE     = os.getenv("DASHBOARD_ENABLE","1")=="1"
+DASHBOARD_CHANNEL_ID = int(os.getenv("DASHBOARD_CHANNEL_ID","0") or 0)
+DASHBOARD_UPDATE_SEC = int(os.getenv("DASHBOARD_UPDATE_SEC","10") or 10)
+PRESENCE_ENABLE      = os.getenv("PRESENCE_ENABLE","1")=="1"
+
+def _kst_now():
+    return datetime.now(timezone.utc) + timedelta(hours=9)
+
+def _daily_key_kst(dt=None):
+    if dt is None: dt=_kst_now()
+    return dt.strftime("%Y-%m-%d")
+
+def _panic_active():
+    return KILL_SWITCH_ENABLE and os.path.exists(PANIC_FLAG_PATH)
+
+def _panic_on():
+    if not KILL_SWITCH_ENABLE: return
+    pathlib.Path(PANIC_FLAG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(PANIC_FLAG_PATH).write_text("1")
+
+def _panic_off():
+    try: os.remove(PANIC_FLAG_PATH)
+    except FileNotFoundError: pass
+
+_DAILY_STATE_PATH = "./data/daily_limits.json"
+
+def _daily_state_load():
+    try:
+        with open(_DAILY_STATE_PATH,"r",encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _daily_state_save(st):
+    pathlib.Path(_DAILY_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(_DAILY_STATE_PATH,"w",encoding="utf-8") as f:
+        json.dump(st,f,ensure_ascii=False,indent=2)
+
+def _daily_reset_if_needed(capital_now: float):
+    st = _daily_state_load()
+    key = _daily_key_kst()
+    want_hour = DAILY_RESET_HOUR_KST
+    last = st.get("key","")
+    last_hour = st.get("hour",want_hour)
+    if key != last or last_hour != want_hour:
+        st = {"key": key, "hour": want_hour, "realized_usdt": 0.0, "realized_pct": 0.0,
+              "closes": 0, "base_capital": capital_now}
+        _daily_state_save(st)
+    return st
+
+def _daily_register_close(pnl_usdt: float, capital_after: float):
+    st = _daily_state_load()
+    if not st: st = _daily_reset_if_needed(capital_after)
+    st["realized_usdt"] = float(st.get("realized_usdt",0.0)) + float(pnl_usdt)
+    base = float(st.get("base_capital", capital_after) or 1.0)
+    st["realized_pct"]  = (st["realized_usdt"] / base) * 100.0
+    st["closes"]        = int(st.get("closes",0)) + 1
+    _daily_state_save(st)
+    return st
+
+def _daily_limits_ok(capital_now: float) -> (bool, str):
+    st = _daily_reset_if_needed(capital_now)
+    loss_usdt = float(st.get("realized_usdt",0.0))
+    loss_pct  = float(st.get("realized_pct",0.0))
+    closes    = int(st.get("closes",0))
+    if DAILY_MAX_LOSS_USDT>0 and (-loss_usdt) >= DAILY_MAX_LOSS_USDT:
+        return False, f"daily loss(usdt) reached: {loss_usdt:.2f}"
+    if DAILY_MAX_LOSS_PCT>0 and (-loss_pct) >= DAILY_MAX_LOSS_PCT:
+        return False, f"daily loss(pct) reached: {loss_pct:.2f}%"
+    if DAILY_MAX_CLOSES>0 and closes >= DAILY_MAX_CLOSES:
+        return False, f"daily max closes reached: {closes}"
+    return True, ""
+
 # === Margin Switch Queue: 포지션/오더 때문에 실패한 마진 전환을 예약 ===
 MARGIN_Q_FILE = "logs/margin_switch_queue.json"
 MARGIN_Q = _load_json(MARGIN_Q_FILE, {})   # symbol -> {"target":"ISOLATED"/"CROSSED", "ts": "...", "retries": 0, "last_error": ""}
@@ -5621,6 +5743,35 @@ async def _cancel_all_orders(ex, symbol: str):
                 log(f"[FUT] cancel warn {symbol} id={o.get('id')}: {e}")
     except Exception as e:
         log(f"[FUT] fetch_open_orders warn {symbol}: {e}")
+
+async def cancel_all_open_orders():
+    ex = FUT_EXCHANGE
+    if not ex:
+        return
+    try:
+        symbols = set(FUT_POS.keys()) | {"BTC/USDT", "ETH/USDT"}
+        for sym in symbols:
+            await _cancel_all_orders(ex, sym)
+    except Exception as e:
+        log(f"[FUT] cancel_all_open_orders warn: {e}")
+
+async def close_all_positions(reason="PANIC"):
+    n = 0
+    for key, pos in list(PAPER_POS.items()):
+        try:
+            sym, tf = key.split("|",1)
+        except Exception:
+            continue
+        fallback = float(pos.get("entry_price",0.0))
+        await _paper_close(sym, tf, get_last_price(sym, fallback), reason)
+        n += 1
+    for tfk, sym in list(FUT_POS_TF.items()):
+        await futures_close_all(sym, tfk, reason=reason)
+        n += 1
+    if CLEAR_IDEMP_ON_CLOSEALL:
+        try: idem_clear_all()
+        except Exception: pass
+    return n
 
 async def _has_open_pos_or_orders(ex, symbol: str) -> bool:
     try:
@@ -6412,6 +6563,38 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
                 pnl_pct_val = ((float(exit_price)/float(entry_price))-1.0) * 100.0 * mult
             except Exception:
                 pnl_pct_val = None
+        realized_pnl_usdt = float(pnl_usdt or 0.0)
+        realized_pnl_pct = float(pnl_pct_val if pnl_pct_val is not None else 0.0)
+        st = _daily_register_close(pnl_usdt=realized_pnl_usdt, capital_after=capital_get())
+        try:
+            pathlib.Path(os.path.dirname(TRADE_CSV_PATH)).mkdir(parents=True, exist_ok=True)
+            new_file = not os.path.exists(TRADE_CSV_PATH)
+            with open(TRADE_CSV_PATH,"a",encoding="utf-8",newline="") as f:
+                import csv
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(["ymd","ts","symbol","tf","side","reason",
+                                "entry","exit","pnl_usdt","pnl_pct",
+                                "fee_est","slip_bp",
+                                "upnl_before","upnl_after",
+                                "equity_before","equity_after",
+                                "mae_pct","mfe_pct"])
+                w.writerow([
+                    _daily_key_kst(), _kst_now().isoformat(),
+                    symbol, tf, side, reason,
+                    round(entry_price,6), round(exit_price,6),
+                    round(realized_pnl_usdt,4), round(realized_pnl_pct,4),
+                    round(fee_est_usdt,4) if 'fee_est_usdt' in locals() else 0.0,
+                    round(slip_bps,2) if 'slip_bps' in locals() else 0.0,
+                    round(upnl_before,4) if 'upnl_before' in locals() else 0.0,
+                    round(upnl_after,4)  if 'upnl_after'  in locals() else 0.0,
+                    round(equity_before,4) if 'equity_before' in locals() else capital_get(),
+                    round(equity_after,4)  if 'equity_after'  in locals() else capital_get(),
+                    round(mae_pct,4) if 'mae_pct' in locals() else 0.0,
+                    round(mfe_pct,4) if 'mfe_pct' in locals() else 0.0
+                ])
+        except Exception as e:
+            log(f"[CSV] trade log warn: {e}")
         is_gain = (pnl_pct_val is not None and pnl_pct_val >= 0)
         emoji = "🟢" if is_gain else "🔴"
         label = "익절" if is_gain else "손절"
@@ -7008,6 +7191,89 @@ try:
 except Exception as e:
     log(f"[FUT] exchange init fail: {e}")
     FUT_EXCHANGE = None
+
+
+_DASHBOARD_STATE = {"msg_id": 0}
+
+async def _dash_channel(client):
+    ch_id = DASHBOARD_CHANNEL_ID or int(os.getenv("PNL_REPORT_CHANNEL_ID","0") or 0)
+    if not ch_id: return None
+    try: return await client.fetch_channel(ch_id)
+    except Exception: return None
+
+async def _dash_get_or_create_message(client):
+    ch = await _dash_channel(client)
+    if not ch: return None
+    if _DASHBOARD_STATE["msg_id"]:
+        try:
+            return await ch.fetch_message(_DASHBOARD_STATE["msg_id"])
+        except Exception:
+            _DASHBOARD_STATE["msg_id"] = 0
+    m = await ch.send("📊 initializing dashboard…")
+    _DASHBOARD_STATE["msg_id"] = m.id
+    return m
+
+def get_open_positions_summary():
+    out = []
+    try:
+        for key, pos in (PAPER_POS or {}).items():
+            try:
+                sym, tf = key.split("|",1)
+                side = str(pos.get("side","" )).upper()
+                qty = float(pos.get("qty") or 0.0)
+                entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                last = get_last_price(sym, entry)
+                pnl = ((last - entry) / entry * 100.0) if entry>0 else 0.0
+                out.append(f"{sym} {tf} {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl:+.2f}%")
+            except Exception:
+                continue
+        for sym, pos in (FUT_POS or {}).items():
+            try:
+                side = str(pos.get("side","" )).upper()
+                qty = float(pos.get("qty") or 0.0)
+                entry = float(pos.get("entry") or 0.0)
+                last = get_last_price(sym, entry)
+                pnl = ((last - entry) / entry * 100.0) if entry>0 else 0.0
+                out.append(f"{sym} FUT {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl:+.2f}%")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+def _dash_render_text():
+    st = _daily_state_load()
+    cap = capital_get()
+    lines = [
+        f"**Equity**: ${cap:,.2f}",
+        f"**Day PnL**: {st.get('realized_usdt',0):+.2f} USDT ({st.get('realized_pct',0):+.2f}%) | closes={st.get('closes',0)}",
+        "— open positions —"
+    ]
+    try:
+        for pos in get_open_positions_summary():
+            lines.append(pos)
+    except Exception:
+        lines.append("(no position)")
+    return "\n".join(lines)
+
+async def _dash_loop(client):
+    if not DASHBOARD_ENABLE: return
+    while True:
+        try:
+            msg = await _dash_get_or_create_message(client)
+            if msg:
+                await msg.edit(content=_dash_render_text())
+            if PRESENCE_ENABLE:
+                st = _daily_state_load()
+                eq = capital_get()
+                pnl = st.get("realized_usdt",0.0)
+                await client.change_presence(activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"Eq ${eq:,.0f} | Day {pnl:+.0f} USDT"
+                ))
+        except Exception as e:
+            log(f"[DASH] warn: {e}")
+        await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
 
 
 async def _sync_open_state_on_ready():
@@ -7955,6 +8221,8 @@ def _get_channel_or_skip(asset: str, tf: str):
 @client.event
 async def on_ready():
     log(f'✅ Logged in as {client.user}')
+    if DASHBOARD_ENABLE:
+        client.loop.create_task(_dash_loop(client))
 
     timeframes = ['15m', '1h', '4h', '1d']
 
@@ -8772,6 +9040,9 @@ async def _set_pause(symbol: str | None, tf: str | None, minutes: int | None):
             for tfx in ("15m", "1h", "4h", "1d"):
                 PAUSE_UNTIL[(symbol.upper(), tfx)] = until_ms
 
+async def cmd_pause_all():
+    await _set_pause("ALL", "ALL", None)
+
 
 @client.event
 async def on_message(message):
@@ -8881,6 +9152,42 @@ async def on_message(message):
             await message.channel.send(msg)
         except Exception as e:
             await message.channel.send(f"⚠️ cap reset 실패: {e}")
+        return
+
+    if content.startswith('!panic'):
+        _panic_on()
+        if PANIC_CANCEL_OPEN:
+            await cancel_all_open_orders()
+        if PANIC_FORCE_CLOSE:
+            await close_all_positions(reason="PANIC")
+        await message.channel.send("⛔ panic ON (entries blocked)")
+        return
+
+    if content.startswith('!unpanic'):
+        _panic_off()
+        await message.channel.send("✅ panic OFF")
+        return
+
+    if content.startswith('!limits'):
+        st = _daily_state_load()
+        await message.channel.send(
+            f"limits — realized: {st.get('realized_usdt',0):.2f} USDT ({st.get('realized_pct',0):.2f}%), "
+            f"closes: {st.get('closes',0)}, action={DAILY_LIMIT_ACTION}"
+        )
+        return
+
+    if content.startswith('!limit set'):
+        try:
+            _,_,k,v = content.split()
+            if k=='loss_usdt':
+                os.environ['DAILY_MAX_LOSS_USDT'] = str(float(v))
+            elif k=='loss_pct':
+                os.environ['DAILY_MAX_LOSS_PCT'] = str(float(v))
+            elif k=='closes':
+                os.environ['DAILY_MAX_CLOSES'] = str(int(v))
+            await message.channel.send(f"ok set {k}={v} (runtime)")
+        except Exception as e:
+            await message.channel.send(f"bad args: {e}")
         return
 
     # [ANCHOR: CONFIG_DUMP_HANDLER]
