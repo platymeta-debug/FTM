@@ -62,6 +62,7 @@ def capital_apply_realized_pnl(delta_usd: float, fees_usd: float = 0.0):
         return  # 실거래는 거래소 잔고 소스오브트루스
     _CAPITAL = float((_CAPITAL or 0.0) + float(delta_usd) - float(fees_usd))
 
+
 # [ANCHOR: ALLOC_UPNL_HELPERS_BEGIN]  << ADD NEW >>
 # --- env for allocation with UPNL ---
 ALLOC_USE_UPNL       = int(os.getenv("ALLOC_USE_UPNL", "0") or 0)
@@ -130,6 +131,7 @@ def planning_capital_for_allocation(exchange=None) -> tuple[float, float, float]
     plan = max(base + contrib_capped, 0.0)
     return float(base), float(contrib_capped), float(plan)
 # [ANCHOR: ALLOC_UPNL_HELPERS_END]
+
 
 def _refresh_exchange_capital(exchange=None) -> Optional[float]:
     """실거래 모드: 잔고에서 총자본 읽기 (거래소별 자유자재 응용)"""
@@ -5986,6 +5988,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             align_text = "-"
 
         # [ANCHOR: ENTRY_ALLOC_CALC]  << REPLACE BLOCK >>
+
         # 1) 계획자본 계산 (base, upnl 기여, planning)
         base_cap, upnl_contrib, plan_cap = planning_capital_for_allocation(exchange=GLOBAL_EXCHANGE)
 
@@ -5999,6 +6002,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
         notional  = None
         if eff_margin and base_margin > 0:
             use_frac = float(eff_margin) / float(base_margin)
+
         if eff_margin and lev_used:
             try:
                 notional = float(eff_margin) * int(lev_used)
@@ -6052,6 +6056,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
 
         # 배분 브레이크다운
         # ① 총자본 → TF배정
+
         if base_cap and alloc_pct is not None:
             lines.append(f"• 배분(1): 총자본 {_fmt_usd(base_cap)} → TF배정 {_fmt_usd(base_margin)} ({tf_pct:.2f}%)")
             if ALLOC_USE_UPNL and ALLOC_DEBUG:
@@ -6059,6 +6064,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
                 lines.append(
                     f"• 배분(1a): UPNL 기여({sign}) {_fmt_usd(abs(upnl_contrib))} → 계획자본 {_fmt_usd(plan_cap)}"
                 )
+
         elif base_margin:
             lines.append(f"• 배분(1): TF배정 {_fmt_usd(base_margin)}")
 
@@ -9072,7 +9078,9 @@ if __name__ == "__main__":
     exchange = GLOBAL_EXCHANGE
     capital_bootstrap(exchange)
     log(f"[BOOT] CAPITAL: source={CAPITAL_SOURCE}, base={capital_get(exchange=exchange):,.2f} {CAPITAL_EXCHANGE_CCY}")
+
     log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
+
     # [ANCHOR: BOOT_ENV_SUMMARY]
     try:
         log("[BOOT] ENV SUMMARY: "
