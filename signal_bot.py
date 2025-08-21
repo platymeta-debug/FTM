@@ -4855,7 +4855,9 @@ async def safe_price_hint(symbol:str):
     """
     snap = await _fetch_with_retry(get_price_snapshot, symbol)
 
+
     # ✅ None 가드 + 옵션 폴백
+
     if not isinstance(snap, dict):
         if os.getenv("PRICE_FALLBACK_ON_NONE", "1") == "1":
             try:
@@ -4863,6 +4865,7 @@ async def safe_price_hint(symbol:str):
                 last = float(df["close"].iloc[-1]) if hasattr(df, "iloc") and len(df) else 0.0
             except Exception:
                 last = 0.0
+
             return _sanitize_exit_price(symbol, last)
         return _sanitize_exit_price(symbol, 0.0)
 
@@ -4877,12 +4880,14 @@ async def safe_price_hint(symbol:str):
     if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and ((snap or {}).get("mark") == cand):
         last = (snap or {}).get("last")
         if last is not None:
+
             cand = float(last)
 
     clamped, bar = _sanitize_exit_price(symbol, float(cand or 0.0))
 
     # 이상치면 1회 재조회(✅ None 가드)
     if _outlier_guard(clamped, bar):
+
         snap2 = await _fetch_with_retry(get_price_snapshot, symbol)
         cand2 = float(((snap2 or {}).get("last") or (snap2 or {}).get("mid") or cand or 0.0))
         clamped, bar = _sanitize_exit_price(symbol, cand2)
