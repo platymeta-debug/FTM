@@ -4091,6 +4091,46 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 if PANIC_FORCE_CLOSE:
                     await close_all_positions(reason="PANIC")
             return
+    # [ANCHOR: REENTRY_GUARD_BEGIN]  << ADD >>
+    try:
+        key = (symbol, tf, "LONG" if exec_signal=="BUY" else "SHORT")
+        node = _REENTRY_MEM.get(str(key), {})
+        now = time.time()
+
+        side_block = float(node.get("side_block_until") or 0)
+        re_block_sec = int(os.getenv("REENTRY_SIDE_BLOCK_SEC","0") or 0)
+        if re_block_sec > 0 and now < side_block:
+            if int(os.getenv("REENTRY_DEBUG","0") or 0):
+                log(f"[REENTRY] skip same-side cooldown until {side_block:.0f} ({(side_block-now):.0f}s)")
+            return
+
+        min_away = float(os.getenv("REENTRY_MIN_PRICE_AWAY_PCT","0") or 0.0)
+        if min_away > 0 and node.get("last_exit_px"):
+            away = abs(float(last_price) - float(node["last_exit_px"])) / float(node["last_exit_px"]) * 100.0
+            if away < min_away:
+                if int(os.getenv("REENTRY_DEBUG","0") or 0):
+                    log(f"[REENTRY] skip: price away {away:.2f}% < {min_away:.2f}% (last_exit {node['last_exit_px']})")
+                return
+
+        min_d = float(os.getenv("REENTRY_MIN_SCORE_DELTA","0") or 0.0)
+        last_score = node.get("last_entry_score")
+        cur_score = EXEC_STATE.get(('score', symbol, tf))
+        if min_d > 0 and last_score is not None and cur_score is not None:
+            delta = float(cur_score) - float(last_score)
+            if delta < min_d:
+                if int(os.getenv("REENTRY_DEBUG","0") or 0):
+                    log(f"[REENTRY] skip: score delta {delta:.3f} < {min_d:.3f}")
+                return
+
+        if int(node.get("loss_streak") or 0) >= int(os.getenv("REENTRY_BLOCK_AFTER_N_LOSSES","0") or 0):
+            until = float(node.get("loss_block_until") or 0)
+            if now < until:
+                if int(os.getenv("REENTRY_DEBUG","0") or 0):
+                    log(f"[REENTRY] skip: loss-block until {until:.0f}")
+                return
+    except Exception as e:
+        log(f"[REENTRY] guard warn: {e}")
+    # [ANCHOR: REENTRY_GUARD_END]
 
     # [ANCHOR: PROTECTIVE_CHECK_BEFORE_ENTRY]
     key = f"{symbol}|{tf}"
@@ -4544,6 +4584,17 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
       ])
     if PAPER_CSV_OPEN_LOG:
         _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
+# [ANCHOR: REENTRY_ON_ENTRY_SUCCESS]  << ADD WHERE ORDER SUCCEEDS >>
+    try:
+        key = (symbol, tf, side)
+        node = _REENTRY_MEM.get(str(key), {})
+        ttl = time.time() + int(os.getenv("REENTRY_SIDE_BLOCK_SEC","0") or 0)
+        node["side_block_until"] = ttl
+        node["last_entry_score"] = float(EXEC_STATE.get(('score', symbol, tf)) or node.get("last_entry_score") or 0.0)
+        _REENTRY_MEM[str(key)] = node
+        reentry_state_save()
+    except Exception as e:
+        log(f"[REENTRY] on_entry warn: {e}")
 
 # [ANCHOR: POSITION_OPEN_HOOK]
     # --- Bracket legs state on open ---
@@ -4746,6 +4797,31 @@ async def capital_ledger_write(event: str, **kw):
     except Exception as e:
         log(f"[CAPITAL] ledger warn: {e}")
 # [ANCHOR: CAPITAL_PERSIST_BLOCK_END]
+
+# [ANCHOR: REENTRY_STATE_BEGIN]  << ADD NEW >>
+import time, pathlib, json
+
+REENTRY_STATE_PATH = "./data/reentry_state.json"
+_REENTRY_MEM = {}  # {(symbol, tf, side): {"last_exit_px":..., "last_entry_score":..., "side_block_until": ts, "loss_streak": int, "loss_block_until": ts}}
+
+def reentry_state_load():
+    global _REENTRY_MEM
+    try:
+        with open(REENTRY_STATE_PATH, "r", encoding="utf-8") as f:
+            _REENTRY_MEM = json.load(f)
+    except Exception:
+        _REENTRY_MEM = {}
+
+def reentry_state_save():
+    try:
+        pathlib.Path(REENTRY_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(REENTRY_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_REENTRY_MEM, f)
+    except Exception as e:
+        log(f"[REENTRY] save warn: {e}")
+
+reentry_state_load()
+# [ANCHOR: REENTRY_STATE_END]
 
 # [ANCHOR: RESILIENT_FETCHERS_BEGIN]  << ADD NEW >>
 import asyncio as _asyncio
@@ -5767,6 +5843,26 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
             await capital_save_state()
         except Exception as _e:
             log(f"[CAPITAL] on_close ledger/save warn: {_e}")
+        realized_pnl_usdt = net_usdt
+        # [ANCHOR: REENTRY_ON_CLOSE]  << ADD NEAR CLOSE LEDGER/SAVE >>
+        try:
+            key = (symbol, tf, side)
+            node = _REENTRY_MEM.get(str(key), {})
+            node["last_exit_px"] = float(exit_price)
+            node["last_entry_score"] = float(entry_score) if "entry_score" in locals() else float(node.get("last_entry_score") or 0.0)
+            if realized_pnl_usdt < 0:
+                streak = int(node.get("loss_streak") or 0) + 1
+                node["loss_streak"] = streak
+                if streak >= int(os.getenv("REENTRY_BLOCK_AFTER_N_LOSSES","0") or 0):
+                    ttl = time.time() + int(os.getenv("REENTRY_BLOCK_TTL_SEC","0") or 0)
+                    node["loss_block_until"] = ttl
+            else:
+                node["loss_streak"] = 0
+                node["loss_block_until"] = 0
+            _REENTRY_MEM[str(key)] = node
+            reentry_state_save()
+        except Exception as e:
+            log(f"[REENTRY] on_close warn: {e}")
         # IDEMP: allow re-entry after manual/forced close
         try: idem_clear_symbol_tf(symbol, tf)
         except Exception: pass
