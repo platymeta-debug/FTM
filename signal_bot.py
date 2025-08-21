@@ -1641,6 +1641,7 @@ neutral_info = {'15m': None, '1h': None, '4h': None, '1d': None}
 entry_data = {}       # (symbol, tf) -> dict(e.g., {"entry": float, ...})
 highest_price = {}    # (symbol, tf) -> float
 lowest_price = {}     # (symbol, tf) -> float
+trail_peak_roe = {}   # (symbol, tf) -> float
 
 # [ANCHOR: LAST_PRICE_GLOBALS]
 LAST_PRICE = {}  # symbol -> last/mark price cache
@@ -4142,7 +4143,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         if not _outlier_guard(clamped, bar1m):
             tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
             tr_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
-            ok_exit, reason, trig_px, dbg = _eval_exit(symbol, tf, side, entry, clamped, tp_price, sl_price, tr_eff, (symbol, tf))
+            lev = float(pos.get("lev") or 1.0)
+            op_ts = float(pos.get("opened_ts") or 0)/1000.0
+            ok_exit, reason, trig_px, dbg = _eval_exit(symbol, tf, side, entry, clamped, tp_price, sl_price, tr_eff, (symbol, tf), lev, op_ts)
             if ok_exit:
                 exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
                 info = await _paper_close(symbol, tf, exec_px, reason) if TRADE_MODE=="paper" else None
@@ -4618,6 +4621,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         else:
             lowest_price[k2] = entry_price
             highest_price.pop(k2, None)
+        trail_peak_roe[k2] = 0.0
     except Exception:
         pass
     previous_signal[(symbol, tf)] = exec_signal
@@ -4875,6 +4879,43 @@ async def safe_price_hint(symbol:str):
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
 
+# [ANCHOR: TRAIL_GUARDS_BEGIN]
+def _tf_map_get(env_key:str, tf:str, default:float) -> float:
+    raw = os.getenv(env_key, "")
+    try:
+        items = dict([p.split(":") for p in raw.split(",") if ":" in p])
+        val = float(items.get(tf, default))
+    except Exception:
+        val = float(default)
+    return val
+
+def _roe_pct(side:str, entry:float, last:float, lev:float) -> float:
+    chg = (last-entry)/entry*100.0
+    mult = 1.0 if side.upper()=="LONG" else -1.0
+    return chg*mult*float(lev or 1.0)
+
+def _arm_allowed(side:str, tf:str, entry:float, last:float, lev:float, opened_ts:float) -> bool:
+    arm_delta = _tf_map_get("TRAIL_ARM_DELTA_MIN_PCT_BY_TF", tf, 0.5)
+    if abs((last-entry)/entry*100.0) < arm_delta:
+        return False
+    if os.getenv("TRAIL_ONLY_AFTER_BREAK_EVEN","1")=="1":
+        if _roe_pct(side, entry, last, lev) <= 0.0:
+            return False
+    need_profit = _tf_map_get("TRAIL_MIN_PROFIT_PCT_BY_TF", tf, 0.0)
+    if need_profit > 0 and _roe_pct(side, entry, last, lev) < need_profit:
+        return False
+    hold_need = _tf_map_get("TRAIL_MIN_HOLD_SEC_BY_TF", tf, 0.0)
+    if hold_need > 0:
+        now = _dt.datetime.now(_dt.timezone.utc).timestamp()
+        if (now - float(opened_ts or now)) < hold_need:
+            return False
+    return True
+
+def _trail_priority_secondary() -> bool:
+    return (os.getenv("TRAIL_PRIORITY","secondary") or "secondary").lower() == "secondary"
+# [ANCHOR: TRAIL_GUARDS_END]
+
+
 # [ANCHOR: DASH_ADV_HELPERS_BEGIN]
 import json as _json, pathlib as _pathlib, math as _math
 
@@ -5001,7 +5042,6 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     """
     열린 포지션을 순회하며 1분봉 가드가 적용된 가격으로 UPNL/ROE를 계산, 합계/정렬 정보까지 반환
     returns (rows, totals)
-
       rows: [{symbol, tf, side, qty, entry, last, lev, upnl_usdt, upnl_pct_on_margin,
               notional, mae_pct, mfe_pct, dist_sl_pct, dist_tp_pct, riskbar, warn, fund}]
 
@@ -7126,6 +7166,7 @@ async def _auto_close_and_notify_eth(
     entry_data[key2]      = None
     highest_price[key2]   = None
     lowest_price[key2]    = None
+    trail_peak_roe[key2]  = None
 
 
 
@@ -7214,6 +7255,7 @@ async def _auto_close_and_notify_btc(
     entry_data[key2]      = None
     highest_price.pop(key2, None)
     lowest_price.pop(key2, None)
+    trail_peak_roe.pop(key2, None)
 
 
 
@@ -7455,6 +7497,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             else:
                 lowest_price[k2] = entry_price
                 highest_price.pop(k2, None)
+            trail_peak_roe[k2] = 0.0
         except Exception:
             pass
         previous_signal[(symbol, tf)] = 'BUY' if side == 'LONG' else 'SELL'
@@ -7791,54 +7834,76 @@ def _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev):
 def _eval_exit(symbol: str, tf: str, side: str,
                entry_price: float, last_price_hint: float,
                tp_price: float|None, sl_price: float|None,
-               tr_pct: float|None, key2: tuple):
+               tr_pct: float|None, key2: tuple,
+               lev: float = 1.0, opened_ts: float | None = None):
     """
 
     Returns: (should_exit: bool, reason: str, trigger_price: float, dbg: str)
     - Uses 1m bar and EXIT_EVAL_MODE (TOUCH | CLOSE)
     - Price is sanitized/clamped; outlier-guarded
-    - Trailing uses _compute_trail() (armed + base guard)
+    - Trailing is secondary to TP/SL and obeys arm guards
 
     """
     clamped, bar = _sanitize_exit_price(symbol, last_price_hint)
     if _outlier_guard(clamped, bar):
         return (False, "OUTLIER_SKIP", clamped, f"outlier>{OUTLIER_MAX_1M}")
-    # Compute trailing price with arming (helpers already enforce hp>=entry / lp<=entry)
-    trail_px, armed, base = _compute_trail(side, float(entry_price),
-                                           float(tr_pct) if tr_pct is not None else 0.0,
-                                           highest_price.get(key2), lowest_price.get(key2), tf)
-    # Select representative price for evaluation mode
+
     if EXIT_EVAL_MODE == "CLOSE":
         p = float(bar["close"])
-        hi, lo = float(bar["close"]), float(bar["close"])
-    else:  # TOUCH
+        hi = lo = p
+    else:
         p = clamped
         hi, lo = float(bar["high"]), float(bar["low"])
+
     sideU = str(side).upper()
-    tp_hit = sl_hit = tr_hit = False
+    tp_hit = sl_hit = False
     if sideU == "LONG":
         if tp_price: tp_hit = hi >= float(tp_price)
         if sl_price: sl_hit = lo <= float(sl_price)
-        if trail_px and armed: tr_hit = lo <= float(trail_px)
-    else:  # SHORT
+    else:
         if tp_price: tp_hit = lo <= float(tp_price)
         if sl_price: sl_hit = hi >= float(sl_price)
-        if trail_px and armed: tr_hit = hi >= float(trail_px)
 
-    # conflict resolution: SL > TRAIL > TP (more conservative first)
-    reason = None
-    if   sl_hit: reason = "SL"
-    elif tr_hit: reason = "TRAIL"
-    elif tp_hit: reason = "TP"
+    if tp_hit or sl_hit:
+        reason = "TP" if tp_hit else "SL"
+        trig = float(tp_price) if tp_hit else float(sl_price)
+        dbg = (f"1m ohlc=({bar['open']:.6f},{bar['high']:.6f},{bar['low']:.6f},{bar['close']:.6f}) "
+               f"p={p:.6f} clamp={clamped:.6f} tp={tp_price} sl={sl_price} tr={tr_pct}")
+        return (True, reason, trig, dbg)
+
+    if _trail_priority_secondary():
+        if not _arm_allowed(side, tf, entry_price, p, lev, opened_ts):
+            if os.getenv("REENTRY_DEBUG","0") == "1":
+                log(f"[TRAIL] skip arm: tf={tf} needΔ={_tf_map_get('TRAIL_ARM_DELTA_MIN_PCT_BY_TF',tf,0)} "
+                    f"needP={_tf_map_get('TRAIL_MIN_PROFIT_PCT_BY_TF',tf,0)} be={os.getenv('TRAIL_ONLY_AFTER_BREAK_EVEN','1')}")
+            return (False, "NONE", p, f"tp={tp_price} sl={sl_price} tr={tr_pct} arm=False")
+
+    tr_hit = False
+    apply_lev = os.getenv("APPLY_LEV_TO_TRAIL","1") == "1"
+    if apply_lev:
+        curr_roe = _roe_pct(side, entry_price, p, lev)
+        peak = trail_peak_roe.get(key2, curr_roe)
+        trail_peak_roe[key2] = max(peak, curr_roe)
+        retrace = trail_peak_roe[key2] - curr_roe
+        tr_hit = (float(tr_pct or 0.0) > 0) and (retrace >= float(tr_pct))
+        trail_px = p
+        armed = True
+        base = trail_peak_roe[key2]
+    else:
+        trail_px, armed, base = _compute_trail(side, float(entry_price),
+                                               float(tr_pct) if tr_pct is not None else 0.0,
+                                               highest_price.get(key2), lowest_price.get(key2), tf)
+        if sideU == "LONG":
+            if trail_px and armed: tr_hit = lo <= float(trail_px)
+        else:
+            if trail_px and armed: tr_hit = hi >= float(trail_px)
 
     dbg = (f"1m ohlc=({bar['open']:.6f},{bar['high']:.6f},{bar['low']:.6f},{bar['close']:.6f}) "
            f"p={p:.6f} clamp={clamped:.6f} armed={armed} base={base} "
            f"tp={tp_price} sl={sl_price} tr={tr_pct} trail_px={trail_px}")
-    if reason:
-
-        trig = (float(sl_price) if reason=="SL" else (float(trail_px) if reason=="TRAIL" else float(tp_price)))
-
-        return (True, reason, trig, dbg)
+    if tr_hit:
+        trig = trail_px
+        return (True, "TRAIL", trig, dbg)
     return (False, "NONE", p, dbg)
 
 
@@ -8710,7 +8775,9 @@ async def on_ready():
                         tp_price = pos.get("tp_price")
                         sl_price = pos.get("sl_price")
                         tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
-                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2)
+                        lev = float(pos.get("lev") or 1.0)
+                        op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
                             exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
                             if TRADE_MODE == "paper":
@@ -8755,7 +8822,9 @@ async def on_ready():
                     entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
                     tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
                     tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
-                    ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2)
+                    lev = float(pos.get("lev") or 1.0)
+                    op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                    ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                     log(f"[EXIT_CHECK] {symbol_eth} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
                     if ok_exit:
                         exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
@@ -8857,6 +8926,7 @@ async def on_ready():
                             # 🔹 포지션 오픈 시 트레일링 기준점도 진입가로 초기화
                             highest_price[key2] = price if signal == 'BUY' else None
                             lowest_price[key2]  = price if signal == 'SELL' else None
+                            trail_peak_roe[key2] = 0.0
 
 
                 # 수익률 계산
@@ -9104,7 +9174,9 @@ async def on_ready():
                         tp_price = pos.get("tp_price")
                         sl_price = pos.get("sl_price")
                         tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
-                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2)
+                        lev = float(pos.get("lev") or 1.0)
+                        op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
                             exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
                             if TRADE_MODE == "paper":
@@ -9157,7 +9229,9 @@ async def on_ready():
                     entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
                     tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
                     tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
-                    ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2)
+                    lev = float(pos.get("lev") or 1.0)
+                    op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                    ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                     log(f"[EXIT_CHECK] {symbol_btc} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
                     if ok_exit:
                         exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
@@ -9224,6 +9298,7 @@ async def on_ready():
                         entry_data[key2] = (price, now_str_btc)
                         highest_price[key2] = price
                         lowest_price[key2]  = price
+                        trail_peak_roe[key2] = 0.0
 
                 prev_entry2 = entry_data.get(key2)
                 if signal == previous and prev_entry2:
