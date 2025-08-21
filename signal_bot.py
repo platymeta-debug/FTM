@@ -4084,7 +4084,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 info = _paper_close(symbol, tf, exec_px, reason) if TRADE_MODE=="paper" else None
                 if info:
 
-                    await _notify_trade_exit(symbol, tf, side=info["side"], entry_price=info["entry_price"], exit_price=exec_px, reason=(reason or "TP/SL"), mode="paper", pnl_pct=info.get("pnl_pct"))
+                    await _notify_trade_exit(symbol, tf, side=info["side"], entry_price=info["entry_price"], exit_price=exec_px, reason=(reason or "TP/SL"), mode="paper", pnl_pct=info.get("pnl_pct"), qty=info.get("qty"), pnl_usdt=info.get("net_usdt"))
                 elif TRADE_MODE!="paper":
                     await futures_close_all(symbol, tf, exit_price=exec_px, reason=reason)
                 # 엔트리 대신 보호청산 했으므로 반환
@@ -4567,13 +4567,136 @@ def capital_get() -> float:
     """현재 총자본(페이퍼). 실거래는 추후 확장."""
     return float(_CAPITAL_RT or 0.0)
 
-def capital_apply_realized_pnl(delta_usd: float):
+
+def capital_apply_realized_pnl(delta_usd: float, fees_usd: float = 0.0):
     """실현손익을 총자본에 반영"""
     global _CAPITAL_RT
     try:
-        _CAPITAL_RT = float(( _CAPITAL_RT or 0.0 ) + float(delta_usd))
+        _CAPITAL_RT = float(( _CAPITAL_RT or 0.0 ) + float(delta_usd) - float(fees_usd))
     except Exception:
         pass
+
+# [ANCHOR: CAPITAL_PERSIST_BLOCK]  << ADD NEW >>
+import json, csv, os, datetime as _dt
+
+CAPITAL_PERSIST       = int(os.getenv("CAPITAL_PERSIST","1") or 1)
+CAPITAL_STATE_PATH    = os.getenv("CAPITAL_STATE_PATH","./data/capital_state.json")
+CAPITAL_LEDGER_CSV    = os.getenv("CAPITAL_LEDGER_CSV","./data/capital_ledger.csv")
+CAPITAL_LEDGER_ENABLE = int(os.getenv("CAPITAL_LEDGER_ENABLE","1") or 1)
+CAPITAL_LEDGER_APPEND_HEADERS = int(os.getenv("CAPITAL_LEDGER_APPEND_HEADERS","1") or 1)
+
+CAP_RESET_ALLOW = int(os.getenv("CAP_RESET_ALLOW","1") or 1)
+CAP_RESET_MIN   = float(os.getenv("CAP_RESET_MIN","0") or 0.0)
+CAP_RESET_LOG   = int(os.getenv("CAP_RESET_LOG","1") or 1)
+
+def _ensure_parent_dir(path: str):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except Exception:
+        pass
+
+def capital_save_state():
+    """현재 총자본을 json 상태 파일에 저장"""
+    try:
+        if not CAPITAL_PERSIST:
+            return
+        _ensure_parent_dir(CAPITAL_STATE_PATH)
+        with open(CAPITAL_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"capital": capital_get(), "ts": _dt.datetime.utcnow().isoformat()+"Z"}, f)
+    except Exception as e:
+        log(f"[CAPITAL] save_state warn: {e}")
+
+def capital_load_state():
+    """재시작 시 마지막 자본 복원"""
+    global _CAPITAL_RT
+    if not CAPITAL_PERSIST:
+        return
+    try:
+        if os.path.isfile(CAPITAL_STATE_PATH):
+            with open(CAPITAL_STATE_PATH, "r", encoding="utf-8") as f:
+                obj = json.load(f)
+            val = float(obj.get("capital", CAPITAL_BASE))
+            _CAPITAL_RT = val
+            log(f"[CAPITAL] restored: {val:,.2f} from {CAPITAL_STATE_PATH}")
+    except Exception as e:
+        log(f"[CAPITAL] load_state warn: {e}")
+
+def _csv_append(path: str, headers: list[str], row: dict):
+    """헤더 보장 + append"""
+    try:
+        _ensure_parent_dir(path)
+        write_header = CAPITAL_LEDGER_APPEND_HEADERS and (not os.path.isfile(path) or os.path.getsize(path)==0)
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=headers)
+            if write_header:
+                w.writeheader()
+            w.writerow(row)
+    except Exception as e:
+        log(f"[CSV] append warn: {path}: {e}")
+
+def capital_ledger_write(event: str, **kw):
+    """
+    자본 원장에 한 줄 기록. event 예: CLOSE, RESET, DEPOSIT, WITHDRAW
+    kw: symbol, tf, side, reason, entry_price, exit_price, qty, gross_usdt, fees_usdt, net_usdt, capital_after
+    """
+    if not CAPITAL_LEDGER_ENABLE:
+        return
+    try:
+        now = _dt.datetime.utcnow().replace(tzinfo=_dt.timezone.utc).isoformat()
+        row = {
+            "ts_utc": now,
+            "event": event,
+            "capital_after": f"{capital_get():.8f}",
+        }
+        for k,v in kw.items():
+            row[k] = v
+        headers = ["ts_utc","event","symbol","tf","side","reason",
+                   "entry_price","exit_price","qty","gross_usdt","fees_usdt","net_usdt","capital_after"]
+        _csv_append(CAPITAL_LEDGER_CSV, headers, row)
+    except Exception as e:
+        log(f"[CAPITAL] ledger warn: {e}")
+# [ANCHOR: CAPITAL_PERSIST_BLOCK_END]
+
+# [ANCHOR: CONFIG_DUMP_HELPERS]  << ADD NEW (TOP-LEVEL FUNCS) >>
+CONFIG_DUMP_MODE = os.getenv("CONFIG_DUMP_MODE","chunk").lower()  # chunk | file
+CONFIG_CHUNK_LEN = int(os.getenv("CONFIG_CHUNK_LEN","1800") or 1800)
+CONFIG_FILENAME  = os.getenv("CONFIG_FILENAME","config_dump.txt")
+
+def _build_config_dump_text() -> str:
+    # 필요한 항목만 골라 가독성 있게 출력
+    lines = []
+    lines.append("[RUNTIME]")
+    lines.append(f"TRADE_MODE={TRADE_MODE}, EXCHANGE_ID={EXCHANGE_ID}, HEDGE_MODE={HEDGE_MODE}")
+    lines.append(f"EXIT_EVAL_MODE={os.getenv('EXIT_EVAL_MODE')}, EXIT_FILL_MODE={os.getenv('EXIT_FILL_MODE')}, OUTLIER_MAX_1M={os.getenv('OUTLIER_MAX_1M')}")
+    lines.append(f"CAPITAL_BASE={CAPITAL_BASE}, CAPITAL={capital_get():.2f}, PERSIST={CAPITAL_PERSIST}")
+    lines.append(f"ALLOC_BY_TF={os.getenv('ALLOC_BY_TF')}")
+    lines.append(f"LEVERAGE_BY_SYMBOL={os.getenv('LEVERAGE_BY_SYMBOL')}")
+    lines.append(f"SLIPPAGE_PCT={os.getenv('SLIPPAGE_PCT')}, SLIPPAGE_BY_SYMBOL={os.getenv('SLIPPAGE_BY_SYMBOL')}")
+    lines.append(f"TP/SL/TR BY SYMBOL={os.getenv('TP_PCT_BY_SYMBOL')} | {os.getenv('SL_PCT_BY_SYMBOL')} | {os.getenv('TRAIL_PCT_BY_SYMBOL')}")
+    lines.append("")
+    return "\n".join(lines)
+
+async def _send_long_text_or_file(ch, text: str, fname: str):
+    if CONFIG_DUMP_MODE == "file" or len(text) > 1900 and CONFIG_DUMP_MODE != "chunk":
+        try:
+            _ensure_parent_dir(f"./data/{fname}")
+        except Exception:
+            pass
+        path = f"./data/{fname}"
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        await ch.send(file=discord.File(path, filename=fname))
+        return
+    if len(text) <= CONFIG_CHUNK_LEN:
+        await ch.send(f"```{text}```")
+        return
+    i = 0
+    n = len(text)
+    while i < n:
+        chunk = text[i:i+CONFIG_CHUNK_LEN]
+        await ch.send(f"```{chunk}```")
+        i += CONFIG_CHUNK_LEN
+
 
 def _ema_update(x: float, alpha: float) -> float:
     global _UPNL_EMA_VAL
@@ -5253,16 +5376,21 @@ def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = "")
     qty = float(pos.get("qty") or 0.0)
     side_up = 1 if str(side).upper()=="LONG" else -1
     gross_usdt = (float(exit_price) - float(entry)) * qty * side_up
-    # 수수료(bps): (진입+청산) 왕복. 동적 조회 실패시 폴백 사용
+
     fee_bps = _fee_bps(order_type="MARKET", ex=None, symbol=symbol)
     fees_usdt = _fee_usdt(entry, qty, fee_bps) + _fee_usdt(exit_price, qty, fee_bps)
     net_usdt = gross_usdt - fees_usdt
 
-    # 총자본 업데이트(페이퍼)
+
+    before_cap = capital_get()
     try:
-        capital_apply_realized_pnl(net_usdt)
+        capital_apply_realized_pnl(gross_usdt, fees_usdt)
     except Exception as _e:
         log(f"[CAPITAL] apply pnl warn: {symbol} {tf}: {_e}")
+    after_cap = capital_get()
+    delta_cap = after_cap - before_cap
+    delta_pct = (delta_cap / before_cap * 100.0) if before_cap > 0 else 0.0
+
     # CSV: paper CLOSE
     try:
         if PAPER_CSV_CLOSE_LOG:
@@ -5279,10 +5407,26 @@ def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = "")
 
     except Exception as e:
         log(f"[CSV_CLOSE_WARN] paper {symbol} {tf}: {e}")
+
+    # [ANCHOR: PAPER_CLOSE_AND_NOTIFY_LEDGER]
+    try:
+        capital_ledger_write(
+            "CLOSE",
+            symbol=symbol, tf=tf, side=side, reason=(exit_reason or ""),
+            entry_price=f"{entry:.8f}", exit_price=f"{exit_price:.8f}",
+            qty=f"{qty:.8f}",
+            gross_usdt=f"{gross_usdt:.8f}", fees_usdt=f"{fees_usdt:.8f}", net_usdt=f"{net_usdt:.8f}",
+            capital_after=f"{after_cap:.8f}",
+        )
+        capital_save_state()
+    except Exception as _e:
+        log(f"[CAPITAL] on_close ledger/save warn: {_e}")
     # IDEMP: allow re-entry after manual/forced close
     try: idem_clear_symbol_tf(symbol, tf)
     except Exception: pass
-    return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty}
+
+    return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty, "net_usdt": net_usdt}
+
 
 # [ANCHOR: PAPER_PARTIAL_CLOSE_BEGIN]
 def _paper_reduce(symbol: str, tf: str, reduce_qty: float, exit_price: float):
@@ -6115,7 +6259,10 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
                              mode: str,          # 'futures'|'spot'|'paper'
                              pnl_pct: float | None = None,
                              qty: float | None = None,
-                             status: str | None = None):
+
+                             status: str | None = None,
+                             pnl_usdt: float | None = None):
+
     try:
         cid = _get_trade_channel_id(symbol, tf)
         if not cid:
@@ -6153,11 +6300,15 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
 
         # [ANCHOR: PAPER_CLOSE_AND_NOTIFY]
 
-        # 총자본 표시(종결 이후)
         if ALERT_SHOW_CAPITAL:
             after_cap = capital_get()
             tail = (f" [Planner: {PLANNER_ID}]" if PLANNER_ID else "")
-            lines.append(f"• 총자본(종결후): {_fmt_usd(after_cap)}{tail}")
+            if pnl_usdt is not None:
+                before_cap = after_cap - float(pnl_usdt)
+                delta_pct = (float(pnl_usdt) / before_cap * 100.0) if before_cap > 0 else 0.0
+                lines.append(f"• 총자본(종결후): {_fmt_usd(after_cap)} | 변화: {_fmt_usd(pnl_usdt)} ({delta_pct:+.2f}%){tail}")
+            else:
+                lines.append(f"• 총자본(종결후): {_fmt_usd(after_cap)}{tail}")
 
 
         # [ANCHOR: EXIT_NOTIFY_TAIL]
@@ -6299,6 +6450,8 @@ async def _auto_close_and_notify_eth(
                     mode="paper",
                     pnl_pct=info.get("pnl_pct"),
                     qty=info.get("qty"),
+                    pnl_usdt=info.get("net_usdt"),
+
                 )
             except Exception as e:
                 log(f"[NOTIFY] paper exit warn {symbol_eth} {tf}: {e}")
@@ -6395,6 +6548,8 @@ async def _auto_close_and_notify_btc(
                     mode="paper",
                     pnl_pct=info.get("pnl_pct"),
                     qty=info.get("qty"),
+                    pnl_usdt=info.get("net_usdt"),
+
                 )
             except Exception as e:
                 log(f"[NOTIFY] paper exit warn {symbol} {tf}: {e}")
@@ -7834,7 +7989,8 @@ async def on_ready():
                                         exit_price=exec_px,
                                         reason=reason, mode="paper",
                                         pnl_pct=info.get("pnl_pct"),
-                                        qty=info.get("qty")
+                                        qty=info.get("qty"),
+                                        pnl_usdt=info.get("net_usdt")
                                     )
                             else:
                                 await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=reason)
@@ -7880,7 +8036,8 @@ async def on_ready():
                                     symbol_eth, tf,
                                     side=info['side'], entry_price=info['entry_price'],
                                     exit_price=exec_px, reason=exit_reason, mode='paper',
-                                    pnl_pct=info.get('pnl_pct'), qty=info.get('qty')
+
+                                    pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt')
                                 )
 
                         else:
@@ -8226,7 +8383,8 @@ async def on_ready():
                                         entry_price=info["entry_price"],
                                         exit_price=exec_px,
                                         reason=reason, mode="paper",
-                                        pnl_pct=info.get("pnl_pct")
+                                        pnl_pct=info.get("pnl_pct"), qty=info.get("qty"), pnl_usdt=info.get("net_usdt")
+
                                     )
                             else:
                                 await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=reason)
@@ -8273,7 +8431,8 @@ async def on_ready():
                         if TRADE_MODE=='paper':
                             info = _paper_close(symbol_btc, tf, float(trig_px), exit_reason)
                             if info:
-                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'))
+                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+
                         else:
                             await futures_close_all(symbol_btc, tf, exit_price=float(trig_px), reason=exit_reason)
                         continue
@@ -8570,6 +8729,41 @@ async def on_message(message):
             await message.channel.send(f"▶ resumed {sym} {tfx}")
         except Exception as e:
             await message.channel.send(f"⚠️ resume error: {e}")
+        return
+
+    # [ANCHOR: DISCORD_CMD_CAP_RESET]
+    if content.lower().startswith("!cap reset") and CAP_RESET_ALLOW:
+        try:
+            parts = content.split()
+            amount = None
+            if len(parts) >= 3:
+                amount = float(parts[2])
+                if amount < CAP_RESET_MIN:
+                    await message.channel.send(f"⚠️ 최소 리셋 금액({CAP_RESET_MIN}) 미만입니다.")
+                    return
+            else:
+                amount = float(CAPITAL_BASE)
+
+            before = capital_get()
+            global _CAPITAL_RT
+            _CAPITAL_RT = float(amount)
+            capital_save_state()
+            if CAP_RESET_LOG:
+                capital_ledger_write("RESET", capital_after=f"{capital_get():.8f}")
+
+            msg = f"🔄 CAPITAL RESET: {before:,.2f} → {capital_get():,.2f}"
+            await message.channel.send(msg)
+        except Exception as e:
+            await message.channel.send(f"⚠️ cap reset 실패: {e}")
+        return
+
+    # [ANCHOR: CONFIG_DUMP_HANDLER]
+    if content.startswith("!config"):
+        try:
+            dump = _build_config_dump_text()
+            await _send_long_text_or_file(message.channel, dump, CONFIG_FILENAME)
+        except Exception as e:
+            await message.channel.send(f"⚠️ config dump 실패: {e}")
         return
 
     # [ANCHOR: CMD_CLOSE_CLOSEALL]
@@ -9095,7 +9289,8 @@ def _reload_runtime_parsed_maps():
 if __name__ == "__main__":
     exchange = GLOBAL_EXCHANGE
 
-    log(f"[BOOT] CAPITAL: source={CAPITAL_SOURCE}, base={capital_get():,.2f}")
+    capital_load_state()
+    log(f"[BOOT] CAPITAL: restored={int(bool(CAPITAL_PERSIST))} base={CAPITAL_BASE:,.2f} now={capital_get():,.2f}")
     log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
 
     # [ANCHOR: BOOT_ENV_SUMMARY]
