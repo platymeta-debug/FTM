@@ -4851,30 +4851,42 @@ async def _fetch_with_retry(fn, *args, **kwargs):
 
 async def safe_price_hint(symbol:str):
     """
-    스냅샷 후보 우선순위 → 값 선택 → (필요 시) 1m 캔들로 클램프 + 이상치 가드 반영
+    스냅샷 후보 우선순위 → 값 선택 → (필요 시) 1m 캔들로 클램프 + 이상치 가드
     """
-    snap = await _fetch_with_retry(get_price_snapshot, symbol)
-    # 후보 선정
+    snap = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
+
+    # ✅ None 가드 + 옵션 폴백
+    if not isinstance(snap, dict) or not snap:
+        if os.getenv("PRICE_FALLBACK_ON_NONE", "1") == "1":
+            try:
+                df = get_ohlcv(symbol, "1m", limit=1)
+                last = float(df["close"].iloc[-1]) if hasattr(df, "iloc") and len(df) else 0.0
+            except Exception:
+                last = 0.0
+            return _sanitize_exit_price(symbol, last)
+        return _sanitize_exit_price(symbol, 0.0)
+
+    # 후보 가격 선택
     cand = None
     for k in PRICE_FALLBACK_ORDER:
         v = snap.get(k)
-        if v:
-            cand = float(v)
-            break
-    # mark는 직접 트리거 금지 → last가 있으면 그 범위로 한 번 더 제한
+        if v is not None:
+            cand = float(v); break
+
+    # mark 직접사용 제한 → last 있으면 last로 클램프
     if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and (snap.get("mark") == cand):
         last = snap.get("last")
-        if last:
-            # last로 한 번 더 가드
+        if last is not None:
             cand = float(last)
 
-    # 1분봉 바운드/이상치 처리
     clamped, bar = _sanitize_exit_price(symbol, float(cand or 0.0))
+
+    # 이상치면 1회 재조회(✅ None 가드)
     if _outlier_guard(clamped, bar):
-        # 이상치면 한 번 더 재조회 시도
-        snap2 = await _fetch_with_retry(get_price_snapshot, symbol)
+        snap2 = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
         cand2 = float(snap2.get("last") or snap2.get("mid") or cand or 0.0)
         clamped, bar = _sanitize_exit_price(symbol, cand2)
+
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
@@ -5050,16 +5062,15 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     rows: List[Dict] = []
     upnl_sum = 0.0
     # 포지션 소스: 페이퍼/실거래 공용 요약 유틸 사용 (프로젝트 내 존재). 없다면 PAPER_POS를 직접 순회.
-    positions = get_open_positions_iter()  # 없는 경우, 기존 요약 루틴/저장소 조회 함수로 대체
-
-    for pos in positions:
+    for pos in get_open_positions_iter():
         symbol = pos["symbol"]; tf = pos["tf"]
-        side = pos["side"]; qty = float(pos["qty"])
-        entry = float(pos["entry_price"])
-        lev = float(pos.get("lev") or 1.0)
+        entry  = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+        lev    = float(pos.get("lev") or 1.0)
+        side   = pos.get("side","").upper()
+        qty    = float(pos.get("qty") or 0.0)
 
-        # 1m 바운드/이상치 가드를 거친 안전 가격
-        last, _bar = await safe_price_hint(symbol)
+        # ✅ 실시간가 힌트(1m 가드/폴백 포함)
+        last, bar1m = await safe_price_hint(symbol)
 
         upnl = _pnl_usdt(side, entry, last, qty)
         roe_pct = _pnl_pct_on_margin(side, entry, last, lev)
@@ -7559,8 +7570,18 @@ async def _dash_get_or_create_message(client):
 def get_open_positions_iter():
     """Yield unified open position dicts from paper/futures stores."""
     out = []
+    paper = PAPER_POS or {}
+    fut   = FUT_POS or {}
+    if not paper and not fut:
+        # 디스크/거래소 하이드레이션이 늦는 경우를 대비한 1회 폴백
+        try:
+            _hydrate_from_disk()
+            paper = PAPER_POS or {}
+            fut   = FUT_POS or {}
+        except Exception:
+            pass
     try:
-        for key, pos in (PAPER_POS or {}).items():
+        for key, pos in paper.items():
             try:
                 sym, tf = key.split("|", 1)
                 out.append({
@@ -7573,7 +7594,7 @@ def get_open_positions_iter():
                 })
             except Exception:
                 continue
-        for sym, pos in (FUT_POS or {}).items():
+        for sym, pos in fut.items():
             try:
                 out.append({
                     "symbol": sym,
@@ -7590,32 +7611,32 @@ def get_open_positions_iter():
     return out
 
 async def _dash_render_text():
-    st = _daily_state_load()
-    cap_realized = capital_get()          # 실현 총자본
-    rows, totals = await gather_positions_upnl()
+    st = _daily_state_load() or {}  # ← Nonesafe
+    cap_realized = capital_get()
+    rows, totals = await gather_positions_upnl()  # ← async 버전만 사용
 
-    # live equity 모드: 실현 + UPNL 합산
     eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE","live") or "live").lower()
     if eq_mode == "live":
-        eq_now = cap_realized + totals["upnl_usdt_sum"]
+        eq_now = float(cap_realized) + float((totals or {}).get("upnl_usdt_sum", 0.0))
     else:
-        eq_now = cap_realized
+        eq_now = float(cap_realized)
 
     lines = []
     lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode=="live" else " (realized)"))
     lines.append(f"Day PnL: {st.get('realized_usdt',0):+.2f} USDT ({st.get('realized_pct',0):+.2f}%) | closes={st.get('closes',0)}")
 
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL","1")=="1":
-        lines.append(f"Open UPNL: {totals['upnl_usdt_sum']:+.2f} USDT ({totals['upnl_pct_on_equity']:+.2f}% of equity)")
+        lines.append(
+            f"Open UPNL: {float((totals or {}).get('upnl_usdt_sum',0.0)):+.2f} USDT "
+            f"({float((totals or {}).get('upnl_pct_on_equity',0.0)):+.2f}% of equity)"
+        )
         lines.append(f"Open UPNL Detail: {len(rows)} pos | sort={os.getenv('DASHBOARD_SORT')}")
-
 
     lines.append("— open positions —" if rows else "— no open positions —")
 
     show_usdt = os.getenv("DASHBOARD_SHOW_POS_USDT","1")=="1"
     show_mae = DASHBOARD_MAE_MFE
     show_risk = DASHBOARD_RISK_BAR
-
 
     for r in rows:
         base = (f"{r['symbol']} {r['tf']} {r['side']} {r['qty']:.4f} @ {r['entry']:.2f} "
@@ -7628,10 +7649,7 @@ async def _dash_render_text():
             base += f" {r.get('riskbar','')}"
             base += f" SL {r['dist_sl_pct']:.2f}% · TP {r['dist_tp_pct']:.2f}%"
             base += r.get('warn','')
-        # 펀딩
         base += r.get('fund','')
-
-
         lines.append(base)
 
     return "\n".join(lines), st, eq_now, totals
@@ -7646,13 +7664,15 @@ async def _dash_loop(client):
             if msg:
                 await msg.edit(content=txt)
             if PRESENCE_ENABLE:
-                eq = eq_now
-                day = st.get("realized_usdt",0.0)
-                ou = totals["upnl_usdt_sum"]
-                await client.change_presence(activity=discord.Activity(
-                    type=discord.ActivityType.watching,
-                    name=f"Eq ${eq:,.0f} | Day {day:+.0f} | Open {ou:+.0f}"
-                ))
+                eq  = float(eq_now)
+                day = float((st or {}).get("realized_usdt", 0.0))
+                ou  = float((totals or {}).get("upnl_usdt_sum", 0.0))
+                await client.change_presence(
+                    activity=discord.Activity(
+                        type=discord.ActivityType.watching,
+                        name=f"Eq ${eq:,.0f} | Day {day:+.0f} | Open {ou:+.0f}"
+                    )
+                )
         except Exception as e:
             log(f"[DASH] warn: {e}")
         await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
