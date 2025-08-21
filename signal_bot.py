@@ -23,7 +23,6 @@ from collections import defaultdict
 
 
 
-
 # [ANCHOR: RUNTIME_CFG_DECL]
 RUNTIME_CFG = {}  # overlay store: key -> raw string
 
@@ -4071,36 +4070,25 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     pos = (PAPER_POS or {}).get(key)
     if pos:
         side  = str(pos.get("side", "")).upper()
-        entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-
-        # 1) 현재가 힌트 수집 (mark 허용하되, '직접 트리거'는 금지하고 클램핑에만 사용)
+        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
         snap_curr = await get_price_snapshot(symbol)
-        curr_hint = (snap_curr.get("last")
-                     or snap_curr.get("mid")
-                     or snap_curr.get("mark")
-                     or last_price)
-
-        # 2) 1분봉 기준 클램핑 & 이상치 가드
-        clamped, bar = _sanitize_exit_price(symbol, last_hint=float(curr_hint or 0.0))
-        if _outlier_guard(clamped, bar):
-            log(f"[PROTECT] skip minute(outlier): {symbol} {tf}")
-        else:
-            # 3) TOUCH 모드의 통합 종료평가 (보호체크 전용, TRAIL은 무시)
-            hit, reason, trig_px = _eval_exit_touch(side=side, entry=entry, tf=tf, bar=bar)
-            if hit:
-                exec_px = _choose_exec_price(reason, side, trig_px, bar)
-                info = _paper_close(symbol, tf, exec_px)
+        curr = (snap_curr.get("last") or snap_curr.get("mid") or snap_curr.get("mark") or last_price)
+        last_hint = float(curr or last_price)
+        clamped, bar1m = _sanitize_exit_price(symbol, last_hint)
+        if not _outlier_guard(clamped, bar1m):
+            tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
+            tr_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+            ok_exit, reason, trig_px, dbg = _eval_exit(symbol, tf, side, entry, clamped, tp_price, sl_price, tr_eff, (symbol, tf))
+            if ok_exit:
+                exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+                info = _paper_close(symbol, tf, exec_px, reason) if TRADE_MODE=="paper" else None
                 if info:
-                    await _notify_trade_exit(
-                        symbol, tf,
-                        side=info["side"],
-                        entry_price=info["entry_price"],
-                        exit_price=exec_px,
-                        reason=(reason or "TP/SL"),
-                        mode="paper",
-                        pnl_pct=info.get("pnl_pct"),
-                        qty=info.get("qty")
-                    )
+
+                    await _notify_trade_exit(symbol, tf, side=info["side"], entry_price=info["entry_price"], exit_price=exec_px, reason=(reason or "TP/SL"), mode="paper", pnl_pct=info.get("pnl_pct"))
+                elif TRADE_MODE!="paper":
+                    await futures_close_all(symbol, tf, exit_price=exec_px, reason=reason)
+                # 엔트리 대신 보호청산 했으므로 반환
+
                 return
         log(f"⏭ {symbol} {tf}: open pos exists → skip new entry")
         log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
@@ -7820,17 +7808,38 @@ async def on_ready():
                 k = f"{symbol_eth}|{tf}"
                 pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_eth) if TRADE_MODE == "futures" else None)
                 if pos:
-                    side = pos.get("side")
+                    side = str(pos.get("side", "")).upper()
                     entry = float(pos.get("entry_price") or pos.get("entry") or 0)
-                    hit, reason = _eval_tp_sl(side, entry, float(snap.get("mark") or last_price), tf)
-                    if hit:
-                        if TRADE_MODE == "paper":
-                            info = _paper_close(symbol_eth, tf, last_price, reason)
-                            if info:
-                                await _notify_trade_exit(symbol_eth, tf, side=info["side"], entry_price=info["entry_price"], exit_price=last_price, reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"), qty=info.get("qty"))
-                        elif TRADE_MODE == "futures":
-                            await futures_close_all(symbol_eth, tf, exit_price=last_price, reason=reason)
-                        continue
+
+                    # 틱 힌트를 1분봉으로 클램프
+                    last_hint = float(snap.get("mark") or last_price)
+                    clamped, bar1m = _sanitize_exit_price(symbol_eth, last_hint)
+                    # 이상치면 무시
+                    if _outlier_guard(clamped, bar1m):
+                        pass
+                    else:
+                        tp_price = pos.get("tp_price")
+                        sl_price = pos.get("sl_price")
+                        tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2)
+                        if ok_exit:
+                            exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+                            if TRADE_MODE == "paper":
+                                info = _paper_close(symbol_eth, tf, exec_px, reason)
+                                if info:
+                                    await _notify_trade_exit(
+                                        symbol_eth, tf,
+                                        side=info["side"],
+                                        entry_price=info["entry_price"],
+                                        exit_price=exec_px,
+                                        reason=reason, mode="paper",
+                                        pnl_pct=info.get("pnl_pct"),
+                                        qty=info.get("qty")
+                                    )
+                            else:
+                                await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=reason)
+                            continue
+
 
 
                 # Use 1m bar extremes to update trailing baselines (never raw ticks)
@@ -7860,12 +7869,22 @@ async def on_ready():
                     log(f"[EXIT_CHECK] {symbol_eth} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
                     if ok_exit:
                         exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
+                        # 1분봉 바운드 체결가 계산
+                        _bar = _fetch_recent_bar_1m(symbol_eth)
+                        exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
                         if TRADE_MODE=='paper':
-                            info = _paper_close(symbol_eth, tf, float(trig_px), exit_reason)
+                            info = _paper_close(symbol_eth, tf, exec_px, exit_reason)
                             if info:
-                                await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'))
+
+                                await _notify_trade_exit(
+                                    symbol_eth, tf,
+                                    side=info['side'], entry_price=info['entry_price'],
+                                    exit_price=exec_px, reason=exit_reason, mode='paper',
+                                    pnl_pct=info.get('pnl_pct'), qty=info.get('qty')
+                                )
+
                         else:
-                            await futures_close_all(symbol_eth, tf, exit_price=float(trig_px), reason=exit_reason)
+                            await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=exit_reason)
                         continue
 
 
@@ -8182,17 +8201,37 @@ async def on_ready():
                 key2 = (symbol_btc, tf)
                 pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_btc) if TRADE_MODE == "futures" else None)
                 if pos:
-                    side = pos.get("side")
+                    side = str(pos.get("side", "")).upper()
                     entry = float(pos.get("entry_price") or pos.get("entry") or 0)
-                    hit, reason = _eval_tp_sl(side, entry, float(snap.get("mark") or last_price), tf)
-                    if hit:
-                        if TRADE_MODE == "paper":
-                            info = _paper_close(symbol_btc, tf, last_price, reason)
-                            if info:
-                                await _notify_trade_exit(symbol_btc, tf, side=info["side"], entry_price=info["entry_price"], exit_price=last_price, reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"), qty=info.get("qty"))
-                        elif TRADE_MODE == "futures":
-                            await futures_close_all(symbol_btc, tf, exit_price=last_price, reason=reason)
-                        continue
+
+                    # 틱 힌트를 1분봉으로 클램프
+                    last_hint = float(snap.get("mark") or last_price)
+                    clamped, bar1m = _sanitize_exit_price(symbol_btc, last_hint)
+                    # 이상치면 무시
+                    if _outlier_guard(clamped, bar1m):
+                        pass
+                    else:
+                        tp_price = pos.get("tp_price")
+                        sl_price = pos.get("sl_price")
+                        tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2)
+                        if ok_exit:
+                            exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+                            if TRADE_MODE == "paper":
+                                info = _paper_close(symbol_btc, tf, exec_px, reason)
+                                if info:
+                                    await _notify_trade_exit(
+                                        symbol_btc, tf,
+                                        side=info["side"],
+                                        entry_price=info["entry_price"],
+                                        exit_price=exec_px,
+                                        reason=reason, mode="paper",
+                                        pnl_pct=info.get("pnl_pct")
+                                    )
+                            else:
+                                await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=reason)
+                            continue
+
 
                 # Use 1m bar extremes to update trailing baselines (never raw ticks)
                 _bar1m = _fetch_recent_bar_1m(symbol_btc)
