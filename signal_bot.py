@@ -4853,16 +4853,19 @@ async def safe_price_hint(symbol:str):
     """
     스냅샷 후보 우선순위 → 값 선택 → (필요 시) 1m 캔들로 클램프 + 이상치 가드
     """
+
     snap = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
 
     # ✅ None 가드 + 옵션 폴백
     if not isinstance(snap, dict) or not snap:
+
         if os.getenv("PRICE_FALLBACK_ON_NONE", "1") == "1":
             try:
                 df = get_ohlcv(symbol, "1m", limit=1)
                 last = float(df["close"].iloc[-1]) if hasattr(df, "iloc") and len(df) else 0.0
             except Exception:
                 last = 0.0
+
             return _sanitize_exit_price(symbol, last)
         return _sanitize_exit_price(symbol, 0.0)
 
@@ -4870,21 +4873,26 @@ async def safe_price_hint(symbol:str):
     cand = None
     for k in PRICE_FALLBACK_ORDER:
         v = snap.get(k)
+
         if v is not None:
             cand = float(v); break
 
     # mark 직접사용 제한 → last 있으면 last로 클램프
+
     if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and (snap.get("mark") == cand):
         last = snap.get("last")
         if last is not None:
+
             cand = float(last)
 
     clamped, bar = _sanitize_exit_price(symbol, float(cand or 0.0))
 
     # 이상치면 1회 재조회(✅ None 가드)
     if _outlier_guard(clamped, bar):
+
         snap2 = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
         cand2 = float(snap2.get("last") or snap2.get("mid") or cand or 0.0)
+
         clamped, bar = _sanitize_exit_price(symbol, cand2)
 
     return clamped, bar
@@ -5063,8 +5071,10 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     upnl_sum = 0.0
     # 포지션 소스: 페이퍼/실거래 공용 요약 유틸 사용 (프로젝트 내 존재). 없다면 PAPER_POS를 직접 순회.
     for pos in get_open_positions_iter():
+
         if os.getenv("DASH_TRACE","0")=="1":
             assert isinstance(pos, dict), f"gather() pos type={type(pos).__name__}"
+
         symbol = pos["symbol"]; tf = pos["tf"]
         entry  = float(pos.get("entry_price") or pos.get("entry") or 0.0)
         lev    = float(pos.get("lev") or 1.0)
@@ -7578,10 +7588,12 @@ def get_open_positions_iter():
         # 디스크/거래소 하이드레이션이 늦는 경우를 대비한 1회 폴백
         try:
             _hydrate_from_disk()
+
             paper = PAPER_POS or {}
             fut   = FUT_POS or {}
         except Exception:
             pass
+
     try:
         for key, pos in paper.items():
             try:
@@ -7613,6 +7625,7 @@ def get_open_positions_iter():
     return out
 
 async def _dash_render_text():
+
     st = _daily_state_load() or {}  # ← Nonesafe
     cap_realized = capital_get()
     rows, totals = await gather_positions_upnl()  # ← async 버전만 사용
@@ -7624,11 +7637,13 @@ async def _dash_render_text():
         if bad:
             raise TypeError(f"DASH rows bad entries: {bad[:5]}")
 
+
     eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE","live") or "live").lower()
     if eq_mode == "live":
         eq_now = float(cap_realized) + float((totals or {}).get("upnl_usdt_sum", 0.0))
     else:
         eq_now = float(cap_realized)
+
 
     lines = []
     lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode=="live" else " (realized)"))
@@ -7679,8 +7694,10 @@ async def _dash_loop(client):
             if msg:
                 await msg.edit(content=txt)
             if PRESENCE_ENABLE:
+
                 if os.getenv("DASH_TRACE","0")=="1":
                     log("[DASH:TRACE] before presence")
+
                 eq  = float(eq_now)
                 day = float((st or {}).get("realized_usdt", 0.0))
                 ou  = float((totals or {}).get("upnl_usdt_sum", 0.0))
@@ -7690,6 +7707,7 @@ async def _dash_loop(client):
                         name=f"Eq ${eq:,.0f} | Day {day:+.0f} | Open {ou:+.0f}"
                     )
                 )
+
         except Exception as e:
             if os.getenv("DASH_TRACE","0")=="1":
                 import traceback
