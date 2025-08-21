@@ -4961,21 +4961,19 @@ def _pos_stats_load():
     파일이 없거나, 손상되었거나, null/비-dict이면 {}로 정규화.
     """
     global _POS_STATS
-    # 이미 메모리에 dict가 있으면 그대로 사용
     if isinstance(_POS_STATS, dict):
         return _POS_STATS
 
     data = None
     try:
         with open(POS_STATS_STATE_PATH, "r", encoding="utf-8") as f:
-            data = _json.load(f)  # ← null이면 None로 들어옴(예외 아님)
+            data = _json.load(f)  # null이면 None
     except Exception:
         data = {}
 
     if not isinstance(data, dict):
         log("[DASH] pos_stats file not dict -> reset to {}")
         data = {}
-        # ⬇ 자동수복(기본 ON, .env로 끊기 가능)
         if os.getenv("POS_STATS_AUTOFIX", "1") == "1":
             try:
                 _pathlib.Path(POS_STATS_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -7588,7 +7586,7 @@ except Exception as e:
     FUT_EXCHANGE = None
 
 
-_DASHBOARD_STATE = {"msg_id": 0}
+_DASHBOARD_STATE = {"msg_id": 0, "ch_id": 0}
 
 async def _dash_channel(client):
     ch_id = DASHBOARD_CHANNEL_ID or int(os.getenv("PNL_REPORT_CHANNEL_ID","0") or 0)
@@ -7598,15 +7596,22 @@ async def _dash_channel(client):
 
 async def _dash_get_or_create_message(client):
     ch = await _dash_channel(client)
-    if not ch: return None
-    if _DASHBOARD_STATE["msg_id"]:
-        try:
-            return await ch.fetch_message(_DASHBOARD_STATE["msg_id"])
-        except Exception:
-            _DASHBOARD_STATE["msg_id"] = 0
+    if not ch:
+        return None
+
+    try:
+        mid = int(_DASHBOARD_STATE.get("msg_id") or 0)
+        if mid and _DASHBOARD_STATE.get("ch_id") == ch.id:
+            # ✔ 권한 없이도 edit 가능한 partial message 사용 (fetch 불필요)
+            return ch.get_partial_message(mid)
+    except Exception:
+        _DASHBOARD_STATE["msg_id"] = 0
+
+    # 최착 생성 (또는 복구)
     m = await ch.send("📊 initializing dashboard…")
     _DASHBOARD_STATE["msg_id"] = m.id
-    return m
+    _DASHBOARD_STATE["ch_id"] = ch.id
+    return ch.get_partial_message(m.id)
 
 def get_open_positions_iter():
     """Yield unified open position dicts from paper/futures stores."""
@@ -7721,7 +7726,13 @@ async def _dash_loop(client):
             if os.getenv("DASH_TRACE","0")=="1":
                 log(f"[DASH:TRACE] render_ok types st={type(st).__name__}, totals={type(totals).__name__}")
             if msg:
-                await msg.edit(content=txt)
+                try:
+                    await msg.edit(content=txt)
+                except Exception as e:
+                    # 메시지가 삭제되었거나 Unknown Message면 다음 루프에서 재생성
+                    if "Unknown Message" in str(e) or "Not Found" in str(e):
+                        _DASHBOARD_STATE["msg_id"] = 0
+                    raise
             if PRESENCE_ENABLE:
 
                 if os.getenv("DASH_TRACE","0")=="1":
