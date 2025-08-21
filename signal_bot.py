@@ -22,6 +22,8 @@ from matplotlib import rcParams
 from collections import defaultdict
 
 
+
+
 # [ANCHOR: RUNTIME_CFG_DECL]
 RUNTIME_CFG = {}  # overlay store: key -> raw string
 
@@ -4648,6 +4650,7 @@ def planning_capital_for_allocation() -> tuple[float, float, float]:
     return float(base), float(contrib), float(plan)
 # [ANCHOR: CAPITAL_MGR_END]
 
+
 ALLOC_BY_TF_RAW    = os.getenv("ALLOC_BY_TF", "")   # 예: "15m:0.10,1h:0.15,4h:0.25,1d:0.40"
 RESERVE_PCT        = float(os.getenv("RESERVE_PCT", "0.10"))
 
@@ -4674,8 +4677,10 @@ def _margin_for_tf(tf):
     if pct is None:
         return FUT_MGN_USDT
     try:
+
         base_cap, upnl_contrib, plan_cap = planning_capital_for_allocation()
         return max(0.0, float(plan_cap) * float(pct))
+
     except Exception:
         return FUT_MGN_USDT
 
@@ -5967,10 +5972,12 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             align_text = "-"
 
         # [ANCHOR: ENTRY_ALLOC_CALC]  << REPLACE BLOCK >>
+
         use_frac  = None
         notional  = None
         if eff_margin and base_margin:
             use_frac = float(eff_margin) / float(base_margin)
+
         if eff_margin and lev_used:
             try:
                 notional = float(eff_margin) * int(lev_used)
@@ -6024,6 +6031,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
 
         # 배분 브레이크다운
         # ① 총자본 → TF배정
+
         # total_cap 은 base(미실현 제외), TF배정은 plan_cap*tf_pct 로 계산
         try:
             base_cap, upnl_contrib, plan_cap = planning_capital_for_allocation()
@@ -6042,6 +6050,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             else:
                 alloc_pct_calc = (float(base_margin)/float(base_cap))*100.0 if base_cap>0 else None
                 lines.append(f"• 배분(1): 총자본 {_fmt_usd(base_cap)} → TF배정 {_fmt_usd(base_margin)} ({_fmt_pct(alloc_pct_calc) if alloc_pct_calc is not None else '-'} )")
+
         elif base_margin:
             lines.append(f"• 배분(1): TF배정 {_fmt_usd(base_margin)}")
 
@@ -6155,11 +6164,13 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
             lines.append(f"• 상태: {status}")
 
         # [ANCHOR: PAPER_CLOSE_AND_NOTIFY]
+
         # 총자본 표시(종결 이후)
         if ALERT_SHOW_CAPITAL:
             after_cap = capital_get()
             tail = (f" [Planner: {PLANNER_ID}]" if PLANNER_ID else "")
             lines.append(f"• 총자본(종결후): {_fmt_usd(after_cap)}{tail}")
+
 
         # [ANCHOR: EXIT_NOTIFY_TAIL]
         if ALERT_SHOW_CAPITAL and PLANNER_ID and all("Planner:" not in s for s in lines):
@@ -9044,8 +9055,10 @@ def _reload_runtime_parsed_maps():
 
 if __name__ == "__main__":
     exchange = GLOBAL_EXCHANGE
+
     log(f"[BOOT] CAPITAL: source={CAPITAL_SOURCE}, base={capital_get():,.2f}")
     log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
+
     # [ANCHOR: BOOT_ENV_SUMMARY]
     try:
         lines = [
