@@ -4854,27 +4854,42 @@ async def safe_price_hint(symbol:str):
     스냅샷 후보 우선순위 → 값 선택 → (필요 시) 1m 캔들로 클램프 + 이상치 가드 반영
     """
     snap = await _fetch_with_retry(get_price_snapshot, symbol)
+
+    # ✅ 스냅샷 None 가드 + 옵션 기반 폴백
+    if not isinstance(snap, dict):
+        if os.getenv("PRICE_FALLBACK_ON_NONE", "1") == "1":
+            try:
+                df = get_ohlcv(symbol, "1m", limit=1)
+                last = float(df["close"].iloc[-1]) if hasattr(df, "iloc") and len(df) else 0.0
+            except Exception:
+                last = 0.0
+            clamped, bar = _sanitize_exit_price(symbol, last)
+            return clamped, bar
+        # 폴백 비활성화 시 0 클램프(보수적)
+        return _sanitize_exit_price(symbol, 0.0)
+
     # 후보 선정
     cand = None
     for k in PRICE_FALLBACK_ORDER:
-        v = snap.get(k)
+        v = (snap or {}).get(k)
         if v:
             cand = float(v)
             break
-    # mark는 직접 트리거 금지 → last가 있으면 그 범위로 한 번 더 제한
-    if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and (snap.get("mark") == cand):
-        last = snap.get("last")
+
+    # mark는 직접 트리거 금지 → last가 있으면 한 번 더 제한
+    if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and ((snap or {}).get("mark") == cand):
+        last = (snap or {}).get("last")
         if last:
-            # last로 한 번 더 가드
             cand = float(last)
 
     # 1분봉 바운드/이상치 처리
     clamped, bar = _sanitize_exit_price(symbol, float(cand or 0.0))
     if _outlier_guard(clamped, bar):
-        # 이상치면 한 번 더 재조회 시도
+        # 이상치면 한 번 더 재조회 시도 (✅ None 가드)
         snap2 = await _fetch_with_retry(get_price_snapshot, symbol)
-        cand2 = float(snap2.get("last") or snap2.get("mid") or cand or 0.0)
+        cand2 = float(((snap2 or {}).get("last") or (snap2 or {}).get("mid") or cand or 0.0))
         clamped, bar = _sanitize_exit_price(symbol, cand2)
+
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
@@ -7647,7 +7662,7 @@ async def _dash_loop(client):
                 await msg.edit(content=txt)
             if PRESENCE_ENABLE:
                 eq = eq_now
-                day = st.get("realized_usdt",0.0)
+                day = float((st or {}).get("realized_usdt", 0.0))
                 ou = totals["upnl_usdt_sum"]
                 await client.change_presence(activity=discord.Activity(
                     type=discord.ActivityType.watching,
