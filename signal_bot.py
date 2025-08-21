@@ -21,6 +21,7 @@ from collections import deque
 from matplotlib import rcParams
 from collections import defaultdict
 
+
 # [ANCHOR: RUNTIME_CFG_DECL]
 RUNTIME_CFG = {}  # overlay store: key -> raw string
 
@@ -4093,7 +4094,10 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                         side=info["side"],
                         entry_price=info["entry_price"],
                         exit_price=exec_px,
-                        reason=(reason or "TP/SL")
+                        reason=(reason or "TP/SL"),
+                        mode="paper",
+                        pnl_pct=info.get("pnl_pct"),
+                        qty=info.get("qty")
                     )
                 return
         log(f"⏭ {symbol} {tf}: open pos exists → skip new entry")
@@ -4532,6 +4536,118 @@ except Exception as _e:
 
 # === 총자본·배분 설정 ===
 TOTAL_CAPITAL_USDT = float(os.getenv("TOTAL_CAPITAL_USDT", "2000"))
+
+# [ANCHOR: CAPITAL_MGR_BEGIN]
+from typing import Optional
+
+# env 읽기 (RUNTIME_CFG 오버레이 지원)
+def _cfgf(key, default):
+    try:
+        return float(cfg_get(key, str(default)))
+    except Exception:
+        return float(default)
+
+def _cfg(key, default):
+    v = cfg_get(key, None)
+    return (v if v is not None else default)
+
+# 총자본 소스/초기값
+CAPITAL_SOURCE = _cfg("CAPITAL_SOURCE", "paper").lower()  # paper | exchange (현 버전은 paper만 사용)
+CAPITAL_BASE   = _cfgf("CAPITAL_BASE", _cfg("TOTAL_CAPITAL_USDT", "2000"))
+CAPITAL_INCLUDE_UPNL = int(_cfg("CAPITAL_INCLUDE_UPNL", "0") or "0")  # 표시용(배분에는 별도 가중 루틴 사용)
+
+# 알림 꼬리표
+ALERT_SHOW_CAPITAL = (str(_cfg("ALERT_SHOW_CAPITAL", "1")) == "1")
+PLANNER_ID         = str(_cfg("PLANNER_ID", "") or "").strip()
+
+# UPNL 가중 배분 옵션
+ALLOC_USE_UPNL       = int(_cfg("ALLOC_USE_UPNL", "1") or "1")
+ALLOC_UPNL_MODE      = str(_cfg("ALLOC_UPNL_MODE", "ASYM")).upper()   # NET | ASYM | POS_ONLY | NEG_ONLY
+ALLOC_UPNL_W_POS     = _cfgf("ALLOC_UPNL_W_POS", 0.50)
+ALLOC_UPNL_W_NEG     = _cfgf("ALLOC_UPNL_W_NEG", 1.25)
+ALLOC_UPNL_EMA_ALPHA = _cfgf("ALLOC_UPNL_EMA_ALPHA", 0.30)
+ALLOC_UPNL_CLAMP_PCT = _cfgf("ALLOC_UPNL_CLAMP_PCT", 20.0)
+ALLOC_DEBUG          = int(_cfg("ALLOC_DEBUG", "1") or "1")
+
+# 런타임 총자본(페이퍼)
+_CAPITAL_RT: Optional[float] = float(CAPITAL_BASE)
+_UPNL_EMA_VAL: Optional[float] = None
+
+def capital_get() -> float:
+    """현재 총자본(페이퍼). 실거래는 추후 확장."""
+    return float(_CAPITAL_RT or 0.0)
+
+def capital_apply_realized_pnl(delta_usd: float):
+    """실현손익을 총자본에 반영"""
+    global _CAPITAL_RT
+    try:
+        _CAPITAL_RT = float(( _CAPITAL_RT or 0.0 ) + float(delta_usd))
+    except Exception:
+        pass
+
+def _ema_update(x: float, alpha: float) -> float:
+    global _UPNL_EMA_VAL
+    if alpha <= 0:
+        _UPNL_EMA_VAL = x
+        return x
+    if _UPNL_EMA_VAL is None:
+        _UPNL_EMA_VAL = x
+        return x
+    _UPNL_EMA_VAL = alpha*x + (1-alpha)*_UPNL_EMA_VAL
+    return _UPNL_EMA_VAL
+
+def _calc_upnl_now() -> float:
+    """
+    매우 간단한 미실현손익 합산(페이퍼 포지션만).
+    """
+    try:
+        tot = 0.0
+        for key, pos in (PAPER_POS or {}).items():
+            side = str(pos.get("side","" )).upper()
+            qty  = float(pos.get("qty") or 0.0)
+            entry= float(pos.get("entry_price") or 0.0)
+            sym  = str(pos.get("symbol") or "").upper() or key.split("|")[0]
+            if qty <= 0 or entry <= 0:
+                continue
+            lp = get_last_price(sym) or entry
+            delta = (float(lp) - entry) * (1 if side=="LONG" else -1)
+            tot += qty * delta
+        return float(tot)
+    except Exception:
+        return 0.0
+
+def _upnl_weighted_component(upnl_raw: float) -> float:
+    up_s = _ema_update(float(upnl_raw or 0.0), float(ALLOC_UPNL_EMA_ALPHA))
+    pos = max(up_s, 0.0)
+    neg = min(up_s, 0.0)
+    if ALLOC_UPNL_MODE == "POS_ONLY":
+        contrib = pos * ALLOC_UPNL_W_POS
+    elif ALLOC_UPNL_MODE == "NEG_ONLY":
+        contrib = neg * ALLOC_UPNL_W_NEG
+    elif ALLOC_UPNL_MODE == "ASYM":
+        contrib = pos * ALLOC_UPNL_W_POS + neg * ALLOC_UPNL_W_NEG
+    else:
+        contrib = up_s * ALLOC_UPNL_W_POS  # NET: 동일 가중
+
+    # base 대비 기여 한도 클램프
+    base = capital_get()
+    lim  = abs(base) * (ALLOC_UPNL_CLAMP_PCT/100.0)
+    return max(min(contrib, lim), -lim)
+
+def planning_capital_for_allocation() -> tuple[float, float, float]:
+    """
+    배분용 계획자본 계산
+    returns: (base_cap, upnl_contrib, plan_cap)
+    """
+    base = capital_get()
+    if not ALLOC_USE_UPNL:
+        return float(base), 0.0, float(base)
+    upnl = _calc_upnl_now()
+    contrib = _upnl_weighted_component(upnl)
+    plan = max(float(base) + float(contrib), 0.0)
+    return float(base), float(contrib), float(plan)
+# [ANCHOR: CAPITAL_MGR_END]
+
 ALLOC_BY_TF_RAW    = os.getenv("ALLOC_BY_TF", "")   # 예: "15m:0.10,1h:0.15,4h:0.25,1d:0.40"
 RESERVE_PCT        = float(os.getenv("RESERVE_PCT", "0.10"))
 
@@ -4558,7 +4674,8 @@ def _margin_for_tf(tf):
     if pct is None:
         return FUT_MGN_USDT
     try:
-        return max(0.0, TOTAL_CAPITAL_USDT * pct)
+        base_cap, upnl_contrib, plan_cap = planning_capital_for_allocation()
+        return max(0.0, float(plan_cap) * float(pct))
     except Exception:
         return FUT_MGN_USDT
 
@@ -5130,6 +5247,7 @@ def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = "")
         _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
     side = pos.get("side", "")
     entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+    qty = float(pos.get("qty") or pos.get("quantity") or 0.0)
     pnl_pct = None
     try:
         if entry > 0 and exit_price > 0:
@@ -5137,6 +5255,21 @@ def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = "")
             pnl_pct = gross
     except Exception:
         pnl_pct = None
+    
+    # === 실현손익(USDT) 및 수수료 추정 ===
+    qty = float(pos.get("qty") or 0.0)
+    side_up = 1 if str(side).upper()=="LONG" else -1
+    gross_usdt = (float(exit_price) - float(entry)) * qty * side_up
+    # 수수료(bps): (진입+청산) 왕복. 동적 조회 실패시 폴백 사용
+    fee_bps = _fee_bps(order_type="MARKET", ex=None, symbol=symbol)
+    fees_usdt = _fee_usdt(entry, qty, fee_bps) + _fee_usdt(exit_price, qty, fee_bps)
+    net_usdt = gross_usdt - fees_usdt
+
+    # 총자본 업데이트(페이퍼)
+    try:
+        capital_apply_realized_pnl(net_usdt)
+    except Exception as _e:
+        log(f"[CAPITAL] apply pnl warn: {symbol} {tf}: {_e}")
     # CSV: paper CLOSE
     try:
         if PAPER_CSV_CLOSE_LOG:
@@ -5156,7 +5289,7 @@ def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = "")
     # IDEMP: allow re-entry after manual/forced close
     try: idem_clear_symbol_tf(symbol, tf)
     except Exception: pass
-    return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct}
+    return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty}
 
 # [ANCHOR: PAPER_PARTIAL_CLOSE_BEGIN]
 def _paper_reduce(symbol: str, tf: str, reduce_qty: float, exit_price: float):
@@ -5833,24 +5966,14 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
         except Exception:
             align_text = "-"
 
-        # 배분/사용비율(총자본 → TF배정 → 강도×MTF → 최종)
-        total_cap = None
-        try:
-            total_cap = float(TOTAL_CAPITAL_USDT)
-        except Exception:
-            pass
-
-        alloc_pct = None
+        # [ANCHOR: ENTRY_ALLOC_CALC]  << REPLACE BLOCK >>
         use_frac  = None
         notional  = None
-        if base_margin:
-            if total_cap and total_cap > 0:
-                alloc_pct = base_margin / total_cap                  # TF 기본배정 비율
-            if eff_margin and base_margin > 0:
-                use_frac = float(eff_margin) / float(base_margin)    # 강도×MTF 적용 후 실제 사용 비율
+        if eff_margin and base_margin:
+            use_frac = float(eff_margin) / float(base_margin)
         if eff_margin and lev_used:
             try:
-                notional = float(eff_margin) * int(lev_used)         # 레버리지 적용 노치오날
+                notional = float(eff_margin) * int(lev_used)
             except Exception:
                 pass
 
@@ -5901,10 +6024,31 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
 
         # 배분 브레이크다운
         # ① 총자본 → TF배정
-        if total_cap and alloc_pct is not None:
-            lines.append(f"• 배분(1): 총자본 {_fmt_usd(total_cap)} → TF배정 {_fmt_usd(base_margin)} ({_fmt_pct(alloc_pct)})")
+        # total_cap 은 base(미실현 제외), TF배정은 plan_cap*tf_pct 로 계산
+        try:
+            base_cap, upnl_contrib, plan_cap = planning_capital_for_allocation()
+        except Exception:
+            base_cap, upnl_contrib, plan_cap = (TOTAL_CAPITAL_USDT, 0.0, TOTAL_CAPITAL_USDT)
+
+        tf_pct = None
+        try:
+            tf_pct = float(ALLOC_TF.get(tf)) if ALLOC_TF else None
+        except Exception:
+            tf_pct = None
+
+        if base_cap and base_margin:
+            if tf_pct is not None:
+                lines.append(f"• 배분(1): 총자본 {_fmt_usd(base_cap)} → TF배정 {_fmt_usd(base_margin)} ({_fmt_pct(tf_pct)})")
+            else:
+                alloc_pct_calc = (float(base_margin)/float(base_cap))*100.0 if base_cap>0 else None
+                lines.append(f"• 배분(1): 총자본 {_fmt_usd(base_cap)} → TF배정 {_fmt_usd(base_margin)} ({_fmt_pct(alloc_pct_calc) if alloc_pct_calc is not None else '-'} )")
         elif base_margin:
             lines.append(f"• 배분(1): TF배정 {_fmt_usd(base_margin)}")
+
+        # (디버그) UPNL 기여/계획자본
+        if ALLOC_USE_UPNL and ALLOC_DEBUG:
+            sign = "+" if upnl_contrib >= 0 else "-"
+            lines.append(f"• 배분(1a): UPNL 기여({sign}) {_fmt_usd(abs(upnl_contrib))} → 계획자본 {_fmt_usd(plan_cap)}")
 
         # ② 강도×MTF 적용(최종 사용비율/금액)
         if eff_margin is not None:
@@ -5973,6 +6117,7 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
                              reason: str,
                              mode: str,          # 'futures'|'spot'|'paper'
                              pnl_pct: float | None = None,
+                             qty: float | None = None,
                              status: str | None = None):
     try:
         cid = _get_trade_channel_id(symbol, tf)
@@ -6008,6 +6153,17 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
             lines.append(f"• 손익률: {pnl_pct_val:.2f}%")
         if status:
             lines.append(f"• 상태: {status}")
+
+        # [ANCHOR: PAPER_CLOSE_AND_NOTIFY]
+        # 총자본 표시(종결 이후)
+        if ALERT_SHOW_CAPITAL:
+            after_cap = capital_get()
+            tail = (f" [Planner: {PLANNER_ID}]" if PLANNER_ID else "")
+            lines.append(f"• 총자본(종결후): {_fmt_usd(after_cap)}{tail}")
+
+        # [ANCHOR: EXIT_NOTIFY_TAIL]
+        if ALERT_SHOW_CAPITAL and PLANNER_ID and all("Planner:" not in s for s in lines):
+            lines.append(f"• Planner: {PLANNER_ID}")
 
         await ch.send("\n".join([title] + lines))
     except Exception as e:
@@ -6143,6 +6299,7 @@ async def _auto_close_and_notify_eth(
                     reason=str(action_reason),
                     mode="paper",
                     pnl_pct=info.get("pnl_pct"),
+                    qty=info.get("qty"),
                 )
             except Exception as e:
                 log(f"[NOTIFY] paper exit warn {symbol_eth} {tf}: {e}")
@@ -6238,6 +6395,7 @@ async def _auto_close_and_notify_btc(
                     reason=action_reason,
                     mode="paper",
                     pnl_pct=info.get("pnl_pct"),
+                    qty=info.get("qty"),
                 )
             except Exception as e:
                 log(f"[NOTIFY] paper exit warn {symbol} {tf}: {e}")
@@ -6371,7 +6529,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     _record_signal(symbol, tf, exec_signal, local_score)
 
     # 2) 기본 증거금(총자본 × TF배분)
-    base_margin = _margin_for_tf(tf)  # TOTAL_CAPITAL_USDT * ALLOC_TF[tf] or fallback(FUT_MGN_USDT)
+    base_margin = _margin_for_tf(tf)  # capital_get() × ALLOC_TF[tf] or fallback(FUT_MGN_USDT)
 
     # 3) 강도 가중
     sf = _strength_factor(exec_signal, local_score)
@@ -7658,7 +7816,7 @@ async def on_ready():
                         if TRADE_MODE == "paper":
                             info = _paper_close(symbol_eth, tf, last_price, reason)
                             if info:
-                                await _notify_trade_exit(symbol_eth, tf, side=info["side"], entry_price=info["entry_price"], exit_price=last_price, reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"))
+                                await _notify_trade_exit(symbol_eth, tf, side=info["side"], entry_price=info["entry_price"], exit_price=last_price, reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"), qty=info.get("qty"))
                         elif TRADE_MODE == "futures":
                             await futures_close_all(symbol_eth, tf, exit_price=last_price, reason=reason)
                         continue
@@ -7694,7 +7852,7 @@ async def on_ready():
                         if TRADE_MODE=='paper':
                             info = _paper_close(symbol_eth, tf, float(trig_px), exit_reason)
                             if info:
-                                await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'))
+                                await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'))
                         else:
                             await futures_close_all(symbol_eth, tf, exit_price=float(trig_px), reason=exit_reason)
                         continue
@@ -8020,7 +8178,7 @@ async def on_ready():
                         if TRADE_MODE == "paper":
                             info = _paper_close(symbol_btc, tf, last_price, reason)
                             if info:
-                                await _notify_trade_exit(symbol_btc, tf, side=info["side"], entry_price=info["entry_price"], exit_price=last_price, reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"))
+                                await _notify_trade_exit(symbol_btc, tf, side=info["side"], entry_price=info["entry_price"], exit_price=last_price, reason=reason, mode="paper", pnl_pct=info.get("pnl_pct"), qty=info.get("qty"))
                         elif TRADE_MODE == "futures":
                             await futures_close_all(symbol_btc, tf, exit_price=last_price, reason=reason)
                         continue
@@ -8065,7 +8223,7 @@ async def on_ready():
                         if TRADE_MODE=='paper':
                             info = _paper_close(symbol_btc, tf, float(trig_px), exit_reason)
                             if info:
-                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'))
+                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'))
                         else:
                             await futures_close_all(symbol_btc, tf, exit_price=float(trig_px), reason=exit_reason)
                         continue
@@ -8885,18 +9043,20 @@ def _reload_runtime_parsed_maps():
 
 
 if __name__ == "__main__":
+    exchange = GLOBAL_EXCHANGE
+    log(f"[BOOT] CAPITAL: source={CAPITAL_SOURCE}, base={capital_get():,.2f}")
+    log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
     # [ANCHOR: BOOT_ENV_SUMMARY]
     try:
-        log("[BOOT] ENV SUMMARY: "
-            f"OBS={os.getenv('GATEKEEPER_OBS_SEC','-')}, "
-            f"COOLDOWN={os.getenv('POST_EXIT_COOLDOWN_SEC','-')}, "
-            f"WAIT_TARGET={os.getenv('WAIT_TARGET_ENABLE','0')}/"
-            f"{os.getenv('TARGET_SCORE_BY_TF','-')}/"
-            f"{os.getenv('WAIT_TARGET_SEC','-')}/"
-            f"{os.getenv('TARGET_WAIT_MODE','-')}, "
-            f"IGNORE_OCCUPANCY_TFS={os.getenv('IGNORE_OCCUPANCY_TFS','')}, "
-            f"TRADE_MODE={os.getenv('TRADE_MODE','paper')}"
-        )
+        lines = [
+            f"OBS={os.getenv('GATEKEEPER_OBS_SEC','-')}",
+            f"COOLDOWN={os.getenv('POST_EXIT_COOLDOWN_SEC','-')}",
+            f"WAIT_TARGET={os.getenv('WAIT_TARGET_ENABLE','0')}/{os.getenv('TARGET_SCORE_BY_TF','-')}/{os.getenv('WAIT_TARGET_SEC','-')}/{os.getenv('TARGET_WAIT_MODE','-')}",
+            f"IGNORE_OCCUPANCY_TFS={os.getenv('IGNORE_OCCUPANCY_TFS','')}",
+            f"TRADE_MODE={os.getenv('TRADE_MODE','paper')}",
+            f"CAPITAL_BASE={CAPITAL_BASE:,.2f} (paper), ALERT_SHOW_CAPITAL={int(ALERT_SHOW_CAPITAL)}",
+        ]
+        log("[BOOT] ENV SUMMARY: " + ", ".join(lines))
     except Exception as _e:
         log(f"[BOOT] ENV SUMMARY warn: {_e}")
     import time
