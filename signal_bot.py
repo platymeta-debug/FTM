@@ -219,6 +219,30 @@ def _sanitize_exit_price(symbol: str, last_hint: float|None = None):
     clamped = max(min(float(last_raw), hi), lo)
     return clamped, bar
 
+def _sanitize_exit_price_with_bar(symbol: str, price: float, bar_1m):
+    """
+    Same clamp/outlier logic as _sanitize_exit_price(), but DOES NOT fetch OHLCV.
+    'bar_1m' should be a single 1m candle tuple/list or None.
+    """
+    if bar_1m is None:
+        return _sanitize_exit_price(symbol, price)
+    try:
+        if isinstance(bar_1m, dict):
+            bar = {k: float(bar_1m[k]) for k in ("open", "high", "low", "close")}
+        else:
+            bar = {
+                "open": float(bar_1m[1]),
+                "high": float(bar_1m[2]),
+                "low": float(bar_1m[3]),
+                "close": float(bar_1m[4]),
+            }
+    except Exception:
+        return _sanitize_exit_price(symbol, price)
+    last_raw = _raw_exit_price(symbol, price)
+    hi, lo = float(bar["high"]), float(bar["low"])
+    clamped = max(min(float(last_raw), hi), lo)
+    return clamped, bar
+
 def _outlier_guard(clamped: float, bar: dict) -> bool:
     """
     True → skip this minute as outlier (|Δ| > OUTLIER_MAX_1M vs 1m open/close).
@@ -2084,6 +2108,33 @@ def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
+
+# --- async bridges for blocking ccxt calls ---
+# ENV: AIO_CCXT_POOL=1 enables offloading to thread pool
+import functools
+
+async def _to_thread(func, *args, **kwargs):
+    if os.getenv("AIO_CCXT_POOL", "1") != "1":
+        # fallback (sync) – not recommended
+        return func(*args, **kwargs)
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(None, bound)
+
+async def aio_get_ohlcv(symbol: str, timeframe: str, limit: int = 1):
+    # wrap existing sync get_ohlcv() with executor
+    return await _to_thread(get_ohlcv, symbol, timeframe, limit)
+
+async def _fetch_recent_bar_1m_async(symbol: str):
+    """Return last 1m bar (ts, open, high, low, close, vol) without blocking event loop."""
+    try:
+        ohlc = await aio_get_ohlcv(symbol, "1m", limit=1)
+        if hasattr(ohlc, "iloc"):
+            row = ohlc.iloc[-1].tolist()
+            return row
+        return ohlc[-1] if ohlc else None
+    except Exception:
+        return None
 
 
 # === [UTIL] calc_daily_change_pct — 퍼포먼스 스냅샷과 동일식 ===
@@ -4885,15 +4936,16 @@ async def safe_price_hint(symbol:str):
 
             cand = float(last)
 
-    clamped, bar = _sanitize_exit_price(symbol, float(cand or 0.0))
+    bar_async = await _fetch_recent_bar_1m_async(symbol)
+    clamped, bar = _sanitize_exit_price_with_bar(symbol, float(cand or 0.0), bar_async)
 
     # 이상치면 1회 재조회(✅ None 가드)
     if _outlier_guard(clamped, bar):
 
         snap2 = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
         cand2 = float(snap2.get("last") or snap2.get("mid") or cand or 0.0)
-
-        clamped, bar = _sanitize_exit_price(symbol, cand2)
+        bar_async = await _fetch_recent_bar_1m_async(symbol)
+        clamped, bar = _sanitize_exit_price_with_bar(symbol, cand2, bar_async)
 
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
@@ -4945,12 +4997,32 @@ RISK_WARN_NEAR_SL_PCT = float(os.getenv("RISK_WARN_NEAR_SL_PCT","0.5") or 0.5)
 RISK_BAR_WIDTH = int(os.getenv("RISK_BAR_WIDTH","12") or 12)
 POS_STATS_STATE_PATH = os.getenv("POS_STATS_STATE_PATH","./data/pos_stats.json")
 
+DASH_STATE_PATH = os.getenv("DASH_STATE_PATH", "./data/dashboard_state.json")
+
 DASHBOARD_FUNDING = int(os.getenv("DASHBOARD_FUNDING","1") or 1)
 FUNDING_COUNTDOWN_ONLY = int(os.getenv("FUNDING_COUNTDOWN_ONLY","1") or 1)
 FUNDING_EXCHANGE_HINT = os.getenv("FUNDING_EXCHANGE_HINT","")
 
 # 포지션별 극값/MAE/MFE 저장소 (세션 지속)
 _POS_STATS = None
+
+def _dash_state_load():
+    try:
+        with open(DASH_STATE_PATH, "r", encoding="utf-8") as f:
+            s = _json.load(f)
+            if isinstance(s, dict) and s.get("msg_id") and s.get("ch_id"):
+                _DASHBOARD_STATE.update(s)
+    except Exception:
+        pass
+
+def _dash_state_save():
+    try:
+        _pathlib.Path(DASH_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(DASH_STATE_PATH, "w", encoding="utf-8") as f:
+            _json.dump({"msg_id": _DASHBOARD_STATE.get("msg_id", 0),
+                        "ch_id":  _DASHBOARD_STATE.get("ch_id", 0)}, f)
+    except Exception as e:
+        log(f"[DASH] state save warn: {e}")
 
 def _pos_stats_key(symbol:str, tf:str, side:str, entry:float, qty:float) -> str:
     return f"{symbol}|{tf}|{side}|{entry:.8f}|{qty:.8f}"
@@ -4961,21 +5033,19 @@ def _pos_stats_load():
     파일이 없거나, 손상되었거나, null/비-dict이면 {}로 정규화.
     """
     global _POS_STATS
-    # 이미 메모리에 dict가 있으면 그대로 사용
     if isinstance(_POS_STATS, dict):
         return _POS_STATS
 
     data = None
     try:
         with open(POS_STATS_STATE_PATH, "r", encoding="utf-8") as f:
-            data = _json.load(f)  # ← null이면 None로 들어옴(예외 아님)
+            data = _json.load(f)  # null이면 None
     except Exception:
         data = {}
 
     if not isinstance(data, dict):
         log("[DASH] pos_stats file not dict -> reset to {}")
         data = {}
-        # ⬇ 자동수복(기본 ON, .env로 끊기 가능)
         if os.getenv("POS_STATS_AUTOFIX", "1") == "1":
             try:
                 _pathlib.Path(POS_STATS_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -7588,7 +7658,9 @@ except Exception as e:
     FUT_EXCHANGE = None
 
 
-_DASHBOARD_STATE = {"msg_id": 0}
+_DASHBOARD_STATE = {"msg_id": 0, "ch_id": 0}
+_DASH_TASK_RUNNING = False
+_dash_state_load()
 
 async def _dash_channel(client):
     ch_id = DASHBOARD_CHANNEL_ID or int(os.getenv("PNL_REPORT_CHANNEL_ID","0") or 0)
@@ -7598,15 +7670,24 @@ async def _dash_channel(client):
 
 async def _dash_get_or_create_message(client):
     ch = await _dash_channel(client)
-    if not ch: return None
-    if _DASHBOARD_STATE["msg_id"]:
-        try:
-            return await ch.fetch_message(_DASHBOARD_STATE["msg_id"])
-        except Exception:
-            _DASHBOARD_STATE["msg_id"] = 0
+    if not ch:
+        return None
+
+    try:
+        mid = int(_DASHBOARD_STATE.get("msg_id") or 0)
+        if mid and _DASHBOARD_STATE.get("ch_id") == ch.id:
+            return ch.get_partial_message(mid)  # no history fetch required
+    except Exception:
+        _DASHBOARD_STATE["msg_id"] = 0
+        _dash_state_save()
+
+    # create once
     m = await ch.send("📊 initializing dashboard…")
     _DASHBOARD_STATE["msg_id"] = m.id
-    return m
+    _DASHBOARD_STATE["ch_id"] = ch.id
+    _dash_state_save()
+    log(f"[DASH] created dashboard msg id={m.id} ch={ch.id}")
+    return ch.get_partial_message(m.id)
 
 def get_open_positions_iter():
     """Yield unified open position dicts from paper/futures stores."""
@@ -7721,7 +7802,15 @@ async def _dash_loop(client):
             if os.getenv("DASH_TRACE","0")=="1":
                 log(f"[DASH:TRACE] render_ok types st={type(st).__name__}, totals={type(totals).__name__}")
             if msg:
-                await msg.edit(content=txt)
+                try:
+                    await msg.edit(content=txt)
+                except Exception as e:
+                    if "Unknown Message" in str(e) or "Not Found" in str(e):
+                        _DASHBOARD_STATE["msg_id"] = 0
+                        _dash_state_save()
+                        log("[DASH] dashboard message missing – will recreate")
+                    else:
+                        log(f"[DASH] edit warn: {e}")
             if PRESENCE_ENABLE:
 
                 if os.getenv("DASH_TRACE","0")=="1":
@@ -8716,7 +8805,12 @@ def _get_channel_or_skip(asset: str, tf: str):
 async def on_ready():
     log(f'✅ Logged in as {client.user}')
     if DASHBOARD_ENABLE:
-        client.loop.create_task(_dash_loop(client))
+        global _DASH_TASK_RUNNING
+        if not _DASH_TASK_RUNNING:
+            _DASH_TASK_RUNNING = True
+            asyncio.create_task(_dash_loop(client))
+        else:
+            log("[DASH] loop already running – skip spawn")
 
     timeframes = ['15m', '1h', '4h', '1d']
 
