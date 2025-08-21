@@ -4956,20 +4956,47 @@ def _pos_stats_key(symbol:str, tf:str, side:str, entry:float, qty:float) -> str:
     return f"{symbol}|{tf}|{side}|{entry:.8f}|{qty:.8f}"
 
 def _pos_stats_load():
+    """
+    POS_STATS_STATE_PATH에서 MAE/MFE 상태를 로드.
+    파일이 없거나, 손상되었거나, null/비-dict이면 {}로 정규화.
+    """
     global _POS_STATS
-    if _POS_STATS is not None: return _POS_STATS
+    # 이미 메모리에 dict가 있으면 그대로 사용
+    if isinstance(_POS_STATS, dict):
+        return _POS_STATS
+
+    data = None
     try:
-        with open(POS_STATS_STATE_PATH,"r",encoding="utf-8") as f:
-            _POS_STATS = _json.load(f)
+        with open(POS_STATS_STATE_PATH, "r", encoding="utf-8") as f:
+            data = _json.load(f)  # ← null이면 None로 들어옴(예외 아님)
     except Exception:
-        _POS_STATS = {}
+        data = {}
+
+    if not isinstance(data, dict):
+        log("[DASH] pos_stats file not dict -> reset to {}")
+        data = {}
+        # ⬇ 자동수복(기본 ON, .env로 끊기 가능)
+        if os.getenv("POS_STATS_AUTOFIX", "1") == "1":
+            try:
+                _pathlib.Path(POS_STATS_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+                with open(POS_STATS_STATE_PATH, "w", encoding="utf-8") as f:
+                    _json.dump(data, f, ensure_ascii=False)
+            except Exception as e:
+                log(f"[DASH] pos_stats autofix warn: {e}")
+
+    _POS_STATS = data
     return _POS_STATS
 
 def _pos_stats_save():
+    """
+    _POS_STATS가 dict일 때만 저장. 그 외는 {}로 저장하여 null 재발 방지.
+    """
+    global _POS_STATS
+    data = _POS_STATS if isinstance(_POS_STATS, dict) else {}
     try:
         _pathlib.Path(POS_STATS_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
-        with open(POS_STATS_STATE_PATH,"w",encoding="utf-8") as f:
-            _json.dump(_POS_STATS,f,ensure_ascii=False)
+        with open(POS_STATS_STATE_PATH, "w", encoding="utf-8") as f:
+            _json.dump(data, f, ensure_ascii=False)
     except Exception as e:
         log(f"[DASH] pos_stats save warn: {e}")
 
@@ -4979,6 +5006,8 @@ def _update_mae_mfe(symbol:str, tf:str, side:str, entry:float, last:float, qty:f
     """
     if not DASHBOARD_MAE_MFE: return (0.0, 0.0)
     st = _pos_stats_load()
+    # ← 로더가 정규화하지만, 재발 감시용 최소 단언(개발 중 추적)
+    assert isinstance(st, dict), f"POS_STATS must be dict, got {type(st).__name__}"
     k = _pos_stats_key(symbol, tf, side, entry, qty)
     node = st.get(k) or {"lo": entry, "hi": entry}
     node["lo"] = min(node["lo"], last)
