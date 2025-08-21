@@ -14,6 +14,15 @@ from dotenv import load_dotenv
 load_dotenv("key.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
+
+# [ANCHOR: LOCKS_BEGIN]
+import asyncio
+ENABLE_POS_LOCK   = int(os.getenv("ENABLE_POS_LOCK","1") or 1)
+ENABLE_STATE_LOCK = int(os.getenv("ENABLE_STATE_LOCK","1") or 1)
+_POS_LOCK   = asyncio.Lock() if ENABLE_POS_LOCK else None
+_STATE_LOCK = asyncio.Lock() if ENABLE_STATE_LOCK else None
+# [ANCHOR: LOCKS_END]
+
 import traceback
 import re
 from datetime import datetime, timezone, timedelta
@@ -4065,23 +4074,38 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=NEUTRAL")
         return
 
+    # [ADD] Kill-switch guard
+    if signal in ("BUY","SELL") and _panic_active():
+        log(f"[PANIC] skip entry {symbol} {tf} due to panic flag")
+        return
+
+    # [ADD] Daily limit guard (entry 차단)
+    if signal in ("BUY","SELL"):
+        ok, reason = _daily_limits_ok(capital_get())
+        if not ok:
+            log(f"[DAILY-LIMIT] skip entry {symbol} {tf}: {reason} -> action={DAILY_LIMIT_ACTION}")
+            if DAILY_LIMIT_ACTION == "pause":
+                await cmd_pause_all()
+            elif DAILY_LIMIT_ACTION == "panic":
+                _panic_on()
+                if PANIC_FORCE_CLOSE:
+                    await close_all_positions(reason="PANIC")
+            return
+
     # [ANCHOR: PROTECTIVE_CHECK_BEFORE_ENTRY]
     key = f"{symbol}|{tf}"
     pos = (PAPER_POS or {}).get(key)
     if pos:
         side  = str(pos.get("side", "")).upper()
         entry = float(pos.get("entry_price") or pos.get("entry") or 0)
-        snap_curr = await get_price_snapshot(symbol)
-        curr = (snap_curr.get("last") or snap_curr.get("mid") or snap_curr.get("mark") or last_price)
-        last_hint = float(curr or last_price)
-        clamped, bar1m = _sanitize_exit_price(symbol, last_hint)
+        clamped, bar1m = await safe_price_hint(symbol)
         if not _outlier_guard(clamped, bar1m):
             tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
             tr_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
             ok_exit, reason, trig_px, dbg = _eval_exit(symbol, tf, side, entry, clamped, tp_price, sl_price, tr_eff, (symbol, tf))
             if ok_exit:
                 exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
-                info = _paper_close(symbol, tf, exec_px, reason) if TRADE_MODE=="paper" else None
+                info = await _paper_close(symbol, tf, exec_px, reason) if TRADE_MODE=="paper" else None
                 if info:
 
                     await _notify_trade_exit(symbol, tf, side=info["side"], entry_price=info["entry_price"], exit_price=exec_px, reason=(reason or "TP/SL"), mode="paper", pnl_pct=info.get("pnl_pct"), qty=info.get("qty"), pnl_usdt=info.get("net_usdt"))
@@ -4113,8 +4137,13 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
         return
 
-    PAPER_POS_TF[tf] = symbol
-    _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+    if _POS_LOCK:
+        async with _POS_LOCK:
+            PAPER_POS_TF[tf] = symbol
+            _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+    else:
+        PAPER_POS_TF[tf] = symbol
+        _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
 
     # [ANCHOR: AVOID_OVERWRITE_OPEN_POS]  (REPLACED)
     existing_paper = (PAPER_POS or {}).get(key)
@@ -4297,7 +4326,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 reduce_size = current_notional * red_pct
             if TRADE_MODE == "paper":
                 red_qty = reduce_size / float(last_price)
-                info = _paper_reduce(symbol, tf, red_qty, float(last_price)) if red_qty>0 else None
+                info = await _paper_reduce(symbol, tf, red_qty, float(last_price)) if red_qty>0 else None
                 if info: did_scale = True
             else:
                 red_qty = reduce_size / float(last_price)
@@ -4422,40 +4451,83 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
 
 
+    market_symbol = symbol
+    if ENFORCE_MARKET_RULES:
+        qty = _amount_to_precision(GLOBAL_EXCHANGE, market_symbol, qty) if TICK_ENFORCE else qty
+        px  = _price_to_precision(GLOBAL_EXCHANGE, market_symbol, float(last_price)) if TICK_ENFORCE else float(last_price)
+        if not _min_notional_ok(GLOBAL_EXCHANGE, market_symbol, px, qty):
+            log(f"[RULES] skip: notional {px*qty:.4f} < min")
+            return
+        last_price = px
+
     side = "LONG" if exec_signal == "BUY" else "SHORT"
 
 
-    PAPER_POS[key] = {
-        "side": side,
-        "entry": float(last_price),
-        "entry_price": float(last_price),
-        "qty": qty,
-        "eff_margin": eff_margin,
-        "lev": lev_used,
-        "ts_ms": int(time.time()*1000),
-        "high": float(last_price),
-        "low": float(last_price),
+    if _POS_LOCK:
+        async with _POS_LOCK:
+            PAPER_POS[key] = {
+                "side": side,
+                "entry": float(last_price),
+                "entry_price": float(last_price),
+                "qty": qty,
+                "eff_margin": eff_margin,
+                "lev": lev_used,
+                "ts_ms": int(time.time()*1000),
+                "high": float(last_price),
+                "low": float(last_price),
 
-    }
-    # (NEW) persist risk to paper JSON and CSV
-    slip   = _req_slippage_pct(symbol, tf)
-    eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
-    if PAPER_POS[key]["side"] == "LONG":
-        tp_price = (float(last_price)*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-        sl_price = (float(last_price)*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
+            }
+            # (NEW) persist risk to paper JSON and CSV
+            slip   = _req_slippage_pct(symbol, tf)
+            eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
+            if PAPER_POS[key]["side"] == "LONG":
+                tp_price = (float(last_price)*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
+                sl_price = (float(last_price)*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
+            else:
+                tp_price = (float(last_price)*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
+                sl_price = (float(last_price)*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
+            tr_pct_eff = eff_tr_pct
+            PAPER_POS[key].update({
+                "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
+                "tp_price": tp_price, "sl_price": sl_price,
+                "lev": float(lev_used or 1.0),
+                "eff_tp_pct": eff_tp_pct, "eff_sl_pct": eff_sl_pct, "eff_tr_pct": tr_pct_eff,
+                "risk_mode": RISK_INTERPRET_MODE,
+                "slippage_pct": slip
+            })
+            _save_json(PAPER_POS_FILE, PAPER_POS)
     else:
-        tp_price = (float(last_price)*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-        sl_price = (float(last_price)*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-    tr_pct_eff = eff_tr_pct
-    PAPER_POS[key].update({
-        "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
-        "tp_price": tp_price, "sl_price": sl_price,
-        "lev": float(lev_used or 1.0),
-        "eff_tp_pct": eff_tp_pct, "eff_sl_pct": eff_sl_pct, "eff_tr_pct": tr_pct_eff,
-        "risk_mode": RISK_INTERPRET_MODE,
-        "slippage_pct": slip
-    })
-    _save_json(PAPER_POS_FILE, PAPER_POS)
+        PAPER_POS[key] = {
+            "side": side,
+            "entry": float(last_price),
+            "entry_price": float(last_price),
+            "qty": qty,
+            "eff_margin": eff_margin,
+            "lev": lev_used,
+            "ts_ms": int(time.time()*1000),
+            "high": float(last_price),
+            "low": float(last_price),
+
+        }
+        # (NEW) persist risk to paper JSON and CSV
+        slip   = _req_slippage_pct(symbol, tf)
+        eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
+        if PAPER_POS[key]["side"] == "LONG":
+            tp_price = (float(last_price)*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
+            sl_price = (float(last_price)*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
+        else:
+            tp_price = (float(last_price)*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
+            sl_price = (float(last_price)*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
+        tr_pct_eff = eff_tr_pct
+        PAPER_POS[key].update({
+            "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
+            "tp_price": tp_price, "sl_price": sl_price,
+            "lev": float(lev_used or 1.0),
+            "eff_tp_pct": eff_tp_pct, "eff_sl_pct": eff_sl_pct, "eff_tr_pct": tr_pct_eff,
+            "risk_mode": RISK_INTERPRET_MODE,
+            "slippage_pct": slip
+        })
+        _save_json(PAPER_POS_FILE, PAPER_POS)
     # also write OPEN row for paper mode
     extra = ",".join([
           f"mode={'paper' if TRADE_MODE=='paper' else 'futures'}",
@@ -4595,46 +4667,64 @@ def _ensure_parent_dir(path: str):
     except Exception:
         pass
 
-def capital_save_state():
+async def capital_save_state():
     """현재 총자본을 json 상태 파일에 저장"""
     try:
         if not CAPITAL_PERSIST:
             return
         _ensure_parent_dir(CAPITAL_STATE_PATH)
-        with open(CAPITAL_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump({"capital": capital_get(), "ts": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00","Z")}, f)
+        if _STATE_LOCK:
+            async with _STATE_LOCK:
+                with open(CAPITAL_STATE_PATH, "w", encoding="utf-8") as f:
+                    json.dump({"capital": capital_get(), "ts": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00","Z")}, f)
+        else:
+            with open(CAPITAL_STATE_PATH, "w", encoding="utf-8") as f:
+                json.dump({"capital": capital_get(), "ts": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00","Z")}, f)
     except Exception as e:
         log(f"[CAPITAL] save_state warn: {e}")
 
-def capital_load_state():
+async def capital_load_state():
     """재시작 시 마지막 자본 복원"""
     global _CAPITAL_RT
     if not CAPITAL_PERSIST:
         return
     try:
         if os.path.isfile(CAPITAL_STATE_PATH):
-            with open(CAPITAL_STATE_PATH, "r", encoding="utf-8") as f:
-                obj = json.load(f)
+            if _STATE_LOCK:
+                async with _STATE_LOCK:
+                    with open(CAPITAL_STATE_PATH, "r", encoding="utf-8") as f:
+                        obj = json.load(f)
+            else:
+                with open(CAPITAL_STATE_PATH, "r", encoding="utf-8") as f:
+                    obj = json.load(f)
             val = float(obj.get("capital", CAPITAL_BASE))
             _CAPITAL_RT = val
             log(f"[CAPITAL] restored: {val:,.2f} from {CAPITAL_STATE_PATH}")
     except Exception as e:
         log(f"[CAPITAL] load_state warn: {e}")
 
-def _csv_append(path: str, headers: list[str], row: dict):
+async def _csv_append(path: str, headers: list[str], row: dict):
     """헤더 보장 + append"""
     try:
         _ensure_parent_dir(path)
         write_header = CAPITAL_LEDGER_APPEND_HEADERS and (not os.path.isfile(path) or os.path.getsize(path)==0)
-        with open(path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=headers)
-            if write_header:
-                w.writeheader()
-            w.writerow(row)
+        if _STATE_LOCK:
+            async with _STATE_LOCK:
+                with open(path, "a", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, fieldnames=headers)
+                    if write_header:
+                        w.writeheader()
+                    w.writerow(row)
+        else:
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=headers)
+                if write_header:
+                    w.writeheader()
+                w.writerow(row)
     except Exception as e:
         log(f"[CSV] append warn: {path}: {e}")
 
-def capital_ledger_write(event: str, **kw):
+async def capital_ledger_write(event: str, **kw):
     """
     자본 원장에 한 줄 기록. event 예: CLOSE, RESET, DEPOSIT, WITHDRAW
     kw: symbol, tf, side, reason, entry_price, exit_price, qty, gross_usdt, fees_usdt, net_usdt, capital_after
@@ -4652,10 +4742,61 @@ def capital_ledger_write(event: str, **kw):
             row[k] = v
         headers = ["ts_utc","event","symbol","tf","side","reason",
                    "entry_price","exit_price","qty","gross_usdt","fees_usdt","net_usdt","capital_after"]
-        _csv_append(CAPITAL_LEDGER_CSV, headers, row)
+        await _csv_append(CAPITAL_LEDGER_CSV, headers, row)
     except Exception as e:
         log(f"[CAPITAL] ledger warn: {e}")
 # [ANCHOR: CAPITAL_PERSIST_BLOCK_END]
+
+# [ANCHOR: RESILIENT_FETCHERS_BEGIN]  << ADD NEW >>
+import asyncio as _asyncio
+
+PRICE_FETCH_MAX_RETRY = int(os.getenv("PRICE_FETCH_MAX_RETRY","3") or 3)
+PRICE_FETCH_BACKOFF_MS = int(os.getenv("PRICE_FETCH_BACKOFF_MS","200") or 200)
+PRICE_FALLBACK_ORDER = [x.strip() for x in os.getenv("PRICE_FALLBACK_ORDER","last,mid,mark,index").split(",")]
+MARK_CLAMP_TO_LAST = int(os.getenv("MARK_CLAMP_TO_LAST","1") or 1)
+
+async def _sleep_ms(ms:int):
+    await _asyncio.sleep(max(ms,0)/1000.0)
+
+async def _fetch_with_retry(fn, *args, **kwargs):
+    """코루틴 fn을 재시도/백오프와 함께 호출"""
+    err = None
+    for i in range(max(1, PRICE_FETCH_MAX_RETRY)):
+        try:
+            return await fn(*args, **kwargs)
+        except Exception as e:
+            err = e
+            await _sleep_ms(PRICE_FETCH_BACKOFF_MS * (i+1))
+    raise err
+
+async def safe_price_hint(symbol:str):
+    """
+    스냅샷 후보 우선순위 → 값 선택 → (필요 시) 1m 캔들로 클램프 + 이상치 가드 반영
+    """
+    snap = await _fetch_with_retry(get_price_snapshot, symbol)
+    # 후보 선정
+    cand = None
+    for k in PRICE_FALLBACK_ORDER:
+        v = snap.get(k)
+        if v:
+            cand = float(v)
+            break
+    # mark는 직접 트리거 금지 → last가 있으면 그 범위로 한 번 더 제한
+    if MARK_CLAMP_TO_LAST and (cand is not None) and ("mark" in PRICE_FALLBACK_ORDER) and (snap.get("mark") == cand):
+        last = snap.get("last")
+        if last:
+            # last로 한 번 더 가드
+            cand = float(last)
+
+    # 1분봉 바운드/이상치 처리
+    clamped, bar = _sanitize_exit_price(symbol, float(cand or 0.0))
+    if _outlier_guard(clamped, bar):
+        # 이상치면 한 번 더 재조회 시도
+        snap2 = await _fetch_with_retry(get_price_snapshot, symbol)
+        cand2 = float(snap2.get("last") or snap2.get("mid") or cand or 0.0)
+        clamped, bar = _sanitize_exit_price(symbol, cand2)
+    return clamped, bar
+# [ANCHOR: RESILIENT_FETCHERS_END]
 
 # [ANCHOR: CONFIG_DUMP_HELPERS]  << ADD NEW (TOP-LEVEL FUNCS) >>
 CONFIG_DUMP_MODE = os.getenv("CONFIG_DUMP_MODE","chunk").lower()  # chunk | file
@@ -5352,103 +5493,117 @@ def _has_open_position(symbol: str, tf: str, mode: str) -> bool:
         return False
 
 
-def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = ""):
-    key = f"{symbol}|{tf}"
-    pos = PAPER_POS.pop(key, None)
-    if not pos:
-        return None
-    _save_json(PAPER_POS_FILE, PAPER_POS)
-    if PAPER_POS_TF.get(tf) == symbol:
-        PAPER_POS_TF.pop(tf, None)
-        _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
-    side = pos.get("side", "")
-    entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-    qty = float(pos.get("qty") or pos.get("quantity") or 0.0)
-    pnl_pct = None
-    try:
-        if entry > 0 and exit_price > 0:
-            gross = ((exit_price - entry) / entry) * 100.0 if side == "LONG" else ((entry - exit_price) / entry) * 100.0
-            pnl_pct = gross
-    except Exception:
+async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = ""):
+    async def _do_close():
+        key = f"{symbol}|{tf}"
+        pos = PAPER_POS.pop(key, None)
+        if not pos:
+            return None
+        _save_json(PAPER_POS_FILE, PAPER_POS)
+        if PAPER_POS_TF.get(tf) == symbol:
+            PAPER_POS_TF.pop(tf, None)
+            _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+        side = pos.get("side", "")
+        entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+        qty = float(pos.get("qty") or pos.get("quantity") or 0.0)
         pnl_pct = None
-    
-    # === 실현손익(USDT) 및 수수료 추정 ===
-    qty = float(pos.get("qty") or 0.0)
-    side_up = 1 if str(side).upper()=="LONG" else -1
-    gross_usdt = (float(exit_price) - float(entry)) * qty * side_up
+        try:
+            if entry > 0 and exit_price > 0:
+                gross = ((exit_price - entry) / entry) * 100.0 if side == "LONG" else ((entry - exit_price) / entry) * 100.0
+                pnl_pct = gross
+        except Exception:
+            pnl_pct = None
 
-    fee_bps = _fee_bps(order_type="MARKET", ex=None, symbol=symbol)
-    fees_usdt = _fee_usdt(entry, qty, fee_bps) + _fee_usdt(exit_price, qty, fee_bps)
-    net_usdt = gross_usdt - fees_usdt
+        # === 실현손익(USDT) 및 수수료 추정 ===
+        qty = float(pos.get("qty") or 0.0)
+        side_up = 1 if str(side).upper()=="LONG" else -1
+        gross_usdt = (float(exit_price) - float(entry)) * qty * side_up
+
+        fee_bps = _fee_bps(order_type="MARKET", ex=None, symbol=symbol)
+        fees_usdt = _fee_usdt(entry, qty, fee_bps) + _fee_usdt(exit_price, qty, fee_bps)
+        net_usdt = gross_usdt - fees_usdt
 
 
-    before_cap = capital_get()
-    try:
-        capital_apply_realized_pnl(gross_usdt, fees_usdt)
-    except Exception as _e:
-        log(f"[CAPITAL] apply pnl warn: {symbol} {tf}: {_e}")
-    after_cap = capital_get()
-    delta_cap = after_cap - before_cap
-    delta_pct = (delta_cap / before_cap * 100.0) if before_cap > 0 else 0.0
+        before_cap = capital_get()
+        try:
+            capital_apply_realized_pnl(gross_usdt, fees_usdt)
+        except Exception as _e:
+            log(f"[CAPITAL] apply pnl warn: {symbol} {tf}: {_e}")
+        after_cap = capital_get()
+        delta_cap = after_cap - before_cap
+        delta_pct = (delta_cap / before_cap * 100.0) if before_cap > 0 else 0.0
 
-    # CSV: paper CLOSE
-    try:
-        if PAPER_CSV_CLOSE_LOG:
+        # CSV: paper CLOSE
+        try:
+            if PAPER_CSV_CLOSE_LOG:
 
-            lev = float((pos or {}).get("lev") or 1.0)
-            pnl_on_margin = (pnl_pct*lev) if (pnl_pct is not None) else None
-            extra = ",".join([
-                "mode=paper", f"lev={lev:.2f}",
-                f"pnl_pct_price={(pnl_pct if pnl_pct is not None else 0):.4f}",
-                f"pnl_pct_on_margin={(pnl_on_margin if pnl_on_margin is not None else 0):.4f}",
-                f"reason={exit_reason}"
-            ])
-            _log_trade_csv(symbol, tf, "CLOSE", side, float((pos or {}).get('qty',0.0)), float(exit_price), extra=extra)
+                lev = float((pos or {}).get("lev") or 1.0)
+                pnl_on_margin = (pnl_pct*lev) if (pnl_pct is not None) else None
+                extra = ",".join([
+                    "mode=paper", f"lev={lev:.2f}",
+                    f"pnl_pct_price={(pnl_pct if pnl_pct is not None else 0):.4f}",
+                    f"pnl_pct_on_margin={(pnl_on_margin if pnl_on_margin is not None else 0):.4f}",
+                    f"reason={exit_reason}"
+                ])
+                _log_trade_csv(symbol, tf, "CLOSE", side, float((pos or {}).get('qty',0.0)), float(exit_price), extra=extra)
 
-    except Exception as e:
-        log(f"[CSV_CLOSE_WARN] paper {symbol} {tf}: {e}")
+        except Exception as e:
+            log(f"[CSV_CLOSE_WARN] paper {symbol} {tf}: {e}")
 
-    # [ANCHOR: PAPER_CLOSE_AND_NOTIFY_LEDGER]
-    try:
-        capital_ledger_write(
-            "CLOSE",
-            symbol=symbol, tf=tf, side=side, reason=(exit_reason or ""),
-            entry_price=f"{entry:.8f}", exit_price=f"{exit_price:.8f}",
-            qty=f"{qty:.8f}",
-            gross_usdt=f"{gross_usdt:.8f}", fees_usdt=f"{fees_usdt:.8f}", net_usdt=f"{net_usdt:.8f}",
-            capital_after=f"{after_cap:.8f}",
-        )
-        capital_save_state()
-    except Exception as _e:
-        log(f"[CAPITAL] on_close ledger/save warn: {_e}")
-    # IDEMP: allow re-entry after manual/forced close
-    try: idem_clear_symbol_tf(symbol, tf)
-    except Exception: pass
+        # [ANCHOR: PAPER_CLOSE_AND_NOTIFY_LEDGER]
+        try:
+            await capital_ledger_write(
+                "CLOSE",
+                symbol=symbol, tf=tf, side=side, reason=(exit_reason or ""),
+                entry_price=f"{entry:.8f}", exit_price=f"{exit_price:.8f}",
+                qty=f"{qty:.8f}",
+                gross_usdt=f"{gross_usdt:.8f}", fees_usdt=f"{fees_usdt:.8f}", net_usdt=f"{net_usdt:.8f}",
+                capital_after=f"{after_cap:.8f}",
+            )
+            await capital_save_state()
+        except Exception as _e:
+            log(f"[CAPITAL] on_close ledger/save warn: {_e}")
+        # IDEMP: allow re-entry after manual/forced close
+        try: idem_clear_symbol_tf(symbol, tf)
+        except Exception: pass
 
-    return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty, "net_usdt": net_usdt}
+        return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty, "net_usdt": net_usdt}
+
+    if _POS_LOCK:
+        async with _POS_LOCK:
+            return await _do_close()
+    else:
+        return await _do_close()
 
 
 # [ANCHOR: PAPER_PARTIAL_CLOSE_BEGIN]
-def _paper_reduce(symbol: str, tf: str, reduce_qty: float, exit_price: float):
-    key = f"{symbol}|{tf}"
-    pos = PAPER_POS.get(key)
-    if not pos or reduce_qty <= 0: return None
-    side = pos.get("side","")
-    qty_old = float(pos.get("qty",0.0))
-    if qty_old <= 0: return None
-    reduce_qty = min(reduce_qty, qty_old)
-    entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-    pnl_usdt = (exit_price - entry) * reduce_qty if side=="LONG" else (entry - exit_price) * reduce_qty
-    qty_new = qty_old - reduce_qty
-    if qty_new <= 0: return _paper_close(symbol, tf, exit_price)
-    eff_margin_old = float(pos.get("eff_margin") or 0.0)
-    eff_margin_new = eff_margin_old * (qty_new/qty_old)
-    pos["qty"] = qty_new
-    pos["eff_margin"] = eff_margin_new
-    pos["last_update_ms"] = int(time.time()*1000)
-    PAPER_POS[key] = pos
-    _save_json(PAPER_POS_FILE, PAPER_POS)
-    return {"pnl": pnl_usdt, "qty_closed": reduce_qty, "qty_left": qty_new}
+async def _paper_reduce(symbol: str, tf: str, reduce_qty: float, exit_price: float):
+    async def _do_reduce():
+        key = f"{symbol}|{tf}"
+        pos = PAPER_POS.get(key)
+        if not pos or reduce_qty <= 0: return None
+        side = pos.get("side","")
+        qty_old = float(pos.get("qty",0.0))
+        if qty_old <= 0: return None
+        reduce_qty = min(reduce_qty, qty_old)
+        entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+        pnl_usdt = (exit_price - entry) * reduce_qty if side=="LONG" else (entry - exit_price) * reduce_qty
+        qty_new = qty_old - reduce_qty
+        if qty_new <= 0: return await _paper_close(symbol, tf, exit_price)
+        eff_margin_old = float(pos.get("eff_margin") or 0.0)
+        eff_margin_new = eff_margin_old * (qty_new/qty_old)
+        pos["qty"] = qty_new
+        pos["eff_margin"] = eff_margin_new
+        pos["last_update_ms"] = int(time.time()*1000)
+        PAPER_POS[key] = pos
+        _save_json(PAPER_POS_FILE, PAPER_POS)
+        return {"pnl": pnl_usdt, "qty_closed": reduce_qty, "qty_left": qty_new}
+
+    if _POS_LOCK:
+        async with _POS_LOCK:
+            return await _do_reduce()
+    else:
+        return await _do_reduce()
 # [ANCHOR: PAPER_PARTIAL_CLOSE_END]
 
 # [ANCHOR: HYDRATE_FROM_DISK_BEGIN]
@@ -5469,6 +5624,101 @@ def _hydrate_from_disk():
     except Exception as e:
         log(f"[HYDRATE] warn: {e}")
 # [ANCHOR: HYDRATE_FROM_DISK_END]
+
+# === [ADD] Safety / Daily limits / Kill-switch (singleton) ===
+from datetime import datetime, timezone, timedelta
+import json, os, pathlib, math
+
+KILL_SWITCH_ENABLE   = os.getenv("KILL_SWITCH_ENABLE","1")=="1"
+PANIC_FLAG_PATH      = os.getenv("PANIC_FLAG_PATH","./data/panic.flag")
+PANIC_CANCEL_OPEN    = os.getenv("PANIC_CANCEL_OPEN_ORDERS","1")=="1"
+PANIC_FORCE_CLOSE    = os.getenv("PANIC_FORCE_CLOSE","0")=="1"
+
+DAILY_MAX_LOSS_USDT  = float(os.getenv("DAILY_MAX_LOSS_USDT","0") or 0)
+DAILY_MAX_LOSS_PCT   = float(os.getenv("DAILY_MAX_LOSS_PCT","0") or 0)
+DAILY_MAX_CLOSES     = int(os.getenv("DAILY_MAX_CLOSES","0") or 0)
+DAILY_LIMIT_ACTION   = (os.getenv("DAILY_LIMIT_ACTION","pause") or "pause").lower()
+DAILY_RESET_HOUR_KST = int(os.getenv("DAILY_RESET_HOUR_KST","9") or 9)
+
+ENFORCE_MARKET_RULES = os.getenv("ENFORCE_MARKET_RULES","1")=="1"
+MIN_NOTIONAL         = float(os.getenv("MIN_NOTIONAL","5") or 5)
+TICK_ENFORCE         = os.getenv("TICK_ENFORCE","1")=="1"
+
+TRADE_CSV_PATH       = os.getenv("TRADE_CSV_PATH","./logs/trades.csv")
+CAPITAL_CSV_PATH     = os.getenv("CAPITAL_CSV_PATH","./logs/capital_ledger.csv")
+
+DASHBOARD_ENABLE     = os.getenv("DASHBOARD_ENABLE","1")=="1"
+DASHBOARD_CHANNEL_ID = int(os.getenv("DASHBOARD_CHANNEL_ID","0") or 0)
+DASHBOARD_UPDATE_SEC = int(os.getenv("DASHBOARD_UPDATE_SEC","10") or 10)
+PRESENCE_ENABLE      = os.getenv("PRESENCE_ENABLE","1")=="1"
+
+def _kst_now():
+    return datetime.now(timezone.utc) + timedelta(hours=9)
+
+def _daily_key_kst(dt=None):
+    if dt is None: dt=_kst_now()
+    return dt.strftime("%Y-%m-%d")
+
+def _panic_active():
+    return KILL_SWITCH_ENABLE and os.path.exists(PANIC_FLAG_PATH)
+
+def _panic_on():
+    if not KILL_SWITCH_ENABLE: return
+    pathlib.Path(PANIC_FLAG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    pathlib.Path(PANIC_FLAG_PATH).write_text("1")
+
+def _panic_off():
+    try: os.remove(PANIC_FLAG_PATH)
+    except FileNotFoundError: pass
+
+_DAILY_STATE_PATH = "./data/daily_limits.json"
+
+def _daily_state_load():
+    try:
+        with open(_DAILY_STATE_PATH,"r",encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _daily_state_save(st):
+    pathlib.Path(_DAILY_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(_DAILY_STATE_PATH,"w",encoding="utf-8") as f:
+        json.dump(st,f,ensure_ascii=False,indent=2)
+
+def _daily_reset_if_needed(capital_now: float):
+    st = _daily_state_load()
+    key = _daily_key_kst()
+    want_hour = DAILY_RESET_HOUR_KST
+    last = st.get("key","")
+    last_hour = st.get("hour",want_hour)
+    if key != last or last_hour != want_hour:
+        st = {"key": key, "hour": want_hour, "realized_usdt": 0.0, "realized_pct": 0.0,
+              "closes": 0, "base_capital": capital_now}
+        _daily_state_save(st)
+    return st
+
+def _daily_register_close(pnl_usdt: float, capital_after: float):
+    st = _daily_state_load()
+    if not st: st = _daily_reset_if_needed(capital_after)
+    st["realized_usdt"] = float(st.get("realized_usdt",0.0)) + float(pnl_usdt)
+    base = float(st.get("base_capital", capital_after) or 1.0)
+    st["realized_pct"]  = (st["realized_usdt"] / base) * 100.0
+    st["closes"]        = int(st.get("closes",0)) + 1
+    _daily_state_save(st)
+    return st
+
+def _daily_limits_ok(capital_now: float) -> (bool, str):
+    st = _daily_reset_if_needed(capital_now)
+    loss_usdt = float(st.get("realized_usdt",0.0))
+    loss_pct  = float(st.get("realized_pct",0.0))
+    closes    = int(st.get("closes",0))
+    if DAILY_MAX_LOSS_USDT>0 and (-loss_usdt) >= DAILY_MAX_LOSS_USDT:
+        return False, f"daily loss(usdt) reached: {loss_usdt:.2f}"
+    if DAILY_MAX_LOSS_PCT>0 and (-loss_pct) >= DAILY_MAX_LOSS_PCT:
+        return False, f"daily loss(pct) reached: {loss_pct:.2f}%"
+    if DAILY_MAX_CLOSES>0 and closes >= DAILY_MAX_CLOSES:
+        return False, f"daily max closes reached: {closes}"
+    return True, ""
 
 # === Margin Switch Queue: 포지션/오더 때문에 실패한 마진 전환을 예약 ===
 MARGIN_Q_FILE = "logs/margin_switch_queue.json"
@@ -5493,6 +5743,35 @@ async def _cancel_all_orders(ex, symbol: str):
                 log(f"[FUT] cancel warn {symbol} id={o.get('id')}: {e}")
     except Exception as e:
         log(f"[FUT] fetch_open_orders warn {symbol}: {e}")
+
+async def cancel_all_open_orders():
+    ex = FUT_EXCHANGE
+    if not ex:
+        return
+    try:
+        symbols = set(FUT_POS.keys()) | {"BTC/USDT", "ETH/USDT"}
+        for sym in symbols:
+            await _cancel_all_orders(ex, sym)
+    except Exception as e:
+        log(f"[FUT] cancel_all_open_orders warn: {e}")
+
+async def close_all_positions(reason="PANIC"):
+    n = 0
+    for key, pos in list(PAPER_POS.items()):
+        try:
+            sym, tf = key.split("|",1)
+        except Exception:
+            continue
+        fallback = float(pos.get("entry_price",0.0))
+        await _paper_close(sym, tf, get_last_price(sym, fallback), reason)
+        n += 1
+    for tfk, sym in list(FUT_POS_TF.items()):
+        await futures_close_all(sym, tfk, reason=reason)
+        n += 1
+    if CLEAR_IDEMP_ON_CLOSEALL:
+        try: idem_clear_all()
+        except Exception: pass
+    return n
 
 async def _has_open_pos_or_orders(ex, symbol: str) -> bool:
     try:
@@ -6284,6 +6563,38 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
                 pnl_pct_val = ((float(exit_price)/float(entry_price))-1.0) * 100.0 * mult
             except Exception:
                 pnl_pct_val = None
+        realized_pnl_usdt = float(pnl_usdt or 0.0)
+        realized_pnl_pct = float(pnl_pct_val if pnl_pct_val is not None else 0.0)
+        st = _daily_register_close(pnl_usdt=realized_pnl_usdt, capital_after=capital_get())
+        try:
+            pathlib.Path(os.path.dirname(TRADE_CSV_PATH)).mkdir(parents=True, exist_ok=True)
+            new_file = not os.path.exists(TRADE_CSV_PATH)
+            with open(TRADE_CSV_PATH,"a",encoding="utf-8",newline="") as f:
+                import csv
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(["ymd","ts","symbol","tf","side","reason",
+                                "entry","exit","pnl_usdt","pnl_pct",
+                                "fee_est","slip_bp",
+                                "upnl_before","upnl_after",
+                                "equity_before","equity_after",
+                                "mae_pct","mfe_pct"])
+                w.writerow([
+                    _daily_key_kst(), _kst_now().isoformat(),
+                    symbol, tf, side, reason,
+                    round(entry_price,6), round(exit_price,6),
+                    round(realized_pnl_usdt,4), round(realized_pnl_pct,4),
+                    round(fee_est_usdt,4) if 'fee_est_usdt' in locals() else 0.0,
+                    round(slip_bps,2) if 'slip_bps' in locals() else 0.0,
+                    round(upnl_before,4) if 'upnl_before' in locals() else 0.0,
+                    round(upnl_after,4)  if 'upnl_after'  in locals() else 0.0,
+                    round(equity_before,4) if 'equity_before' in locals() else capital_get(),
+                    round(equity_after,4)  if 'equity_after'  in locals() else capital_get(),
+                    round(mae_pct,4) if 'mae_pct' in locals() else 0.0,
+                    round(mfe_pct,4) if 'mfe_pct' in locals() else 0.0
+                ])
+        except Exception as e:
+            log(f"[CSV] trade log warn: {e}")
         is_gain = (pnl_pct_val is not None and pnl_pct_val >= 0)
         emoji = "🟢" if is_gain else "🔴"
         label = "익절" if is_gain else "손절"
@@ -6438,7 +6749,7 @@ async def _auto_close_and_notify_eth(
         return
 
     if TRADE_MODE == "paper":
-        info = _paper_close(symbol_eth, tf, float(exit_price), action_reason)
+        info = await _paper_close(symbol_eth, tf, float(exit_price), action_reason)
         if info:
             try:
                 await _notify_trade_exit(
@@ -6536,7 +6847,7 @@ async def _auto_close_and_notify_btc(
     xp = float(exit_price or cp or 0.0)
 
     if TRADE_MODE == "paper":
-        info = _paper_close(symbol, tf, xp, action_reason)
+        info = await _paper_close(symbol, tf, xp, action_reason)
         if info:
             try:
                 await _notify_trade_exit(
@@ -6880,6 +7191,89 @@ try:
 except Exception as e:
     log(f"[FUT] exchange init fail: {e}")
     FUT_EXCHANGE = None
+
+
+_DASHBOARD_STATE = {"msg_id": 0}
+
+async def _dash_channel(client):
+    ch_id = DASHBOARD_CHANNEL_ID or int(os.getenv("PNL_REPORT_CHANNEL_ID","0") or 0)
+    if not ch_id: return None
+    try: return await client.fetch_channel(ch_id)
+    except Exception: return None
+
+async def _dash_get_or_create_message(client):
+    ch = await _dash_channel(client)
+    if not ch: return None
+    if _DASHBOARD_STATE["msg_id"]:
+        try:
+            return await ch.fetch_message(_DASHBOARD_STATE["msg_id"])
+        except Exception:
+            _DASHBOARD_STATE["msg_id"] = 0
+    m = await ch.send("📊 initializing dashboard…")
+    _DASHBOARD_STATE["msg_id"] = m.id
+    return m
+
+def get_open_positions_summary():
+    out = []
+    try:
+        for key, pos in (PAPER_POS or {}).items():
+            try:
+                sym, tf = key.split("|",1)
+                side = str(pos.get("side","" )).upper()
+                qty = float(pos.get("qty") or 0.0)
+                entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                last = get_last_price(sym, entry)
+                pnl = ((last - entry) / entry * 100.0) if entry>0 else 0.0
+                out.append(f"{sym} {tf} {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl:+.2f}%")
+            except Exception:
+                continue
+        for sym, pos in (FUT_POS or {}).items():
+            try:
+                side = str(pos.get("side","" )).upper()
+                qty = float(pos.get("qty") or 0.0)
+                entry = float(pos.get("entry") or 0.0)
+                last = get_last_price(sym, entry)
+                pnl = ((last - entry) / entry * 100.0) if entry>0 else 0.0
+                out.append(f"{sym} FUT {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl:+.2f}%")
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+def _dash_render_text():
+    st = _daily_state_load()
+    cap = capital_get()
+    lines = [
+        f"**Equity**: ${cap:,.2f}",
+        f"**Day PnL**: {st.get('realized_usdt',0):+.2f} USDT ({st.get('realized_pct',0):+.2f}%) | closes={st.get('closes',0)}",
+        "— open positions —"
+    ]
+    try:
+        for pos in get_open_positions_summary():
+            lines.append(pos)
+    except Exception:
+        lines.append("(no position)")
+    return "\n".join(lines)
+
+async def _dash_loop(client):
+    if not DASHBOARD_ENABLE: return
+    while True:
+        try:
+            msg = await _dash_get_or_create_message(client)
+            if msg:
+                await msg.edit(content=_dash_render_text())
+            if PRESENCE_ENABLE:
+                st = _daily_state_load()
+                eq = capital_get()
+                pnl = st.get("realized_usdt",0.0)
+                await client.change_presence(activity=discord.Activity(
+                    type=discord.ActivityType.watching,
+                    name=f"Eq ${eq:,.0f} | Day {pnl:+.0f} USDT"
+                ))
+        except Exception as e:
+            log(f"[DASH] warn: {e}")
+        await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
 
 
 async def _sync_open_state_on_ready():
@@ -7827,6 +8221,8 @@ def _get_channel_or_skip(asset: str, tf: str):
 @client.event
 async def on_ready():
     log(f'✅ Logged in as {client.user}')
+    if DASHBOARD_ENABLE:
+        client.loop.create_task(_dash_loop(client))
 
     timeframes = ['15m', '1h', '4h', '1d']
 
@@ -7967,8 +8363,7 @@ async def on_ready():
                     entry = float(pos.get("entry_price") or pos.get("entry") or 0)
 
                     # 틱 힌트를 1분봉으로 클램프
-                    last_hint = float(snap.get("mark") or last_price)
-                    clamped, bar1m = _sanitize_exit_price(symbol_eth, last_hint)
+                    clamped, bar1m = await safe_price_hint(symbol_eth)
                     # 이상치면 무시
                     if _outlier_guard(clamped, bar1m):
                         pass
@@ -7980,7 +8375,7 @@ async def on_ready():
                         if ok_exit:
                             exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
                             if TRADE_MODE == "paper":
-                                info = _paper_close(symbol_eth, tf, exec_px, reason)
+                                info = await _paper_close(symbol_eth, tf, exec_px, reason)
                                 if info:
                                     await _notify_trade_exit(
                                         symbol_eth, tf,
@@ -8029,7 +8424,7 @@ async def on_ready():
                         _bar = _fetch_recent_bar_1m(symbol_eth)
                         exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
                         if TRADE_MODE=='paper':
-                            info = _paper_close(symbol_eth, tf, exec_px, exit_reason)
+                            info = await _paper_close(symbol_eth, tf, exec_px, exit_reason)
                             if info:
 
                                 await _notify_trade_exit(
@@ -8362,8 +8757,7 @@ async def on_ready():
                     entry = float(pos.get("entry_price") or pos.get("entry") or 0)
 
                     # 틱 힌트를 1분봉으로 클램프
-                    last_hint = float(snap.get("mark") or last_price)
-                    clamped, bar1m = _sanitize_exit_price(symbol_btc, last_hint)
+                    clamped, bar1m = await safe_price_hint(symbol_btc)
                     # 이상치면 무시
                     if _outlier_guard(clamped, bar1m):
                         pass
@@ -8375,7 +8769,7 @@ async def on_ready():
                         if ok_exit:
                             exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
                             if TRADE_MODE == "paper":
-                                info = _paper_close(symbol_btc, tf, exec_px, reason)
+                                info = await _paper_close(symbol_btc, tf, exec_px, reason)
                                 if info:
                                     await _notify_trade_exit(
                                         symbol_btc, tf,
@@ -8429,7 +8823,7 @@ async def on_ready():
                     if ok_exit:
                         exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
                         if TRADE_MODE=='paper':
-                            info = _paper_close(symbol_btc, tf, float(trig_px), exit_reason)
+                            info = await _paper_close(symbol_btc, tf, float(trig_px), exit_reason)
                             if info:
                                 await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
 
@@ -8646,6 +9040,9 @@ async def _set_pause(symbol: str | None, tf: str | None, minutes: int | None):
             for tfx in ("15m", "1h", "4h", "1d"):
                 PAUSE_UNTIL[(symbol.upper(), tfx)] = until_ms
 
+async def cmd_pause_all():
+    await _set_pause("ALL", "ALL", None)
+
 
 @client.event
 async def on_message(message):
@@ -8747,14 +9144,50 @@ async def on_message(message):
             before = capital_get()
             global _CAPITAL_RT
             _CAPITAL_RT = float(amount)
-            capital_save_state()
+            await capital_save_state()
             if CAP_RESET_LOG:
-                capital_ledger_write("RESET", capital_after=f"{capital_get():.8f}")
+                await capital_ledger_write("RESET", capital_after=f"{capital_get():.8f}")
 
             msg = f"🔄 CAPITAL RESET: {before:,.2f} → {capital_get():,.2f}"
             await message.channel.send(msg)
         except Exception as e:
             await message.channel.send(f"⚠️ cap reset 실패: {e}")
+        return
+
+    if content.startswith('!panic'):
+        _panic_on()
+        if PANIC_CANCEL_OPEN:
+            await cancel_all_open_orders()
+        if PANIC_FORCE_CLOSE:
+            await close_all_positions(reason="PANIC")
+        await message.channel.send("⛔ panic ON (entries blocked)")
+        return
+
+    if content.startswith('!unpanic'):
+        _panic_off()
+        await message.channel.send("✅ panic OFF")
+        return
+
+    if content.startswith('!limits'):
+        st = _daily_state_load()
+        await message.channel.send(
+            f"limits — realized: {st.get('realized_usdt',0):.2f} USDT ({st.get('realized_pct',0):.2f}%), "
+            f"closes: {st.get('closes',0)}, action={DAILY_LIMIT_ACTION}"
+        )
+        return
+
+    if content.startswith('!limit set'):
+        try:
+            _,_,k,v = content.split()
+            if k=='loss_usdt':
+                os.environ['DAILY_MAX_LOSS_USDT'] = str(float(v))
+            elif k=='loss_pct':
+                os.environ['DAILY_MAX_LOSS_PCT'] = str(float(v))
+            elif k=='closes':
+                os.environ['DAILY_MAX_CLOSES'] = str(int(v))
+            await message.channel.send(f"ok set {k}={v} (runtime)")
+        except Exception as e:
+            await message.channel.send(f"bad args: {e}")
         return
 
     # [ANCHOR: CONFIG_DUMP_HANDLER]
@@ -8778,7 +9211,7 @@ async def on_message(message):
                     continue
 
                 fallback = float(pos.get("entry_price", 0.0))
-                _paper_close(sym, tf, get_last_price(sym, fallback), "MANUAL")
+                await _paper_close(sym, tf, get_last_price(sym, fallback), "MANUAL")
                 n += 1
             for tfk, sym in list(FUT_POS_TF.items()):
                 await futures_close_all(sym, tfk, reason="MANUAL")
@@ -8797,7 +9230,7 @@ async def on_message(message):
             _, sym, tfx = content.split()
             if TRADE_MODE == "paper":
 
-                _paper_close(sym.upper(), tfx, get_last_price(sym.upper(), 0.0), "MANUAL")
+                await _paper_close(sym.upper(), tfx, get_last_price(sym.upper(), 0.0), "MANUAL")
 
             else:
                 await futures_close_symbol_tf(sym.upper(), tfx)
@@ -8866,103 +9299,6 @@ async def on_message(message):
             "• !risk SYMBOL TF tp=5 sl=2.5 tr=1.8",
         ]
         await message.channel.send("\n".join(lines))
-        return
-
-    # [ANCHOR: DIAG_CMD_CONFIG]
-    if content.startswith("!config"):
-        try:
-            lines = [
-                f"• ENABLE_OBSERVE: {cfg_get('ENABLE_OBSERVE','1')}",
-                f"• ENABLE_COOLDOWN: {cfg_get('ENABLE_COOLDOWN','1')}",
-                f"• STRONG_BYPASS_SCORE: {cfg_get('STRONG_BYPASS_SCORE','0.8')}",
-                f"• GK_TTL_HOLD_SEC: {cfg_get('GK_TTL_HOLD_SEC','0.8')}",
-                f"• GATEKEEPER_OBS_SEC: {cfg_get('GATEKEEPER_OBS_SEC','15m:20,1h:25,4h:40,1d:60')}",
-                f"• WAIT_TARGET_ENABLE: {cfg_get('WAIT_TARGET_ENABLE','0')}",
-                f"• TARGET_SCORE_BY_TF: {cfg_get('TARGET_SCORE_BY_TF')}",
-                f"• WAIT_TARGET_SEC: {cfg_get('WAIT_TARGET_SEC')}",
-                f"• TARGET_WAIT_MODE: {cfg_get('TARGET_WAIT_MODE','SOFT')}",
-                f"• IGNORE_OCCUPANCY_TFS: {cfg_get('IGNORE_OCCUPANCY_TFS','')}",
-                f"• TRADE_MODE: {cfg_get('TRADE_MODE','paper')}",
-                f"• ROUTE_ALLOW: {cfg_get('ROUTE_ALLOW','*')}",
-                f"• ROUTE_DENY: {cfg_get('ROUTE_DENY','')}",
-            ]
-            # [ANCHOR: CONFIG_EXT]
-            lines.append(f"• STRENGTH_WEIGHTS: {cfg_get('STRENGTH_WEIGHTS')}")
-            lines.append(f"• STRENGTH_BUCKETS: {cfg_get('STRENGTH_BUCKETS')}")
-            lines.append(f"• MTF_FACTORS: {cfg_get('MTF_FACTORS')}")
-            lines.append(f"• FULL_ALLOC_ON_ALL_ALIGN: {cfg_get('FULL_ALLOC_ON_ALL_ALIGN','1')}")
-            lines.append(f"• SCALE_ENABLE: {cfg_get('SCALE_ENABLE')}")
-            lines.append(f"• SCALE_MAX_LEGS: {cfg_get('SCALE_MAX_LEGS')}")
-            lines.append(f"• SCALE_UP_SCORE_DELTA: {cfg_get('SCALE_UP_SCORE_DELTA')}")
-            lines.append(f"• SCALE_DOWN_SCORE_DELTA: {cfg_get('SCALE_DOWN_SCORE_DELTA')}")
-            lines.append(f"• SCALE_STEP_PCT: {cfg_get('SCALE_STEP_PCT')}")
-            lines.append(f"• SCALE_REDUCE_PCT: {cfg_get('SCALE_REDUCE_PCT')}")
-            lines.append(f"• SCALE_MIN_ADD_NOTIONAL_USDT: {cfg_get('SCALE_MIN_ADD_NOTIONAL_USDT')}")
-            lines.append(f"• SCALE_REALLOCATE_BRACKETS: {int(SCALE_REALLOCATE_BRACKETS)}")
-            lines.append(f"• SCALE_BRACKETS_DEFAULT: {SCALE_BRACKETS_DEFAULT}")
-            lines.append(f"• SCALE_BRACKETS_ALIGN / CONTRA / RANGE: {SCALE_BRACKETS_ALIGN} / {SCALE_BRACKETS_CONTRA} / {SCALE_BRACKETS_RANGE}")
-            lines.append(f"• SCALE_REALLOC_ON_ALIGN_CHANGE: {int(SCALE_REALLOC_ON_ALIGN_CHANGE)}")
-            lines.append(f"• SCALE_REALLOC_ON_BIAS_STEP: {int(SCALE_REALLOC_ON_BIAS_STEP)}  (steps={SCALE_REALLOC_BIAS_STEPS})")
-            lines.append(f"• SCALE_REALLOC_COOLDOWN_SEC: {SCALE_REALLOC_COOLDOWN_SEC}")
-            lines.append(f"• SCALE_REALLOC_MIN_USDT: {SCALE_REALLOC_MIN_USDT}")
-            lines.append(f"• REALLOC_FUTURES_EXECUTE: {int(REALLOC_FUTURES_EXECUTE)}")
-            lines.append(f"• REALLOC_MIN_QTY: {REALLOC_MIN_QTY}")
-            lines.append(f"• REALLOC_MAX_RETRIES: {REALLOC_MAX_RETRIES}")
-            lines.append(f"• REALLOC_RETRY_SLEEP_SEC: {REALLOC_RETRY_SLEEP_SEC}")
-            lines.append(f"• CSV_SCALE_EVENTS: {int(CSV_SCALE_EVENTS)}")
-            lines.append(f"• SLIPPAGE_BY_SYMBOL: {cfg_get('SLIPPAGE_BY_SYMBOL')}")
-            lines.append(f"• TP_PCT_BY_SYMBOL: {cfg_get('TP_PCT_BY_SYMBOL')}")
-            lines.append(f"• SL_PCT_BY_SYMBOL: {cfg_get('SL_PCT_BY_SYMBOL')}")
-            lines.append(f"• TRAIL_PCT_BY_SYMBOL: {cfg_get('TRAIL_PCT_BY_SYMBOL')}")
-            lines.append(f"• EXIT_RESOLUTION: {EXIT_RESOLUTION}")
-            lines.append(f"• EXIT_EVAL_MODE: {EXIT_EVAL_MODE}")
-            lines.append(f"• EXIT_PRICE_SOURCE: {EXIT_PRICE_SOURCE}")
-            lines.append(f"• OUTLIER_MAX_1M: {OUTLIER_MAX_1M}")
-            lines.append(f"• REGIME_ENABLE: {int(REGIME_ENABLE)}")
-            lines.append(f"• REGIME_TF: {REGIME_TF}")
-            lines.append(f"• REGIME_LOOKBACK: {REGIME_LOOKBACK}")
-            lines.append(f"• REGIME_TREND_R2_MIN: {REGIME_TREND_R2_MIN}")
-            lines.append(f"• REGIME_ADX_MIN: {REGIME_ADX_MIN}")
-            lines.append(f"• STRUCT_ZIGZAG_PCT: {STRUCT_ZIGZAG_PCT}")
-            lines.append(f"• CHANNEL_BANDS_STD: {CHANNEL_BANDS_STD}")
-            lines.append(f"• CTX_ALPHA: {CTX_ALPHA}")
-            lines.append(f"• CTX_BETA: {CTX_BETA}")
-            lines.append(f"• REGIME_PLAYBOOK: {int(REGIME_PLAYBOOK)}")
-            lines.append(f"• ALERT_CTX_LINES: {int(ALERT_CTX_LINES)}")
-            lines.append(f"• CTX_TTL_SEC: {CTX_TTL_SEC}")
-            lines.append(f"• PLAYBOOK_ENABLE: {int(PLAYBOOK_ENABLE)}")
-            lines.append(f"• PB_ALIGN_TP_MUL/SL/TR: {PB_ALIGN_TP_MUL}/{PB_ALIGN_SL_MUL}/{PB_ALIGN_TR_MUL}")
-            lines.append(f"• PB_ALIGN_ALLOC_MUL: {PB_ALIGN_ALLOC_MUL}")
-            lines.append(f"• PB_ALIGN_LEV_CAP: {PB_ALIGN_LEV_CAP}")
-            lines.append(f"• PB_CONTRA_TP_MUL/SL/TR: {PB_CONTRA_TP_MUL}/{PB_CONTRA_SL_MUL}/{PB_CONTRA_TR_MUL}")
-            lines.append(f"• PB_CONTRA_ALLOC_MUL: {PB_CONTRA_ALLOC_MUL}")
-            lines.append(f"• PB_CONTRA_LEV_CAP: {PB_CONTRA_LEV_CAP}")
-            lines.append(f"• PB_RANGE_TP_MUL/SL/TR: {PB_RANGE_TP_MUL}/{PB_RANGE_SL_MUL}/{PB_RANGE_TR_MUL}")
-            lines.append(f"• PB_RANGE_ALLOC_MUL: {PB_RANGE_ALLOC_MUL}")
-            lines.append(f"• PB_RANGE_LEV_CAP: {PB_RANGE_LEV_CAP}")
-            lines.append(f"• PB_INTENSITY: {PB_INTENSITY}")
-            lines.append(f"• PLAYBOOK_HARD_LIMITS: {int(PLAYBOOK_HARD_LIMITS)}")
-            lines.append(f"• PB_ALIGN_ALLOC_ABS_CAP / CONTRA / RANGE: {PB_ALIGN_ALLOC_ABS_CAP} / {PB_CONTRA_ALLOC_ABS_CAP} / {PB_RANGE_ALLOC_ABS_CAP}")
-            lines.append(f"• PB_ALIGN_MAX_LEV / CONTRA / RANGE: {PB_ALIGN_MAX_LEV} / {PB_CONTRA_MAX_LEV} / {PB_RANGE_MAX_LEV}")
-            lines.append(f"• PLAYBOOK_SCALE_OVERRIDE: {int(PLAYBOOK_SCALE_OVERRIDE)}")
-            lines.append(f"• PB_ALIGN_SCALE_STEP_MUL / REDUCE_MUL: {PB_ALIGN_SCALE_STEP_MUL} / {PB_ALIGN_SCALE_REDUCE_MUL}")
-            lines.append(f"• PB_CONTRA_SCALE_STEP_MUL / REDUCE_MUL: {PB_CONTRA_SCALE_STEP_MUL} / {PB_CONTRA_SCALE_REDUCE_MUL}")
-            lines.append(f"• PB_RANGE_SCALE_STEP_MUL  / REDUCE_MUL: {PB_RANGE_SCALE_STEP_MUL}  / {PB_RANGE_SCALE_REDUCE_MUL}")
-            lines.append(f"• PB_ALIGN_SCALE_MAX_LEGS_ADD / CONTRA / RANGE: {PB_ALIGN_SCALE_MAX_LEGS_ADD} / {PB_CONTRA_SCALE_MAX_LEGS_ADD} / {PB_RANGE_SCALE_MAX_LEGS_ADD}")
-            lines.append(f"• PB_ALIGN_SCALE_UP/DOWN_SHIFT: {PB_ALIGN_SCALE_UP_DELTA_SHIFT} / {PB_ALIGN_SCALE_DOWN_DELTA_SHIFT}")
-            lines.append(f"• PB_CONTRA_SCALE_UP/DOWN_SHIFT: {PB_CONTRA_SCALE_UP_DELTA_SHIFT} / {PB_CONTRA_SCALE_DOWN_DELTA_SHIFT}")
-            lines.append(f"• PB_RANGE_SCALE_UP/DOWN_SHIFT: {PB_RANGE_SCALE_UP_DELTA_SHIFT} / {PB_RANGE_SCALE_DOWN_DELTA_SHIFT}")
-            lines.append(f"• RISK_INTERPRET_MODE: {RISK_INTERPRET_MODE}")
-            lines.append(f"• APPLY_LEV_TO_TRAIL: {int(APPLY_LEV_TO_TRAIL)}")
-            lines.append(f"• PAPER_CSV_CLOSE_LOG: {int(PAPER_CSV_CLOSE_LOG)}")
-            lines.append(f"• FUTURES_CSV_CLOSE_LOG: {int(FUTURES_CSV_CLOSE_LOG)}")
-            lines.append(f"• CLEAR_IDEMP_ON_CLOSEALL: {int(CLEAR_IDEMP_ON_CLOSEALL)}")
-            lines.append(f"• DEFAULT_PAUSE: {cfg_get('DEFAULT_PAUSE','1')}")
-            lines.append(f"• AFTER_CLOSE_PAUSE: {cfg_get('AFTER_CLOSE_PAUSE','1')}")
-            lines.append(f"• DAILY_RESUME_HOUR_KST: {cfg_get('DAILY_RESUME_HOUR_KST','11')}")
-            await message.channel.send("**CONFIG**\n" + "\n".join(lines))
-        except Exception as e:
-            await message.channel.send(f"config error: {e}")
         return
 
     # [ANCHOR: DIAG_CMD_HEALTH]
@@ -9289,7 +9625,7 @@ def _reload_runtime_parsed_maps():
 if __name__ == "__main__":
     exchange = GLOBAL_EXCHANGE
 
-    capital_load_state()
+    asyncio.run(capital_load_state())
     log(f"[BOOT] CAPITAL: restored={int(bool(CAPITAL_PERSIST))} base={CAPITAL_BASE:,.2f} now={capital_get():,.2f}")
     log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
 
