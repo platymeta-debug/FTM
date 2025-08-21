@@ -4798,6 +4798,70 @@ async def safe_price_hint(symbol:str):
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
+# [ANCHOR: DASH_UPNL_HELPERS_BEGIN]
+from typing import List, Dict, Tuple
+
+def _pnl_usdt(side: str, entry: float, last: float, qty: float) -> float:
+    # 선물/페이퍼: 달러 손익 = (last - entry) * qty * (롱=+1, 숏=-1)
+    mult = 1.0 if str(side).upper() == "LONG" else -1.0
+    return (last - entry) * qty * mult
+
+def _pnl_pct_on_margin(side: str, entry: float, last: float, lev: float) -> float:
+    # 퍼센트(마진 기준): 가격변동률(%) × 방향 × 레버리지
+    mult = 1.0 if str(side).upper() == "LONG" else -1.0
+    chg_pct = (last - entry) / entry * 100.0
+    return chg_pct * mult * float(lev or 1.0)
+
+async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
+    """
+    열린 포지션을 순회하며 1분봉 가드가 적용된 가격으로 UPNL/ROE를 계산, 합계/정렬 정보까지 반환
+    returns (rows, totals)
+      rows: [{symbol, tf, side, qty, entry, last, lev, upnl_usdt, upnl_pct_on_margin, notional}]
+      totals: {upnl_usdt_sum, upnl_pct_on_equity}
+    """
+    rows: List[Dict] = []
+    upnl_sum = 0.0
+    # 포지션 소스: 페이퍼/실거래 공용 요약 유틸 사용 (프로젝트 내 존재). 없다면 PAPER_POS를 직접 순회.
+    positions = get_open_positions_iter()  # 없는 경우, 기존 요약 루틴/저장소 조회 함수로 대체
+
+    for pos in positions:
+        symbol = pos["symbol"]; tf = pos["tf"]
+        side = pos["side"]; qty = float(pos["qty"])
+        entry = float(pos["entry_price"])
+        lev = float(pos.get("lev") or 1.0)
+
+        # 1m 바운드/이상치 가드를 거친 안전 가격
+        last, _bar = await safe_price_hint(symbol)
+
+        upnl = _pnl_usdt(side, entry, last, qty)
+        roe_pct = _pnl_pct_on_margin(side, entry, last, lev)
+        notional = last * qty
+
+        rows.append({
+            "symbol": symbol, "tf": tf, "side": side, "qty": qty, "entry": entry,
+            "last": last, "lev": lev, "upnl_usdt": upnl, "upnl_pct_on_margin": roe_pct,
+            "notional": notional
+        })
+        upnl_sum += upnl
+
+    # 정렬
+    mode = (os.getenv("DASHBOARD_SORT","by_notional") or "by_notional").lower()
+    if mode == "by_upnl":
+        rows.sort(key=lambda r: r["upnl_usdt"], reverse=True)
+    elif mode == "by_symbol":
+        rows.sort(key=lambda r: (r["symbol"], r["tf"]))
+    else:
+        rows.sort(key=lambda r: r["notional"], reverse=True)
+
+    # 합계 퍼센트는 현재 Equity 대비(실현 총자본 기준)로 계산
+    eq_base = float(capital_get() or 1.0)
+    totals = {
+        "upnl_usdt_sum": upnl_sum,
+        "upnl_pct_on_equity": (upnl_sum / eq_base * 100.0)
+    }
+    return rows, totals
+# [ANCHOR: DASH_UPNL_HELPERS_END]
+
 # [ANCHOR: CONFIG_DUMP_HELPERS]  << ADD NEW (TOP-LEVEL FUNCS) >>
 CONFIG_DUMP_MODE = os.getenv("CONFIG_DUMP_MODE","chunk").lower()  # chunk | file
 CONFIG_CHUNK_LEN = int(os.getenv("CONFIG_CHUNK_LEN","1800") or 1800)
@@ -7213,77 +7277,86 @@ async def _dash_get_or_create_message(client):
     _DASHBOARD_STATE["msg_id"] = m.id
     return m
 
-def get_open_positions_summary():
+def get_open_positions_iter():
+    """Yield unified open position dicts from paper/futures stores."""
     out = []
     try:
         for key, pos in (PAPER_POS or {}).items():
             try:
-                sym, tf = key.split("|",1)
-                side = str(pos.get("side","" )).upper()
-                qty = float(pos.get("qty") or 0.0)
-                entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-                last = get_last_price(sym, entry)
-
-                chg_px_pct = ((last - entry) / entry * 100.0) if entry > 0 else 0.0
-                side_mult = 1.0 if side == "LONG" else -1.0
-                lev_used = float(pos.get("lev") or 1.0)
-                pnl_pct_on_margin = chg_px_pct * side_mult * lev_used
-                out.append(
-                    f"{sym} {tf} {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl_pct_on_margin:+.2f}%"
-                )
-
+                sym, tf = key.split("|", 1)
+                out.append({
+                    "symbol": sym,
+                    "tf": tf,
+                    "side": str(pos.get("side", "")).upper(),
+                    "qty": float(pos.get("qty") or 0.0),
+                    "entry_price": float(pos.get("entry_price") or pos.get("entry") or 0.0),
+                    "lev": float(pos.get("lev") or 1.0),
+                })
             except Exception:
                 continue
         for sym, pos in (FUT_POS or {}).items():
             try:
-                side = str(pos.get("side","" )).upper()
-                qty = float(pos.get("qty") or 0.0)
-                entry = float(pos.get("entry") or 0.0)
-                last = get_last_price(sym, entry)
-
-                chg_px_pct = ((last - entry) / entry * 100.0) if entry > 0 else 0.0
-                side_mult = 1.0 if side == "LONG" else -1.0
-                lev_used = float(pos.get("lev") or 1.0)
-                pnl_pct_on_margin = chg_px_pct * side_mult * lev_used
-                out.append(
-                    f"{sym} FUT {side} {qty:.4f} @ {entry:.2f} | UPNL {pnl_pct_on_margin:+.2f}%"
-                )
-
+                out.append({
+                    "symbol": sym,
+                    "tf": pos.get("tf", "FUT"),
+                    "side": str(pos.get("side", "")).upper(),
+                    "qty": float(pos.get("qty") or 0.0),
+                    "entry_price": float(pos.get("entry") or pos.get("entry_price") or 0.0),
+                    "lev": float(pos.get("lev") or 1.0),
+                })
             except Exception:
                 continue
     except Exception:
         pass
     return out
 
-def _dash_render_text():
+async def _dash_render_text():
     st = _daily_state_load()
-    cap = capital_get()
-    lines = [
-        f"**Equity**: ${cap:,.2f}",
-        f"**Day PnL**: {st.get('realized_usdt',0):+.2f} USDT ({st.get('realized_pct',0):+.2f}%) | closes={st.get('closes',0)}",
-        "— open positions —"
-    ]
-    try:
-        for pos in get_open_positions_summary():
-            lines.append(pos)
-    except Exception:
-        lines.append("(no position)")
-    return "\n".join(lines)
+    cap_realized = capital_get()          # 실현 총자본
+    rows, totals = await gather_positions_upnl()
+
+    # live equity 모드: 실현 + UPNL 합산
+    eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE","live") or "live").lower()
+    if eq_mode == "live":
+        eq_now = cap_realized + totals["upnl_usdt_sum"]
+    else:
+        eq_now = cap_realized
+
+    lines = []
+    lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode=="live" else " (realized)"))
+    lines.append(f"Day PnL: {st.get('realized_usdt',0):+.2f} USDT ({st.get('realized_pct',0):+.2f}%) | closes={st.get('closes',0)}")
+
+    if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL","1")=="1":
+        lines.append(f"Open UPNL: {totals['upnl_usdt_sum']:+.2f} USDT ({totals['upnl_pct_on_equity']:+.2f}% of equity)")
+
+    lines.append("— open positions —" if rows else "— no open positions —")
+
+    show_usdt = os.getenv("DASHBOARD_SHOW_POS_USDT","1")=="1"
+    for r in rows:
+        base = (f"{r['symbol']} {r['tf']} {r['side']} {r['qty']:.4f} @ {r['entry']:.2f} "
+                f"→ {r['last']:.2f} ×{r['lev']:g} | UPNL {r['upnl_pct_on_margin']:+.2f}%")
+        if show_usdt:
+            base += f" / {r['upnl_usdt']:+.2f} USDT"
+        lines.append(base)
+
+    return "\n".join(lines), st, eq_now, totals
+
 
 async def _dash_loop(client):
     if not DASHBOARD_ENABLE: return
     while True:
         try:
             msg = await _dash_get_or_create_message(client)
+            txt, st, eq_now, totals = await _dash_render_text()
             if msg:
-                await msg.edit(content=_dash_render_text())
+                await msg.edit(content=txt)
             if PRESENCE_ENABLE:
-                st = _daily_state_load()
-                eq = capital_get()
-                pnl = st.get("realized_usdt",0.0)
+                eq = eq_now
+                day = st.get("realized_usdt",0.0)
+                ou = totals["upnl_usdt_sum"]
                 await client.change_presence(activity=discord.Activity(
                     type=discord.ActivityType.watching,
-                    name=f"Eq ${eq:,.0f} | Day {pnl:+.0f} USDT"
+                    name=f"Eq ${eq:,.0f} | Day {day:+.0f} | Open {ou:+.0f}"
                 ))
         except Exception as e:
             log(f"[DASH] warn: {e}")
