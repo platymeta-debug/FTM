@@ -17,24 +17,48 @@ import asyncio  # ✅ 이 줄을 꼭 추가
 def load_env_chain(paths=("key.env", "key.advanced.env", "token.env")):
     """
     Load .env files in order; later files override earlier ones.
-    Each file is optional.
+    If ENV_CHAIN_ORDER is set (e.g., "key,advanced,token"), use that mapping.
+    Support "*.local.env" overlays loaded immediately after their base.
     """
     import os as _os
     from pathlib import Path as _Path
-    for p in paths:
+
+    # map short tokens -> filenames
+    _map = {"key": "key.env", "advanced": "key.advanced.env", "token": "token.env"}
+
+    # 1) resolve order
+    _order_raw = (_os.getenv("ENV_CHAIN_ORDER") or "").strip()
+    if _order_raw:
+        toks = [t.strip() for t in _order_raw.split(",") if t.strip()]
+        paths = tuple(_map.get(t, t) for t in toks)  # allow direct filenames too
+
+    # 2) expand .local overlays
+    def _expand_with_local(seq):
+        out = []
+        for p in seq:
+            out.append(p)
+            if p.endswith(".env"):
+                loc = p.replace(".env", ".local.env")
+                if _Path(loc).exists():
+                    out.append(loc)
+        return out
+
+    seq = _expand_with_local(paths)
+
+    # 3) load in order
+    for p in seq:
         try:
             fp = _Path(p)
-            if fp.exists():
-                with open(fp, "r", encoding="utf-8") as f:
-                    for raw in f:
-                        line = raw.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" not in line:
-                            continue
-                        k, v = line.split("=", 1)
-                        k = k.strip(); v = v.strip()
-                        _os.environ[k] = v
+            if not fp.exists():
+                continue
+            with open(fp, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    _os.environ[k.strip()] = v.strip()
+            print(f"[ENV] loaded: {fp}")
         except Exception as e:
             print(f"[ENV] warn: {p}: {e}")
 
@@ -42,6 +66,7 @@ def _boot_env_summary():
     keys = [
         "AUTO_TRADE","TRADE_MODE","EXCHANGE_ID","HEDGE_MODE",
         "CAPITAL_SOURCE","CAPITAL_BASE","CAPITAL_INCLUDE_UPNL",
+        "ENV_CHAIN_ORDER",
         "DASH_LOCALE","DASHBOARD_CHANNEL_ID","TRADE_CHANNEL_ID",
         "DASHBOARD_EQUITY_MODE","DASHBOARD_UPDATE_SEC",
         "DASH_SHOW_FEES","UPNL_INCLUDE_FEES","FEE_SOURCE",
@@ -4717,6 +4742,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if exec_price is None:
         log(f"[FILL_MODEL] missing ref price for entry {symbol} {tf}")
         return
+
     _ex_guard = _ex_guard if '_ex_guard' in locals() else (FUT_EXCHANGE or PUB_FUT_EXCHANGE)
     if ENFORCE_MARKET_RULES and _ex_guard:
         # futures-aware rounding + min_notional gate
