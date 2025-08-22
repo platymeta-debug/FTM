@@ -13,28 +13,63 @@ import discord
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
 
+# [ANCHOR: DEBUG_FLAG_BEGIN]
+def _env_on(k: str, default="0") -> bool:
+    """Return True if env var looks like on: 1/true/yes/on (case-insensitive)."""
+    import os as _os
+    v = _os.getenv(k, default)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+# Global debug flag (safe default)
+DEBUG = _env_on("DEBUG")
+# [ANCHOR: DEBUG_FLAG_END]
+
 # [ANCHOR: ENV_CHAIN_BEGIN]
 def load_env_chain(paths=("key.env", "key.advanced.env", "token.env")):
     """
     Load .env files in order; later files override earlier ones.
-    Each file is optional.
+    If ENV_CHAIN_ORDER is set (e.g., "key,advanced,token"), use that mapping.
+    Support "*.local.env" overlays loaded immediately after their base.
     """
     import os as _os
     from pathlib import Path as _Path
-    for p in paths:
+
+    # map short tokens -> filenames
+    _map = {"key": "key.env", "advanced": "key.advanced.env", "token": "token.env"}
+
+    # 1) resolve order
+    _order_raw = (_os.getenv("ENV_CHAIN_ORDER") or "").strip()
+    if _order_raw:
+        toks = [t.strip() for t in _order_raw.split(",") if t.strip()]
+        paths = tuple(_map.get(t, t) for t in toks)  # allow direct filenames too
+
+    # 2) expand .local overlays
+    def _expand_with_local(seq):
+        out = []
+        for p in seq:
+            out.append(p)
+            if p.endswith(".env"):
+                loc = p.replace(".env", ".local.env")
+                if _Path(loc).exists():
+                    out.append(loc)
+        return out
+
+    seq = _expand_with_local(paths)
+
+    # 3) load in order
+    for p in seq:
         try:
             fp = _Path(p)
-            if fp.exists():
-                with open(fp, "r", encoding="utf-8") as f:
-                    for raw in f:
-                        line = raw.strip()
-                        if not line or line.startswith("#"):
-                            continue
-                        if "=" not in line:
-                            continue
-                        k, v = line.split("=", 1)
-                        k = k.strip(); v = v.strip()
-                        _os.environ[k] = v
+            if not fp.exists():
+                continue
+            with open(fp, "r", encoding="utf-8") as f:
+                for raw in f:
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    k, v = line.split("=", 1)
+                    _os.environ[k.strip()] = v.strip()
+            print(f"[ENV] loaded: {fp}")
         except Exception as e:
             print(f"[ENV] warn: {p}: {e}")
 
@@ -42,6 +77,7 @@ def _boot_env_summary():
     keys = [
         "AUTO_TRADE","TRADE_MODE","EXCHANGE_ID","HEDGE_MODE",
         "CAPITAL_SOURCE","CAPITAL_BASE","CAPITAL_INCLUDE_UPNL",
+        "ENV_CHAIN_ORDER",
         "DASH_LOCALE","DASHBOARD_CHANNEL_ID","TRADE_CHANNEL_ID",
         "DASHBOARD_EQUITY_MODE","DASHBOARD_UPDATE_SEC",
         "DASH_SHOW_FEES","UPNL_INCLUDE_FEES","FEE_SOURCE",
@@ -339,24 +375,36 @@ def _eval_exit_touch(side: str, entry: float, tf: str, bar: dict):
             return True, "TP", tp_price
     return False, None, None
 
-def _choose_exec_price(reason: str, side: str, trig_px: float, bar: dict) -> float:
+async def _choose_exec_price(symbol: str, tf: str, reason: str, side: str, trig_px: float, bar: dict) -> float:
     """
-    EXIT_FILL_MODE에 따라 실제 기록할 '종결가' 선택.
-    - threshold: 임계값 그대로
-    - bar_bound: 분봉 경계값으로 치환
+    EXIT_FILL_MODE에 따라 실제 기록할 '종결가' 선택 후 공통 실행가격 모델 적용.
     """
     hi, lo = float(bar["high"]), float(bar["low"])
     if EXIT_FILL_MODE == "threshold":
-        return float(trig_px)
-    side = str(side).upper()
-    reason = (reason or "").upper()
-    if reason == "TRAIL":
-        return lo if side == "LONG" else hi
-    if reason == "SL":
-        return max(trig_px, lo) if side == "LONG" else min(trig_px, hi)
-    if reason == "TP":
-        return min(trig_px, hi) if side == "LONG" else max(trig_px, lo)
-    return max(min(trig_px, hi), lo)
+        base_px = float(trig_px)
+    else:
+        side = str(side).upper()
+        reasonU = (reason or "").upper()
+        if reasonU == "TRAIL":
+            base_px = lo if side == "LONG" else hi
+        elif reasonU == "SL":
+            base_px = max(trig_px, lo) if side == "LONG" else min(trig_px, hi)
+        elif reasonU == "TP":
+            base_px = min(trig_px, hi) if side == "LONG" else max(trig_px, lo)
+        else:
+            base_px = max(min(trig_px, hi), lo)
+
+    snap = await get_price_snapshot(symbol)
+    bar1m = _fetch_recent_bar_1m(symbol)
+    _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+    final_px = _exec_price_model(_ex_guard, symbol, tf, side, "exit", snap, bar1m, ref_override=float(base_px))
+
+    if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+        try:
+            log(f"[FILL_MODEL] EXIT {symbol} {tf} side={side} reason={reason} ref={os.getenv('EXIT_PRICE_SOURCE','mark')} slp={_resolve_slippage_pct(symbol, tf, 'exit')}")
+        except Exception:
+            pass
+    return final_px
 # [ANCHOR: EXIT_EVAL_HELPERS_END]
 
 
@@ -1567,39 +1615,43 @@ def detect_market_regime(tf='1h'):
 
 # === 실시간 가격(티커) 유틸 ===
  # === [ANCHOR: PRICE_SNAPSHOT_UTIL] 심볼별 라이브 프라이스 스냅샷 (공통 현재가) ===
-PRICE_SNAPSHOT = {}  # {symbol: {"ts": ms, "last": float|None, "bid": float|None, "ask": float|None, "mid": float|None, "chosen": float|None}}
+PRICE_SNAPSHOT = {}  # {symbol: {"ts": ms, "last": float|None, "bid": float|None, "ask": float|None, "mid": float|None, "mark": float|None, "index": float|None, "chosen": float|None}}
 PRICE_SNAPSHOT_TTL_MS = 500  # 동일 틱 처리용 짧은 TTL
 
 async def get_price_snapshot(symbol: str) -> dict:
     """
-    전 TF(15m/1h/4h/1d)에서 동일하게 쓸 '현재가 스냅샷'을 만든다.
-    chosen = mid(가능) 또는 last(대체). 실패 시 None.
+    Build a unified 'live price snapshot' used across TFs.
+    chosen follows PRICE_FALLBACK_ORDER (e.g., mark,last,mid,index).
+    In paper mode, we still query a public futures exchange for mark/index.
     """
     now_ms = int(time.time() * 1000)
     rec = PRICE_SNAPSHOT.get(symbol)
     if rec and (now_ms - rec.get("ts", 0) < PRICE_SNAPSHOT_TTL_MS):
         return rec
 
-    # 1) 선물 모드면 선물 인스턴스 우선, 2) 아니면 스팟 티커
-    last = bid = ask = mid = mark = chosen = None
-    try:
-        ex = FUT_EXCHANGE if (TRADE_MODE == "futures" and FUT_EXCHANGE) else None
-        if ex:
+    last = bid = ask = mid = mark = index = None
+
+    # Prefer authenticated FUT_EXCHANGE; else fall back to PUB_FUT_EXCHANGE; else spot last.
+    ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
+    if ex:
+        try:
             t = await _post(ex.fetch_ticker, symbol)
             last = float(t.get('last') or 0) or None
             bid  = float(t.get('bid')  or 0) or None
             ask  = float(t.get('ask')  or 0) or None
             try:
-                mark = float(
-                    t.get('markPrice')
-                    or (t.get('info', {}).get('markPrice') if isinstance(t.get('info'), dict) else 0)
-                ) or None
+                info  = t.get('info', {}) if isinstance(t.get('info'), dict) else {}
+                mark  = float(t.get('markPrice')  or info.get('markPrice')  or 0) or None
+                index = float(t.get('indexPrice') or info.get('indexPrice') or 0) or None
             except Exception:
-                mark = None
-        else:
+                pass
+        except Exception:
+            pass
+    else:
+        try:
             last = float(fetch_live_price(symbol) or 0) or None
-    except Exception:
-        pass
+        except Exception:
+            last = None
 
     if bid and ask:
         try:
@@ -1607,8 +1659,22 @@ async def get_price_snapshot(symbol: str) -> dict:
         except Exception:
             mid = None
 
-    chosen = mid or last
-    PRICE_SNAPSHOT[symbol] = {"ts": now_ms, "last": last, "bid": bid, "ask": ask, "mid": mid, "mark": mark, "chosen": chosen}
+    # Decide chosen by fallback order
+    chosen = None
+    for k in PRICE_FALLBACK_ORDER:
+        if k == "mark"  and mark  is not None: chosen = mark;  break
+        if k == "last"  and last  is not None: chosen = last;  break
+        if k == "mid"   and mid   is not None: chosen = mid;   break
+        if k == "index" and index is not None: chosen = index; break
+
+    # Optional: if you never want to use raw 'mark' as the final number for display
+    if MARK_CLAMP_TO_LAST and (chosen is not None) and (mark is not None) and (chosen == mark) and (last is not None):
+        chosen = last
+
+    PRICE_SNAPSHOT[symbol] = {
+        "ts": now_ms, "last": last, "bid": bid, "ask": ask,
+        "mid": mid, "mark": mark, "index": index, "chosen": chosen
+    }
     return PRICE_SNAPSHOT[symbol]
 
 def fetch_live_price(symbol: str) -> float | None:
@@ -4195,7 +4261,15 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
                     ARMED_SIGNAL.pop(key, None)
                     ARMED_TS.pop(key, None)
         elif state == 'CONFIRMED':
-            await maybe_execute_trade(symbol, tf, signal, last_price=display_price, candle_ts=c_ts)
+            side_c = "LONG" if signal == "BUY" else "SHORT"
+            snap2 = await get_price_snapshot(symbol)
+            bar1m = _fetch_recent_bar_1m(symbol)
+            _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+            exec_price = _exec_price_model(_ex_guard, symbol, tf, side_c, "entry", snap2, bar1m)
+            if exec_price is None:
+                log(f"[FILL_MODEL] intrabar_confirm missing price {symbol} {tf}")
+                return
+            await maybe_execute_trade(symbol, tf, signal, last_price=exec_price, candle_ts=c_ts)
             if signal not in ('BUY', 'SELL'):
                 TRIGGER_STATE[key] = 'FLAT'
                 ARMED_SIGNAL.pop(key, None)
@@ -4219,6 +4293,16 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip (signal={signal})")
         log(f"⏭ {symbol} {tf}: skip reason=NEUTRAL")
         return
+
+    # --- Hedge-side policy (paper path as futures) ---
+    try:
+        if not _hedge_side_allowed(symbol, tf, exec_signal):
+            log(f"[PAPER] skip {symbol} {tf} {exec_signal}: hedge side policy")
+            return
+    except Exception as e:
+        log(f"[PAPER] hedge policy warn {symbol} {tf}: {e}")
+
+    side = ("LONG" if exec_signal=="BUY" else "SHORT")
 
     # [ADD] Kill-switch guard
     if signal in ("BUY","SELL") and _panic_active():
@@ -4279,10 +4363,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     # [ANCHOR: REENTRY_GUARD_END]
 
     # [ANCHOR: PROTECTIVE_CHECK_BEFORE_ENTRY]
-    key = f"{symbol}|{tf}"
+    key = _pp_key(symbol, tf, side)
     pos = (PAPER_POS or {}).get(key)
     if pos:
-        side  = str(pos.get("side", "")).upper()
         entry = float(pos.get("entry_price") or pos.get("entry") or 0)
         clamped, bar1m = await safe_price_hint(symbol)
         if not _outlier_guard(clamped, bar1m):
@@ -4292,8 +4375,8 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             op_ts = float(pos.get("opened_ts") or 0)/1000.0
             ok_exit, reason, trig_px, dbg = _eval_exit(symbol, tf, side, entry, clamped, tp_price, sl_price, tr_eff, (symbol, tf), lev, op_ts)
             if ok_exit:
-                exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
-                info = await _paper_close(symbol, tf, exec_px, reason) if TRADE_MODE=="paper" else None
+                exec_px = await _choose_exec_price(symbol, tf, reason, side, float(trig_px), bar1m)
+                info = await _paper_close(symbol, tf, exec_px, reason, side=side) if TRADE_MODE=="paper" else None
                 if info:
 
                     await _notify_trade_exit(symbol, tf, side=info["side"], entry_price=info["entry_price"], exit_price=exec_px, reason=(reason or "TP/SL"), mode="paper", pnl_pct=info.get("pnl_pct"), qty=info.get("qty"), pnl_usdt=info.get("net_usdt"))
@@ -4321,6 +4404,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
+    if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+        try:
+            log(f"[GK] mode={TRIGGER_MODE} px_src(entry)={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} px_src(exit)={os.getenv('EXIT_PRICE_SOURCE','mark')} clamp={os.getenv('BAR_BOUND_CLAMP','1')}")
+        except Exception:
+            pass
+
     occ = PAPER_POS_TF.get(tf)
     if tf not in IGNORE_OCCUPANCY_TFS and occ:
         has_real = _has_open_position(occ, tf, TRADE_MODE)
@@ -4341,10 +4430,11 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     # NOTE: Do NOT pre-commit TF occupancy here anymore.
 
     # [ANCHOR: AVOID_OVERWRITE_OPEN_POS]  (REPLACED)
-    existing_paper = (PAPER_POS or {}).get(key)
+    key_side = _pp_key(symbol, tf, side)
+    existing_paper = (PAPER_POS or {}).get(key_side)
     has_paper = existing_paper is not None
     fut_qty, fut_side = await _fut_get_open_qty_side(symbol)
-    has_futures = fut_qty > 0
+    has_futures = fut_qty > 0 and (fut_side == side)
 
     if (has_paper or has_futures) and SCALE_ENABLE:
         # NOTE: use EXEC_STATE stored score
@@ -4430,6 +4520,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 if TRADE_MODE == "paper":
                     add_eff = add_base
                     add_qty = (add_eff * lev_used) / float(last_price)
+                    _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+                    if ENFORCE_MARKET_RULES and _ex_guard:
+                        add_qty = _fut_amount_to_precision(_ex_guard, symbol, add_qty)
+                        if not _fut_min_notional_ok(_ex_guard, symbol, float(last_price), add_qty):
+                            if SCALE_LOG:
+                                logging.info(f"[PAPER_SCALE_SKIP] below min_notional {symbol} tf={tf} add_qty={add_qty}")
+                            add_eff = 0.0
+                            add_qty = 0.0
                     old_qty = float(existing_paper.get("qty") or 0.0)
                     old_entry = float(existing_paper.get("entry_price") or last_price)
                     new_qty = old_qty + add_qty
@@ -4453,14 +4551,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                     avg = float(existing_paper["entry_price"])
                     tp_pct = float(existing_paper.get("tp_pct", 0.0))
                     sl_pct = float(existing_paper.get("sl_pct", 0.0))
-                    if existing_paper.get("side") == "LONG":
-                        existing_paper["tp_price"] = (avg * (1 + tp_pct/100.0)) if tp_pct>0 else None
-                        existing_paper["sl_price"] = (avg * (1 - sl_pct/100.0)) if sl_pct>0 else None
-                    else:
-                        existing_paper["tp_price"] = (avg * (1 - tp_pct/100.0)) if tp_pct>0 else None
-                        existing_paper["sl_price"] = (avg * (1 + sl_pct/100.0)) if sl_pct>0 else None
-
+                    tr_pct = float(existing_paper.get("tr_pct", 0.0))
                     PAPER_POS[key] = existing_paper
+                    try:
+                        _paper_ensure_tp_sl_trailing(symbol, tf, existing_paper.get("side"), avg, tp_pct, sl_pct, tr_pct, existing_paper.get("lev"))
+                    except Exception as e:
+                        log(f"[PAPER] ensure tp/sl/tr warn {symbol} {tf}: {e}")
                     _save_json(PAPER_POS_FILE, PAPER_POS)
                     did_scale = True
                 else:
@@ -4521,7 +4617,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 reduce_size = current_notional * red_pct
             if TRADE_MODE == "paper":
                 red_qty = reduce_size / float(last_price)
-                info = await _paper_reduce(symbol, tf, red_qty, float(last_price)) if red_qty>0 else None
+                info = await _paper_reduce(symbol, tf, side, red_qty, float(last_price)) if red_qty>0 else None
                 if info: did_scale = True
             else:
                 red_qty = reduce_size / float(last_price)
@@ -4547,7 +4643,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
 
             try:
-                pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else None
+                pos = PAPER_POS.get(_pp_key(symbol, tf, side)) if TRADE_MODE=='paper' else None
                 if isinstance(pos, dict):
                     need = float(reduce_size)
                     legs = list(pos.get("legs", []))
@@ -4565,7 +4661,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
         # === Periodic rebalance across brackets (paper: execute; futures: log plan) ===
         try:
-            pos = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+            pos = PAPER_POS.get(_pp_key(symbol, tf, side)) if TRADE_MODE=='paper' else FUT_POS.get(symbol)
             if isinstance(pos, dict) and SCALE_REALLOCATE_BRACKETS:
                 prev_ctx = pos.get("last_ctx"); new_ctx = CTX_STATE.get(symbol) or _compute_context(symbol)
                 last_ts  = float(pos.get("last_realloc_ts") or 0.0)
@@ -4625,13 +4721,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             idem_mark(symbol, tf, candle_ts)
             return
 
-
+    # Prefer live futures exchange for market limits; fallback to public futures markets on paper.
+    _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
     alloc = _preview_allocation_and_qty(
         symbol=symbol,
         tf=tf,
         signal=exec_signal,
         price=float(last_price),
-        ex=None
+        ex=_ex_guard
     )
     base_margin = alloc["base_margin"]
     eff_margin  = alloc["eff_margin"]
@@ -4645,46 +4742,59 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
 
-
-    market_symbol = symbol
-    if ENFORCE_MARKET_RULES:
-        qty = _amount_to_precision(GLOBAL_EXCHANGE, market_symbol, qty) if TICK_ENFORCE else qty
-        px  = _price_to_precision(GLOBAL_EXCHANGE, market_symbol, float(last_price)) if TICK_ENFORCE else float(last_price)
-        if not _min_notional_ok(GLOBAL_EXCHANGE, market_symbol, px, qty):
-            log(f"[RULES] skip: notional {px*qty:.4f} < min")
-            return
-        last_price = px
-
     side = "LONG" if exec_signal == "BUY" else "SHORT"
 
+    snap = await get_price_snapshot(symbol)
+    bar1m = _fetch_recent_bar_1m(symbol)
+    exec_price = _exec_price_model(_ex_guard, symbol, tf, side, "entry", snap, bar1m)
+    if exec_price is None:
+        log(f"[FILL_MODEL] missing ref price for entry {symbol} {tf}")
+        return
 
+    _ex_guard = _ex_guard if '_ex_guard' in locals() else (FUT_EXCHANGE or PUB_FUT_EXCHANGE)
+    if ENFORCE_MARKET_RULES and _ex_guard:
+        # futures-aware rounding + min_notional gate
+        qty = _fut_amount_to_precision(_ex_guard, symbol, qty)
+        if not _fut_min_notional_ok(_ex_guard, symbol, exec_price, qty):
+            logging.warning(f"[PAPER_RULES] below min_notional: {symbol} {tf} qty={qty}")
+            return
+        exec_price = _price_to_precision(_ex_guard, symbol, float(exec_price))
+
+    if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+        try:
+            log(f"[FILL_MODEL] ENTRY {symbol} {tf} side={side} ref={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} slp={_resolve_slippage_pct(symbol, tf, 'entry')}")
+        except Exception:
+            pass
     if _POS_LOCK:
         async with _POS_LOCK:
             PAPER_POS[key] = {
                 "side": side,
-                "entry": float(last_price),
-                "entry_price": float(last_price),
+                "entry": float(exec_price),
+                "entry_price": float(exec_price),
                 "qty": qty,
                 "eff_margin": eff_margin,
                 "lev": lev_used,
                 "ts_ms": int(time.time()*1000),
-                "high": float(last_price),
-                "low": float(last_price),
+                "high": float(exec_price),
+                "low": float(exec_price),
 
             }
-            # (NEW) persist risk to paper JSON and CSV
-            slip   = _req_slippage_pct(symbol, tf)
-            eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
-            if PAPER_POS[key]["side"] == "LONG":
-                tp_price = (float(last_price)*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                sl_price = (float(last_price)*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-            else:
-                tp_price = (float(last_price)*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                sl_price = (float(last_price)*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-            tr_pct_eff = eff_tr_pct
+            slip = _req_slippage_pct(symbol, tf)
+            eff_tp_pct, eff_sl_pct, _, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
+            try:
+                tp_price, sl_price, tr_pct_eff = _paper_ensure_tp_sl_trailing(
+                    symbol, tf, side,
+                    entry_price=float(exec_price),
+                    tp_pct=(tp_pct if (tp_pct is not None) else None),
+                    sl_pct=(sl_pct if (sl_pct is not None) else None),
+                    tr_pct=(tr_pct if (tr_pct is not None) else None),
+                    lev=float(lev_used or 1.0)
+                )
+            except Exception as e:
+                log(f"[PAPER] ensure tp/sl/tr warn {symbol} {tf}: {e}")
+                tr_pct_eff = None
             PAPER_POS[key].update({
                 "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
-                "tp_price": tp_price, "sl_price": sl_price,
                 "lev": float(lev_used or 1.0),
                 "eff_tp_pct": eff_tp_pct, "eff_sl_pct": eff_sl_pct, "eff_tr_pct": tr_pct_eff,
                 "risk_mode": RISK_INTERPRET_MODE,
@@ -4700,29 +4810,32 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     else:
         PAPER_POS[key] = {
             "side": side,
-            "entry": float(last_price),
-            "entry_price": float(last_price),
+            "entry": float(exec_price),
+            "entry_price": float(exec_price),
             "qty": qty,
             "eff_margin": eff_margin,
             "lev": lev_used,
             "ts_ms": int(time.time()*1000),
-            "high": float(last_price),
-            "low": float(last_price),
+            "high": float(exec_price),
+            "low": float(exec_price),
 
         }
-        # (NEW) persist risk to paper JSON and CSV
-        slip   = _req_slippage_pct(symbol, tf)
-        eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
-        if PAPER_POS[key]["side"] == "LONG":
-            tp_price = (float(last_price)*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-            sl_price = (float(last_price)*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-        else:
-            tp_price = (float(last_price)*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-            sl_price = (float(last_price)*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-        tr_pct_eff = eff_tr_pct
+        slip = _req_slippage_pct(symbol, tf)
+        eff_tp_pct, eff_sl_pct, _, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
+        try:
+            tp_price, sl_price, tr_pct_eff = _paper_ensure_tp_sl_trailing(
+                symbol, tf, side,
+                entry_price=float(exec_price),
+                tp_pct=(tp_pct if (tp_pct is not None) else None),
+                sl_pct=(sl_pct if (sl_pct is not None) else None),
+                tr_pct=(tr_pct if (tr_pct is not None) else None),
+                lev=float(lev_used or 1.0)
+            )
+        except Exception as e:
+            log(f"[PAPER] ensure tp/sl/tr warn {symbol} {tf}: {e}")
+            tr_pct_eff = None
         PAPER_POS[key].update({
             "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
-            "tp_price": tp_price, "sl_price": sl_price,
             "lev": float(lev_used or 1.0),
             "eff_tp_pct": eff_tp_pct, "eff_sl_pct": eff_sl_pct, "eff_tr_pct": tr_pct_eff,
             "risk_mode": RISK_INTERPRET_MODE,
@@ -4750,7 +4863,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
           f"pb_alloc_mul={_pb_alloc_mul if '_pb_alloc_mul' in locals() else ''}"
       ])
     if PAPER_CSV_OPEN_LOG:
-        _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
+        _log_trade_csv(symbol, tf, "OPEN", side, qty, exec_price, extra=extra)
 # [ANCHOR: REENTRY_ON_ENTRY_SUCCESS]  << ADD WHERE ORDER SUCCEEDS >>
     try:
         key = (symbol, tf, side)
@@ -4766,11 +4879,11 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 # [ANCHOR: POSITION_OPEN_HOOK]
     # --- Bracket legs state on open ---
     try:
-        pos_obj = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+        pos_obj = PAPER_POS.get(_pp_key(symbol, tf, side)) if TRADE_MODE=='paper' else FUT_POS.get(symbol)
         if isinstance(pos_obj, dict):
             # persist legs array and last-realloc metadata
             pos_obj.setdefault("legs", [])  # list of {"notional":..., "price":..., "ts":...}
-            pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(last_price)))
+            pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(exec_price)))
             pos_obj.setdefault("last_ctx", CTX_STATE.get(symbol))
             pos_obj.setdefault("last_realloc_ts", 0.0)
     except Exception:
@@ -4778,7 +4891,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     # initialize trailing baseline at entry (per (symbol, tf))
     try:
         k2 = (symbol, tf)
-        entry_price = float(last_price)
+        entry_price = float(exec_price)
         if str(side).upper() == "LONG":
             highest_price[k2] = entry_price
             lowest_price.pop(k2, None)
@@ -4789,14 +4902,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     except Exception:
         pass
     previous_signal[(symbol, tf)] = exec_signal
-    entry_data[(symbol, tf)] = (float(last_price), datetime.now().strftime("%m월 %d일 %H:%M"))
+    entry_data[(symbol, tf)] = (float(exec_price), datetime.now().strftime("%m월 %d일 %H:%M"))
 
     if TRADE_MODE == "paper" and PAPER_STRICT_NONZERO and (not base_margin or not eff_margin or not qty):
         logging.warning("[PAPER_WARN] zero allocation on paper entry: check PART A")
 
     await _notify_trade_entry(
         symbol, tf, exec_signal,
-        mode="paper", price=float(last_price),
+        mode="paper", price=float(exec_price),
         qty=qty,
         base_margin=base_margin, eff_margin=eff_margin,
         lev_used=lev_used,
@@ -4872,7 +4985,9 @@ import json, csv, os, datetime as _dt
 
 CAPITAL_PERSIST       = int(os.getenv("CAPITAL_PERSIST","1") or 1)
 CAPITAL_STATE_PATH    = os.getenv("CAPITAL_STATE_PATH","./data/capital_state.json")
-CAPITAL_LEDGER_CSV    = os.getenv("CAPITAL_LEDGER_CSV","./data/capital_ledger.csv")
+# BACKWARD-COMPAT: allow legacy CAPITAL_CSV_PATH as alias
+_CAPITAL_CSV_PATH_ALIAS = (os.getenv("CAPITAL_CSV_PATH","") or "").strip()
+CAPITAL_LEDGER_CSV    = (os.getenv("CAPITAL_LEDGER_CSV") or _CAPITAL_CSV_PATH_ALIAS or "./data/capital_ledger.csv")
 CAPITAL_LEDGER_ENABLE = int(os.getenv("CAPITAL_LEDGER_ENABLE","1") or 1)
 CAPITAL_LEDGER_APPEND_HEADERS = int(os.getenv("CAPITAL_LEDGER_APPEND_HEADERS","1") or 1)
 
@@ -4996,7 +5111,7 @@ import asyncio as _asyncio
 
 PRICE_FETCH_MAX_RETRY = int(os.getenv("PRICE_FETCH_MAX_RETRY","3") or 3)
 PRICE_FETCH_BACKOFF_MS = int(os.getenv("PRICE_FETCH_BACKOFF_MS","200") or 200)
-PRICE_FALLBACK_ORDER = [x.strip() for x in os.getenv("PRICE_FALLBACK_ORDER","last,mid,mark,index").split(",")]
+PRICE_FALLBACK_ORDER = [x.strip() for x in os.getenv("PRICE_FALLBACK_ORDER","mark,last,mid,index").split(",")]
 MARK_CLAMP_TO_LAST = int(os.getenv("MARK_CLAMP_TO_LAST","1") or 1)
 
 async def _sleep_ms(ms:int):
@@ -5063,6 +5178,95 @@ async def safe_price_hint(symbol:str):
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
+# [ANCHOR: EXEC_PRICE_MODEL_BEGIN]  << ADD NEW >>
+def _resolve_slippage_pct(symbol: str, tf: str, when: str) -> float:
+    """
+    Resolve slippage pct priority:
+      SLIPPAGE_BY_TF > SLIPPAGE_PCT_ENTRY/EXIT > SLIPPAGE_PCT (global) > 0.0
+    """
+    try:
+        by_tf = os.getenv("SLIPPAGE_BY_TF", "")
+        if by_tf:
+            for kv in by_tf.split(","):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    if k.strip() == tf:
+                        return float(v.strip())
+    except Exception:
+        pass
+    try:
+        if when == "entry":
+            v = os.getenv("SLIPPAGE_PCT_ENTRY")
+            if v:
+                return float(v)
+        elif when == "exit":
+            v = os.getenv("SLIPPAGE_PCT_EXIT")
+            if v:
+                return float(v)
+    except Exception:
+        pass
+    try:
+        v = os.getenv("SLIPPAGE_PCT")
+        return float(v) if v else 0.0
+    except Exception:
+        return 0.0
+
+def _bar_clamp(px: float, bar: dict|None) -> float:
+    """Clamp price within current 1m bar bounds if BAR_BOUND_CLAMP=1."""
+    if os.getenv("BAR_BOUND_CLAMP", "1") != "1":
+        return px
+    try:
+        lo = float(bar.get("low")) if bar and bar.get("low") is not None else None
+        hi = float(bar.get("high")) if bar and bar.get("high") is not None else None
+        if lo is not None and px < lo:
+            return lo
+        if hi is not None and px > hi:
+            return hi
+    except Exception:
+        pass
+    return px
+
+def _pick_ref_price(symbol: str, when: str, snap: dict) -> float|None:
+    """
+    Choose a reference price from snapshot for execution.
+    Entry: ENTRY_EXEC_PRICE_SOURCE (default 'chosen').
+    Exit:  EXIT_PRICE_SOURCE      (default 'mark').
+    """
+    src = os.getenv("ENTRY_EXEC_PRICE_SOURCE", "chosen") if when == "entry" else os.getenv("EXIT_PRICE_SOURCE", "mark")
+    return (
+        snap.get(src)
+        or snap.get("chosen")
+        or snap.get("mid")
+        or snap.get("last")
+        or snap.get("mark")
+        or snap.get("index")
+    )
+
+def _exec_price_model(ex, symbol: str, tf: str, side: str, when: str, snap: dict, bar: dict|None, ref_override: float|None = None) -> float|None:
+    """
+    Compute the execution price:
+      1) pick reference (or use ref_override),
+      2) apply worst-case slippage by side (+ for BUY, - for SELL),
+      3) clamp to 1m bar if enabled,
+      4) precision-round via exchange if available.
+    """
+    sideU = (side or "").upper()
+    base = float(ref_override) if (ref_override is not None) else _pick_ref_price(symbol, when, snap)
+    if base is None:
+        return None
+    slp = _resolve_slippage_pct(symbol, tf, when)
+    if sideU in ("LONG", "BUY"):
+        px = base * (1.0 + slp / 100.0)
+    else:
+        px = base * (1.0 - slp / 100.0)
+    px = _bar_clamp(px, bar)
+    try:
+        if ex:
+            px = _price_to_precision(ex, symbol, px)
+    except Exception:
+        pass
+    return float(px)
+# [ANCHOR: EXEC_PRICE_MODEL_END]
 
 # [ANCHOR: TRAIL_GUARDS_BEGIN]
 def _tf_map_get(env_key:str, tf:str, default:float) -> float:
@@ -5315,6 +5519,13 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
             "upnl_pct_on_margin": roe_pct,
             "notional": notional,
         }
+
+        # 표시용 마진모드 (요청값 기준; 실선물은 fetch로 동기화되므로 거의 일치)
+        try:
+            _mm, _ = _req_margin_mode(symbol, tf)
+            r["margin_mode"] = _mm
+        except Exception:
+            r["margin_mode"] = os.getenv("FUT_MARGIN","ISOLATED")
 
         if pos.get("eff_margin") is not None:
             try:
@@ -5945,8 +6156,9 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
     qty = 0.0
     try:
         if price and eff_margin and lev_used:
-            qty = (float(eff_margin) * float(lev_used)) / float(price)
+            qty = (float(eff_margin) * float(lev_used)) / max(float(price), 1e-9)
             if ex:
+                # precision/stepSize rounding applied when exchange provided
                 qty = _fut_amount_to_precision(ex, symbol, qty)
     except Exception:
         qty = 0.0
@@ -6077,8 +6289,11 @@ FUT_POS_TF = _load_json(OPEN_TF_FILE, {})          # tf -> "BTC/USDT" 또는 "ET
 # repair hi/lo baselines on boot (applies to all TFs)
 try:
     for key, pos in (PAPER_POS or {}).items():
-        sym, tf = key.split("|", 1)
-        side = str(pos.get("side","" )).upper()
+        try:
+            sym, tf, side = key.split("|", 2)
+        except Exception:
+            continue
+        side = str(side).upper()
         entry = float(pos.get("entry_price") or 0.0)
         k2 = (sym, tf)
         if side == "LONG":
@@ -6090,7 +6305,7 @@ except Exception: pass
 
 def _has_open_position(symbol: str, tf: str, mode: str) -> bool:
     if mode == "paper":
-        return PAPER_POS.get(f"{symbol}|{tf}") is not None
+        return any(PAPER_POS.get(_pp_key(symbol, tf, s)) for s in ("LONG","SHORT"))
     pos = FUT_POS.get(symbol)
     try:
         return bool(pos and abs(float(pos.get("qty", 0))) > 0)
@@ -6098,35 +6313,80 @@ def _has_open_position(symbol: str, tf: str, mode: str) -> bool:
         return False
 
 
-async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str = ""):
+async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str | None = None, side: str | None = None):
     async def _do_close():
-        key = f"{symbol}|{tf}"
-        pos = PAPER_POS.pop(key, None)
-        if not pos:
-            return None
-        _save_json(PAPER_POS_FILE, PAPER_POS)
-        if PAPER_POS_TF.get(tf) == symbol:
-            PAPER_POS_TF.pop(tf, None)
-            _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
-        side = pos.get("side", "")
+        # Resolve side if not given: if only one exists → use it; if both → prefer previous_signal or LONG
+        _cands = [s for s in ("LONG","SHORT") if PAPER_POS.get(_pp_key(symbol, tf, s))]
+        use_side = (side or (_cands[0] if len(_cands)==1 else None) or
+                    ("LONG" if "BUY" == (previous_signal.get((symbol,tf)) or "").upper() else
+                     "SHORT" if "SELL" == (previous_signal.get((symbol,tf)) or "").upper() else "LONG"))
+        key = _pp_key(symbol, tf, use_side)
+        pos = PAPER_POS.get(key)
+        if not pos: return None
+        eff_side = (pos.get("side") or use_side or "").upper()
         entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-        qty = float(pos.get("qty") or pos.get("quantity") or 0.0)
+        qty   = float(pos.get("qty") or pos.get("quantity") or 0.0)
         pnl_pct = None
         try:
             if entry > 0 and exit_price > 0:
-                gross = ((exit_price - entry) / entry) * 100.0 if side == "LONG" else ((entry - exit_price) / entry) * 100.0
+                gross = ((exit_price - entry) / entry) * 100.0 if eff_side == "LONG" else ((entry - exit_price) / entry) * 100.0
                 pnl_pct = gross
         except Exception:
             pnl_pct = None
 
+        PAPER_POS.pop(key, None)
+        # Free TF occupancy only if no side remains for this (symbol, tf)
+        try:
+            other = "SHORT" if eff_side=="LONG" else "LONG"
+            still_open = PAPER_POS.get(_pp_key(symbol, tf, other))
+            if not still_open and PAPER_POS_TF.get(tf) == symbol:
+                PAPER_POS_TF.pop(tf, None)
+                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+        except Exception:
+            pass
+        _save_json(PAPER_POS_FILE, PAPER_POS)
+
         # === 실현손익(USDT) 및 수수료 추정 ===
         qty = float(pos.get("qty") or 0.0)
-        side_up = 1 if str(side).upper()=="LONG" else -1
-        gross_usdt = (float(exit_price) - float(entry)) * qty * side_up
+        # [ANCHOR: PAPER_FEES_FUNDING_BEGIN]
+        ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
 
-        fee_bps = _fee_bps(order_type="MARKET", ex=None, symbol=symbol)
-        fees_usdt = _fee_usdt(entry, qty, fee_bps) + _fee_usdt(exit_price, qty, fee_bps)
-        net_usdt = gross_usdt - fees_usdt
+        side_up = 1 if str(eff_side).upper() == "LONG" else -1
+        gross_usdt = (float(exit_price) - float(entry)) * float(qty) * side_up
+
+        # --- funding estimation (optional) ---
+        opened_ms = None
+        try:
+            opened_ms = int(pos.get("ts_ms") or pos.get("opened_ts") or 0)
+        except Exception:
+            opened_ms = None
+        closed_ms = int(time.time() * 1000)
+
+        funding_fee = 0.0
+        if ESTIMATE_FUNDING_IN_PNL:
+            try:
+                avg_px = ((float(entry) + float(exit_price)) / 2.0) if (entry and exit_price) else 0.0
+                notional = float(avg_px) * float(qty)
+                funding_fee = await _estimate_funding_fee(ex, symbol, notional, opened_ms, closed_ms)
+            except Exception:
+                funding_fee = 0.0
+
+        # --- fees (dynamic when USE_DYNAMIC_FEE=1) ---
+        if INCLUDE_FEES_IN_PNL:
+            entry_bps = _fee_bps("MARKET", ex=ex, symbol=symbol)
+            exit_bps  = _fee_bps("MARKET", ex=ex, symbol=symbol)
+            fee_entry = _fee_usdt(entry, float(qty), entry_bps)
+            fee_exit  = _fee_usdt(exit_price, float(qty), exit_bps)
+        else:
+            fee_entry = 0.0
+            fee_exit  = 0.0
+
+        fees_usdt = float(fee_entry + fee_exit)
+        if ESTIMATE_FUNDING_IN_PNL:
+            fees_usdt += float(funding_fee)
+
+        net_usdt = float(gross_usdt) - float(fees_usdt)
+        # [ANCHOR: PAPER_FEES_FUNDING_END]
 
 
         before_cap = capital_get()
@@ -6150,7 +6410,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
                     f"pnl_pct_on_margin={(pnl_on_margin if pnl_on_margin is not None else 0):.4f}",
                     f"reason={exit_reason}"
                 ])
-                _log_trade_csv(symbol, tf, "CLOSE", side, float((pos or {}).get('qty',0.0)), float(exit_price), extra=extra)
+                _log_trade_csv(symbol, tf, "CLOSE", eff_side, float((pos or {}).get('qty',0.0)), float(exit_price), extra=extra)
 
         except Exception as e:
             log(f"[CSV_CLOSE_WARN] paper {symbol} {tf}: {e}")
@@ -6159,7 +6419,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         try:
             await capital_ledger_write(
                 "CLOSE",
-                symbol=symbol, tf=tf, side=side, reason=(exit_reason or ""),
+                symbol=symbol, tf=tf, side=eff_side, reason=(exit_reason or ""),
                 entry_price=f"{entry:.8f}", exit_price=f"{exit_price:.8f}",
                 qty=f"{qty:.8f}",
                 gross_usdt=f"{gross_usdt:.8f}", fees_usdt=f"{fees_usdt:.8f}", net_usdt=f"{net_usdt:.8f}",
@@ -6171,7 +6431,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         realized_pnl_usdt = net_usdt
         # [ANCHOR: REENTRY_ON_CLOSE]  << ADD NEAR CLOSE LEDGER/SAVE >>
         try:
-            key = (symbol, tf, side)
+            key = (symbol, tf, eff_side)
             node = _REENTRY_MEM.get(str(key), {})
             node["last_exit_px"] = float(exit_price)
             node["last_entry_score"] = float(entry_score) if "entry_score" in locals() else float(node.get("last_entry_score") or 0.0)
@@ -6192,7 +6452,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         try: idem_clear_symbol_tf(symbol, tf)
         except Exception: pass
 
-        return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty, "net_usdt": net_usdt}
+        return {"side": eff_side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty, "net_usdt": net_usdt}
 
     if _POS_LOCK:
         async with _POS_LOCK:
@@ -6202,19 +6462,25 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
 
 
 # [ANCHOR: PAPER_PARTIAL_CLOSE_BEGIN]
-async def _paper_reduce(symbol: str, tf: str, reduce_qty: float, exit_price: float):
+async def _paper_reduce(symbol: str, tf: str, side: str, reduce_qty: float, exit_price: float):
     async def _do_reduce():
-        key = f"{symbol}|{tf}"
+        key = _pp_key(symbol, tf, side)
         pos = PAPER_POS.get(key)
         if not pos or reduce_qty <= 0: return None
-        side = pos.get("side","")
+        side = (pos.get("side") or side or "").upper()
         qty_old = float(pos.get("qty",0.0))
         if qty_old <= 0: return None
         reduce_qty = min(reduce_qty, qty_old)
+        _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+        if ENFORCE_MARKET_RULES and _ex_guard:
+            reduce_qty = _fut_amount_to_precision(_ex_guard, symbol, reduce_qty)
+            reduce_qty = min(reduce_qty, qty_old)
+            if reduce_qty <= 0:
+                return None
         entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
         pnl_usdt = (exit_price - entry) * reduce_qty if side=="LONG" else (entry - exit_price) * reduce_qty
         qty_new = qty_old - reduce_qty
-        if qty_new <= 0: return await _paper_close(symbol, tf, exit_price)
+        if qty_new <= 0: return await _paper_close(symbol, tf, exit_price, side=side)
         eff_margin_old = float(pos.get("eff_margin") or 0.0)
         eff_margin_new = eff_margin_old * (qty_new/qty_old)
         pos["qty"] = qty_new
@@ -6229,36 +6495,61 @@ async def _paper_reduce(symbol: str, tf: str, reduce_qty: float, exit_price: flo
             return await _do_reduce()
     else:
         return await _do_reduce()
+
+# Back-compat shim (used by older call sites)
+async def _paper_reduce_compat(symbol: str, tf: str, reduce_qty: float, exit_price: float):
+    # Try LONG then SHORT; if both exist, prefer the one with matching direction by PnL sign.
+    for side in ("LONG", "SHORT"):
+        if PAPER_POS.get(_pp_key(symbol, tf, side)):
+            return await _paper_reduce(symbol, tf, side, reduce_qty, exit_price)
+    return None
 # [ANCHOR: PAPER_PARTIAL_CLOSE_END]
 
 # [ANCHOR: HYDRATE_FROM_DISK_BEGIN]
 def _hydrate_from_disk():
     try:
-        # 페이퍼 포지션/점유 복원
+        # ==== Helpers ====
+        def _pp_key(sym: str, tf: str, side: str) -> str:
+            return f"{sym}|{tf}|{side.upper()}"
+
+        globals()["_pp_key"] = _pp_key  # export helper
+
+        # ==== Load & migrate existing PAPER_POS ====
         global PAPER_POS, PAPER_POS_TF
-        if 'PAPER_POS' in globals():
-            for k, v in (PAPER_POS or {}).items():
-                try:
-                    sym, tf = k.split("|", 1)
-                    # TF 점유가 비어있으면 복원
-                    if not PAPER_POS_TF.get(tf):
-                        PAPER_POS_TF[tf] = sym
-                except Exception:
-                    continue
-        # prune stale TF occupancy (no matching PAPER_POS entry)
-        try:
-            valid_tfs = set()
-            for k in (PAPER_POS or {}).keys():
-                try:
-                    _, tfx = k.split("|", 1)
-                    valid_tfs.add(tfx)
-                except Exception:
-                    continue
-            for tfk in list(PAPER_POS_TF.keys()):
-                if tfk not in valid_tfs:
-                    PAPER_POS_TF.pop(tfk, None)
-        except Exception:
-            pass
+        migrated = {}
+        for k, v in (PAPER_POS or {}).items():
+            try:
+                parts = k.split("|")
+                if len(parts) == 2:
+                    sym, tf = parts
+                    side = str(v.get("side") or "").upper() or "LONG"
+                    newk = _pp_key(sym, tf, side)
+                else:
+                    sym, tf, side = parts[0], parts[1], parts[2].upper()
+                    newk = _pp_key(sym, tf, side)
+                migrated[newk] = v
+            except Exception:
+                continue
+        PAPER_POS = migrated
+
+        # ==== Rebuild TF occupancy from migrated keys ====
+        PAPER_POS_TF = PAPER_POS_TF or {}
+        seen_tfs = {}
+        for k in PAPER_POS.keys():
+            try:
+                sym, tf, _ = k.split("|", 2)
+                # Occupy only if empty
+                if not PAPER_POS_TF.get(tf):
+                    PAPER_POS_TF[tf] = sym
+                seen_tfs[tf] = True
+            except Exception:
+                continue
+        # Prune TFs that have no matching paper positions
+        for tf in list(PAPER_POS_TF.keys()):
+            if tf not in seen_tfs:
+                PAPER_POS_TF.pop(tf, None)
+
+        _save_json(PAPER_POS_FILE, PAPER_POS)
         _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
     except Exception as e:
         log(f"[HYDRATE] warn: {e}")
@@ -6398,11 +6689,11 @@ async def close_all_positions(reason="PANIC"):
     n = 0
     for key, pos in list(PAPER_POS.items()):
         try:
-            sym, tf = key.split("|",1)
+            sym, tf, side = key.split("|",2)
         except Exception:
             continue
         fallback = float(pos.get("entry_price",0.0))
-        await _paper_close(sym, tf, get_last_price(sym, fallback), reason)
+        await _paper_close(sym, tf, get_last_price(sym, fallback), reason, side=side)
         n += 1
     for tfk, sym in list(FUT_POS_TF.items()):
         await futures_close_all(sym, tfk, reason=reason)
@@ -6479,6 +6770,113 @@ async def _apply_all_pending_margin_switches(ex):
         except Exception as e:
             log(f"[FUT] margin queue process warn {sym}: {e}")
 
+
+# [ANCHOR: FUT_MARGIN_LEV_FETCH_BEGIN]  << ADD NEW >>
+async def _fetch_current_margin_leverage(ex, symbol: str):
+    """
+    Return (mode, lev) where:
+      mode ∈ {'ISOLATED','CROSSED'} (None if unknown)
+      lev  ∈ int or None
+    Tries Binance 'positionRisk' first; falls back to fetch_positions().
+    """
+    try:
+        m = ex.market(symbol)
+        sym_id = m.get('id') or symbol.replace('/', '')
+    except Exception:
+        sym_id = symbol.replace('/', '')
+
+    mode = None
+    lev  = None
+
+    # 1) Binance positionRisk (preferred)
+    try:
+        if hasattr(ex, 'fapiPrivate_get_positionrisk'):
+            rows = await _post(ex.fapiPrivate_get_positionrisk, {'symbol': sym_id})
+            row = rows[0] if isinstance(rows, list) and rows else rows
+            if row:
+                iso = row.get('isolated')
+                try:
+                    if isinstance(iso, str):
+                        iso = iso.lower() in ('true', '1', 'yes')
+                    mode = 'ISOLATED' if iso else 'CROSSED'
+                except Exception:
+                    pass
+                try:
+                    lev = int(float(row.get('leverage') or 0))
+                except Exception:
+                    pass
+    except Exception as e:
+        log(f"[FUT] margin/lev fetch warn {symbol}: {e}")
+
+    # 2) Fallback: fetch_positions
+    if mode is None or lev is None:
+        try:
+            pos = await _post(ex.fetch_positions, [symbol])
+            if isinstance(pos, list) and pos:
+                p = pos[0] if isinstance(pos[0], dict) else {}
+                info = p.get('info', {}) if isinstance(p, dict) else {}
+                if lev is None:
+                    try:
+                        lev = int(float(p.get('leverage') or info.get('leverage') or 0))
+                    except Exception:
+                        pass
+                if mode is None:
+                    iso = info.get('isolated') if isinstance(info, dict) else None
+                    if iso is not None:
+                        if isinstance(iso, str):
+                            iso = iso.lower() in ('true','1','yes')
+                        mode = 'ISOLATED' if iso else 'CROSSED'
+        except Exception:
+            pass
+
+    return (mode, lev)
+# [ANCHOR: FUT_MARGIN_LEV_FETCH_END]
+
+# [ANCHOR: FUT_PRECHECK_BEGIN]  << ADD NEW >>
+async def _check_and_sync_symbol_settings(ex, symbol: str, tf: str) -> bool:
+    """
+    Verify current margin/leverage equals requested; fix if possible; enqueue & attempt immediate switch if margin mismatch persists.
+    Returns True if settings are aligned; otherwise False (the caller should skip ordering).
+    """
+    try:
+        wanted_margin, _ = _req_margin_mode(symbol, tf)
+    except Exception:
+        wanted_margin = 'ISOLATED'
+
+    try:
+        req_lev = int(_req_leverage(symbol, tf))
+        lim = _market_limits(ex, symbol)
+        req_lev = int(_clamp(req_lev, 1, int(lim.get('max_lev', 125))))
+    except Exception:
+        req_lev = 1
+
+    cur_mode, cur_lev = await _fetch_current_margin_leverage(ex, symbol)
+    if cur_mode == wanted_margin and (cur_lev is None or int(cur_lev) == int(req_lev)):
+        return True
+
+    # Try to apply settings normally
+    try:
+        await _ensure_symbol_settings(ex, symbol, tf)
+    except Exception as e:
+        log(f"[FUT] precheck ensure warn {symbol}: {e}")
+
+    cur_mode2, cur_lev2 = await _fetch_current_margin_leverage(ex, symbol)
+    if cur_mode2 == wanted_margin and (cur_lev2 is not None and int(cur_lev2) == int(req_lev)):
+        return True
+
+    # If margin still mismatched, enqueue & attempt immediate switch
+    try:
+        if cur_mode2 != wanted_margin:
+            _enqueue_margin_switch(symbol, wanted_margin, why="pre-order mismatch")
+            await _apply_margin_switch_if_possible(ex, symbol)
+            cur_mode3, cur_lev3 = await _fetch_current_margin_leverage(ex, symbol)
+            if cur_mode3 == wanted_margin and (cur_lev3 is not None and int(cur_lev3) == int(req_lev)):
+                return True
+    except Exception as e:
+        log(f"[FUT] precheck queue/apply warn {symbol}: {e}")
+
+    return False
+# [ANCHOR: FUT_PRECHECK_END]
 
 # ==========================
 #   USDT-M Futures Engine
@@ -6565,6 +6963,44 @@ def _mk_ex():
     except Exception as e:
         log(f"[FUT] init error: {e}")
     return ex
+
+# [ANCHOR: FUT_PUB_EX_BEGIN]  << ADD NEW >>
+PUB_FUT_EXCHANGE = None
+
+def _mk_pub_fut_ex():
+    """
+    Build a public futures exchange instance (no API keys) so that
+    paper mode can still read futures mark/index prices.
+    """
+    try:
+        ex_id = EXCHANGE_ID
+        # Map common spot id -> its futures counterpart (Binance)
+        if ex_id == "binance":
+            ex_id = "binanceusdm"
+        cls = getattr(ccxt, ex_id)
+    except Exception as e:
+        log(f"[FUT_PUB] Unsupported exchange id for public futures: {EXCHANGE_ID} ({e})")
+        return None
+    try:
+        ex = cls({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+        })
+        # Optional: honor SANDBOX if explicitly desired
+        try:
+            if SANDBOX:
+                ex.set_sandbox_mode(True)
+        except Exception:
+            pass
+        try:
+            ex.load_markets()
+        except Exception as e:
+            log(f"[FUT_PUB] load_markets warn: {e}")
+        return ex
+    except Exception as e:
+        log(f"[FUT_PUB] init failed: {e}")
+        return None
+# [ANCHOR: FUT_PUB_EX_END]
 
 
 async def _post(fn, *args, **kwargs):
@@ -7290,6 +7726,39 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
         except Exception as e:
             log(f"[CSV_CLOSE_WARN] futures {symbol} {tf}: {e}")
 
+        # Ledger: futures CLOSE (paper와 동일 스키마)
+        try:
+            ent = float(entry or 0.0)
+            exi = float(exit_price or ent)
+            qty_abs = float(abs(qty))
+            # gross_usdt: 방향성 반영 (LONG: exi-ent, SHORT: ent-exi) × 수량
+            gross_usdt = (exi - ent) * qty_abs if side.upper() == "LONG" else (ent - exi) * qty_abs
+
+            # fees_usdt: maker/taker 동적 소스 포함(이미 _fee_bps/INCLUDE_FEES_IN_PNL 경로 존재 가정)
+            if INCLUDE_FEES_IN_PNL:
+                try:
+                    entry_bps = _fee_bps("MARKET", ex=ex, symbol=symbol)
+                    exit_bps  = _fee_bps("MARKET",  ex=ex, symbol=symbol)
+                    fees_usdt = qty_abs * ent * (entry_bps/10000.0) + qty_abs * exi * (exit_bps/10000.0)
+                except Exception:
+                    fees_usdt = max(0.0, float(locals().get("fee_est_usdt", 0.0)))  # 기존 추정치가 있으면 사용
+            else:
+                fees_usdt = 0.0
+
+            net_usdt  = gross_usdt - fees_usdt
+            after_cap = capital_get() + float(net_usdt)  # futures 모드에선 상태 반영은 안 하고 원장에만 'after' 필드로 기록
+
+            await capital_ledger_write(
+                "CLOSE",
+                symbol=symbol, tf=tf, side=str(side or "").upper(), reason=str(reason or "CLOSE"),
+                entry_price=f"{ent:.8f}", exit_price=f"{exi:.8f}",
+                qty=f"{qty_abs:.8f}", gross_usdt=f"{gross_usdt:.8f}",
+                fees_usdt=f"{fees_usdt:.8f}", net_usdt=f"{net_usdt:.8f}",
+                capital_after=f"{after_cap:.8f}",
+            )
+        except Exception as le:
+            log(f"[CAPITAL] futures ledger warn {symbol} {tf}: {le}")
+
         # --- B-2: 선물 청산 알림(공통 헬퍼 호출) ---
         try:
             ent = float(entry or 0.0)
@@ -7581,6 +8050,17 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
     await _ensure_account_settings(ex)            # 듀얼 모드 등
     await _ensure_symbol_settings(ex, symbol, tf) # TF별 레버리지/마진
 
+    # [ANCHOR: PREORDER_MARGIN_PRECHECK_BEGIN]  << ADD NEW >>
+    try:
+        if os.getenv("MARGIN_PRECHECK_ENFORCE", "1") == "1":
+            ok = await _check_and_sync_symbol_settings(ex, symbol, tf)
+            if not ok:
+                log(f"[FUT] skip {symbol} {tf}: margin/leverage not ready")
+                return
+    except Exception as e:
+        log(f"[FUT] precheck warn {symbol} {tf}: {e}")
+    # [ANCHOR: PREORDER_MARGIN_PRECHECK_END]
+
     # --- 슬리피지 가드(심볼×TF 오버라이드 반영) ---
     limit_pct = _req_slippage_pct(symbol, tf)  # ex) BTC 4h=0.4, ETH 4h=0.9
     cur = float(last)
@@ -7747,7 +8227,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         # [ANCHOR: POSITION_OPEN_HOOK]
         # --- Bracket legs state on open ---
         try:
-            pos_obj = PAPER_POS.get(f"{symbol}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol)
+            pos_obj = PAPER_POS.get(_pp_key(symbol, tf, side)) if TRADE_MODE=='paper' else FUT_POS.get(symbol)
             if isinstance(pos_obj, dict):
                 pos_obj.setdefault("legs", [])
                 pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(last)))
@@ -7803,6 +8283,14 @@ except Exception as e:
     log(f"[FUT] exchange init fail: {e}")
     FUT_EXCHANGE = None
 
+# [ANCHOR: FUT_PUB_BOOT_BEGIN]  << ADD NEW >>
+try:
+    PUB_FUT_EXCHANGE = _mk_pub_fut_ex()
+except Exception as e:
+    log(f"[FUT_PUB] init fail: {e}")
+    PUB_FUT_EXCHANGE = None
+# [ANCHOR: FUT_PUB_BOOT_END]
+
 
 _DASHBOARD_STATE = {"msg_id": 0, "ch_id": 0}
 _DASH_TASK_RUNNING = False
@@ -7856,11 +8344,11 @@ def get_open_positions_iter():
     try:
         for key, pos in paper.items():
             try:
-                sym, tf = key.split("|", 1)
+                sym, tf, side = key.split("|", 2)
                 out.append({
                     "symbol": sym,
                     "tf": tf,
-                    "side": str(pos.get("side", "")).upper(),
+                    "side": str(side).upper(),
                     "qty": float(pos.get("qty") or 0.0),
                     "entry_price": float(pos.get("entry_price") or pos.get("entry") or 0.0),
                     "lev": float(pos.get("lev") or 1.0),
@@ -7909,15 +8397,16 @@ async def _dash_render_text():
 
 
     lines = []
-    ko = (os.getenv("DASH_LOCALE", "ko") == "ko")
+    ko = os.getenv("DASH_LOCALE", "ko").lower().startswith("ko")
     show_fees = (os.getenv("DASH_SHOW_FEES", "1") == "1")
     eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE", "live") or "live").lower()
 
     # 헤더
     if ko:
-        lines.append(f"Equity(총자본): ${eq_now:,.2f}" + (" (실시간)" if eq_mode == "live" else " (실현기준)"))
+        lines.append(f"자산: **${eq_now:,.2f}**" + (" **(live)**" if eq_mode == "live" else " **(realized)**"))
         lines.append(
-            f"당일손익: {float(st.get('realized_usdt',0.0)):+.2f} USDT ({float(st.get('realized_pct',0.0)):+.2f}%) | 청산수={int(st.get('closes',0))}"
+            f"일일 손익: {float(st.get('realized_usdt',0.0)):+.2f} USDT "
+            f"({float(st.get('realized_pct',0.0)):+.2f}%) | 청산건수={int(st.get('closes',0))}"
         )
     else:
         lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode == "live" else " (realized)"))
@@ -7927,7 +8416,8 @@ async def _dash_render_text():
 
     # [ANCHOR: DASH_RENDER_BEGIN]
 
-    if os.getenv("DASH_LOCALE", "ko") == "ko":
+    ko = os.getenv("DASH_LOCALE","ko").lower().startswith("ko")
+    if ko:
         lev_mode = (os.getenv("DASH_LEV_HEADER_MODE", "applied") or "applied").lower()
         if lev_mode == "applied" and rows:
             _bkt = {}
@@ -7959,18 +8449,18 @@ async def _dash_render_text():
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
         up_sum = float(totals.get("upnl_usdt_sum", 0.0))
         up_net = float(totals.get("upnl_usdt_sum_net", up_sum))
-        pct_on_eq = (up_net / max(1.0, eq_now)) * 100.0
+        pct_on_eq = float(totals.get("upnl_pct_on_equity", 0.0))
         if ko:
-            lines.append(f"미실현손익(UPNL): {up_net:+.2f} USDT ({pct_on_eq:+.2f}% / 자본대비)")
+            lines.append(f"미실현 손익: **{up_net:+.2f} USDT** (**{pct_on_eq:+.2f}%** of equity)")
+            if os.getenv("DASH_SHOW_FEES","1") == "1":
+                fe = float(totals.get("fees_entry_sum",0.0))
+                fx = float(totals.get("fees_exit_est_sum",0.0))
+                lines.append(f"수수료(누적/예상청산): -{fe:.2f} / -{fx:.2f} USDT")
         else:
             lines.append(f"Open UPNL: {up_net:+.2f} USDT ({pct_on_eq:+.2f}% of equity)")
-
-        if show_fees:
-            fe = float(totals.get("fees_entry_sum", 0.0))
-            fx = float(totals.get("fees_exit_est_sum", 0.0))
-            if ko:
-                lines.append(f"수수료(누적/예상청산): -{fe:.2f} / -{fx:.2f} USDT")
-            else:
+            if show_fees:
+                fe = float(totals.get("fees_entry_sum", 0.0))
+                fx = float(totals.get("fees_exit_est_sum", 0.0))
                 lines.append(f"Fees (paid/est. close): -{fe:.2f} / -{fx:.2f} USDT")
 
     # 섹션 제목
@@ -7990,12 +8480,15 @@ async def _dash_render_text():
         tp_pct = r.get("eff_tp_pct", r.get("tp_pct")); sl_pct = r.get("eff_sl_pct", r.get("sl_pct"))
 
         if ko:
-            head = f"• {r['symbol']} · {r['tf']} · {r['side']} ×{r['lev']:g}"
+            head = f"• **{r['symbol']} · {r['tf']} · {r['side']} ×{r['lev']:g} ({r.get('margin_mode','ISOLATED')})**"
             line_price = f"  • 가격/수량: ${float(r['entry']):,.2f} → ${float(r['last']):,.2f} / {r['qty']:.4f}"
             if show_notional:
                 line_price += f"  (노치오날 ${notional:,.2f})"
-            line_cap   = f"  • 실자본 사용: ${margin_used:,.2f}"
-            line_pnl   = f"  • 손익: {r['upnl_pct_on_margin']:+.2f}% / {upnl_net:+,.2f} USDT   ·   MAE {mae:+.2f}% · MFE {mfe:+.2f}%"
+            line_cap   = f"  • 실자본 사용: **${margin_used:,.2f}**"
+            line_pnl   = (
+                f"  • 손익: **{r['upnl_pct_on_margin']:+.2f}% / {upnl_net:+,.2f} USDT**"
+                f"   ·   MAE {mae:+.2f}% · MFE {mfe:+.2f}%"
+            )
             line_fee   = (f"  • 수수료: 진입 -${fe:.2f} / 청산(추정) -${fx:.2f}") if show_fees else ""
             line_risk  = ""
             if (tp_price is not None) and (sl_price is not None) and (tp_pct is not None) and (sl_pct is not None):
@@ -8227,6 +8720,44 @@ def eff_trail_pct(symbol: str, tf: str) -> float:
     except Exception:
         return 0.0
 # [ANCHOR: CFG_RESOLUTION_END]
+
+# [ANCHOR: PAPER_PROTECT_ORDERS_BEGIN]
+def _paper_ensure_tp_sl_trailing(symbol: str, tf: str, side: str,
+                                 entry_price: float, tp_pct: float | None,
+                                 sl_pct: float | None, tr_pct: float | None,
+                                 lev: float | None) -> tuple[float | None, float | None, float | None]:
+    """
+    Compute and persist paper tp/sl and effective trailing pct using the same math
+    futures uses (eff on price, leverage-aware when RISK_INTERPRET_MODE=MARGIN_RETURN).
+    Returns (tp_price, sl_price, eff_tr_pct).
+    """
+    eff_tp_pct, eff_sl_pct, eff_tr_pct, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev)
+    tp_price = None
+    sl_price = None
+
+    if eff_tp_pct and eff_tp_pct > 0:
+        if str(side).upper() == "LONG":
+            tp_price = float(entry_price) * (1.0 + eff_tp_pct / 100.0)
+        else:
+            tp_price = float(entry_price) * (1.0 - eff_tp_pct / 100.0)
+
+    if eff_sl_pct and eff_sl_pct > 0:
+        if str(side).upper() == "LONG":
+            sl_price = float(entry_price) * (1.0 - eff_sl_pct / 100.0)
+        else:
+            sl_price = float(entry_price) * (1.0 + eff_sl_pct / 100.0)
+
+    k = _pp_key(symbol, tf, side)
+    pos = PAPER_POS.get(k) or {}
+    pos["tp_price"] = tp_price
+    pos["sl_price"] = sl_price
+    pos["eff_tr_pct"] = eff_tr_pct
+    if os.getenv("PAPER_EXIT_REDUCEONLY", "1") == "1":
+        pos["reduce_only"] = True
+    PAPER_POS[k] = pos
+    _save_json(PAPER_POS_FILE, PAPER_POS)
+    return tp_price, sl_price, eff_tr_pct
+# [ANCHOR: PAPER_PROTECT_ORDERS_END]
 
 # === Trailing helpers (apply to all TFs) ===
 
@@ -8728,6 +9259,55 @@ async def generate_pnl_pdf():
 
 
 
+# [ANCHOR] OLDSTYLE_REPORT_BEGIN
+async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
+    # 데이터/지표
+    df = get_ohlcv(symbol, tf, limit=300)
+    df = add_indicators(df)
+
+    # 차트/리포트 산출물
+    chart_files        = save_chart_groups(df, symbol, tf)           # 4장
+    score_file         = plot_score_history(symbol, tf)
+    perf_file          = analyze_performance_for(symbol, tf)
+    performance_file   = generate_performance_stats(tf, symbol=symbol)
+
+    # 간단 시그널 텍스트(과거 스타일): 최근 신호/스코어/가격
+    closed_price = get_closed_price(df, 'close')
+    try:
+        sig, _, _, _, _, score, *_ = calculate_signal(df, tf, symbol)
+    except Exception:
+        sig, score = None, None
+    head = f"📈 {symbol} · {tf} · {sig}  (score {score if score is not None else '—'})\n종가: ${closed_price:,.2f}"
+
+    # 포지션 요약(페이퍼+실선물 통합)
+    pos_lines = []
+    try:
+        for p in get_open_positions_iter():
+            pos_lines.append(
+                f"• {p['symbol']} · {p['tf']} · {p['side']} ×{int(p['lev'])}  @ ${p['entry_price']:,.2f} / qty {p['qty']:.4f}"
+            )
+    except Exception:
+        pass
+    pos_block = ("— open positions —\n" + "\n".join(pos_lines)) if pos_lines else "— open positions —\n(없음)"
+
+    content = f"{head}\n{pos_block}"
+
+    # 첨부 파일 구성 (존재 파일만)
+    files_list = [*chart_files, score_file, perf_file, performance_file]
+    pdf_path = None
+    if os.getenv("PDF_REPORT_ENABLE", "1") == "1":
+        try:
+            pdf_path = await generate_pnl_pdf()
+            if pdf_path:
+                files_list.append(pdf_path)
+        except Exception as e:
+            log(f"[REPORT] PDF gen warn: {e}")
+
+    files = [discord.File(p) for p in files_list if p and os.path.exists(p)]
+    await channel.send(content=content, files=files, silent=True)
+# [ANCHOR] OLDSTYLE_REPORT_END
+
+
 # ⬇️ while True 루프 위에 따로 정의
 async def send_timed_reports():
     await client.wait_until_ready()
@@ -8748,306 +9328,22 @@ async def send_timed_reports():
             except Exception as e:
                 log(f"PNL PDF send warn: {e}")
 
-            # (이하 기존 ETH/BTC 루프 계속)
-
-
-            timeframes = ['15m', '1h', '4h', '1d']
-
-            # ===== ETH 루프 =====
-            for tf in timeframes:
-                try:
-                    ch_id = CHANNEL_IDS.get(tf)  # 또는 CHANNEL_BTC.get(tf)
-                    if not ch_id or ch_id == 0:
-                        log(f"⏭ 채널 ID 없음: ETH {tf} 건너뜀")
-                        continue
-                    channel = client.get_channel(ch_id)
-                    if channel is None:
-                        log(f"❌ 채널 객체 없음: ETH {tf} (ID: {ch_id})")
-                        continue
-
-                    symbol_eth = 'ETH/USDT'
-                    key2 = _key2(symbol_eth, tf)
-
-                    # === Closed-candle snapshot (ETH) ===
-                    # (use closed candle to avoid intra-candle spikes)
-                    # 아래 df는 직후에 get_ohlcv로 다시 채워지므로, prelude는 get_ohlcv 이후 위치로 옮겨질 수 있음.
-
-
-                    # 1) 데이터/지표 준비
-                    df = get_ohlcv(symbol_eth, tf, limit=300)
-                    df = add_indicators(df)  # 차트 함수가 지표 컬럼을 사용하므로 미리 계산
-
-                    chart_files   = save_chart_groups(df, symbol_eth, tf)   # 4장
-
-                    score_file     = plot_score_history(symbol_eth, tf)
-                    perf_file      = analyze_performance_for(symbol_eth, tf)
-                    performance_file = generate_performance_stats(tf, symbol=symbol_eth)
-
-                    # 📌 닫힌 캔들의 종가(게이팅·신호 결정에 사용)
-                    closed_price = get_closed_price(df, 'close')
-                    if closed_price is None:
-                        log("⏭️ 닫힌 캔들 종가 없음 → 스킵")
-                        continue
-
-                    # 📌 닫힌 캔들 기준 타임스탬프(초)
-                    last_ts = get_closed_ts(df)
-                    if not last_ts:
-                        log("⏭️ 닫힌 캔들 타임스탬프 계산 실패 → 스킵")
-                        continue
-
-
-                    # 3) 일봉 변동률 계산
-                    if _len(df) == 0:
-                        log(f"⏭️ {symbol_eth} {tf} 보고서 생략: 데이터 없음")
-                        continue
-
-                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
-                    live_price = snap.get("mid") or snap.get("last")
-                    display_price = live_price if isinstance(live_price, (int, float)) else closed_price
-                    # [ANCHOR: daily_change_unify_eth_alt]
-                    daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
-
-
-                    
-                    # 📍 ETH 진입 정보 주입
-
-                    _ep = entry_data.get(key2)
-
-                    entry_price_local = _ep[0] if _ep else None
-                    entry_time_local  = _ep[1] if _ep else None
-
-
-                    # Ichimoku 이미지 준비 (없으면 None)
-                    ichimoku_file = save_ichimoku_chart(df, symbol_eth, tf)  # 실패 시 함수가 None 반환
-
-                    main_msg_pdf, summary_msg_pdf, _ = format_signal_message(
-                        tf, signal, closed_price, pnl, reasons, df,
-                        entry_time=entry_price_local and entry_time_local,
-                        entry_price=entry_price_local,
-                        score=score,
-                        weights=weights, weights_detail=weights_detail,
-                        prev_score_value=previous_score.get(tf),
-                        agree_long=agree_long, agree_short=agree_short,
-                        symbol=symbol_eth,
-                        daily_change_pct=daily_change_pct,
-                        score_history=score_history.get(tf),
-                        recent_scores=score_history.get(tf),
-
-                        live_price=display_price,
-
-                        show_risk=False
-                    )
-
-
-                    # --- 강도/MTF 상태 기록 & 메시지 보강(ETH) ---
-                    _record_signal(symbol_eth, tf, signal, score)
-
-                    sf = _strength_factor(signal, score)
-                    mf, all_align = _mtf_factor(symbol_eth, tf, signal)
-                    align_text, agree_cnt, oppose_cnt = _mtf_alignment_text(symbol_eth, tf, signal)
-                    strength_label = _strength_label(signal, score)
-
-                    addon = (
-                        f"\n• 강도: {strength_label} (×{sf:.2f})"
-                        f"\n• 상위TF: {align_text} (×{mf:.2f})"
-                    )
-                    # ETH의 이 경로는 short_msg를 안 쓰므로 메인/요약에만 반영
-                    main_msg_pdf = addon + "\n" + main_msg_pdf
-                    summary_msg_pdf = addon + "\n" + summary_msg_pdf
-
-
-                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
-                    display_price = snap.get("mid") or snap.get("last") or closed_price
-
-
-                    pdf_path = generate_pdf_report(
-                        df=df, tf=tf, symbol=symbol_eth,
-                        signal=signal, price=display_price, score=score,
-                        reasons=reasons, weights=weights,
-                        agree_long=agree_long, agree_short=agree_short,
-                        now=datetime.now(),
-                        chart_imgs=chart_files, ichimoku_img=ichimoku_file,
-                        daily_change_pct=daily_change_pct,
-                        discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
-                        entry_price=entry_price_local, entry_time=entry_time_local
-                    )
-                    
-
-                    # 현재 버킷(BUY/NEUTRAL/SELL)
-                    curr_bucket = _score_bucket(score, CFG)
-                    price_eth_now   = curr_price_eth
-                    # 게이팅 판정
-                    ok_to_send, why = _should_notify(
-                        tf, score, closed_price, curr_bucket, last_ts,
-                        last_sent_ts_eth, last_sent_bucket_eth, last_sent_score_eth, last_sent_price_eth
-                    )
-
-                    if not ok_to_send:
-                        log(f"🔕 ETH {tf} 억제: {why}")
-                        # 계산값(이전 상태)만 업데이트하고 전송은 생략해도 됨 — 선택
-                        previous_bucket[tf] = curr_bucket
-                        previous_score[tf]  = score
-                        previous_price[tf]  = closed_price   # 📌 닫힌 캔들 종가로 저장
-                        last_candle_ts_eth[tf] = last_ts     # 📌 닫힌 캔들 ts로 저장
-                        continue
-
-                    # 6) 전송
-                    # 보고서 안내 문구
-                    content = f"📄 {datetime.now():%m월 %d일 %p %I시} {symbol_eth} {tf} 보고서입니다."
-                    files = [p for p in [*(chart_files or []), ichimoku_file, pdf_path, score_file, perf_file, performance_file] if p and os.path.exists(p)]       
-                    await channel.send(
-                        content=main_msg_pdf,
-                        files=[discord.File(p) for p in chart_files if p],
-                        silent=True
-                    )
-
-                except Exception as e:
-                    # 채널이 None일 수 있어 안전 가드
-                    try:
-                        await channel.send(f"❌ ETH PDF 생성 실패: {e}")
-                    except Exception:
-                        log(f"❌ ETH PDF 생성 실패(채널 전송 불가): {e}")
-                    
-                    # 📌 전송 성공 후 마지막 전송 상태 업데이트 (닫힌 기준)
-                    last_sent_ts_eth[tf]     = last_ts
-                    last_sent_bucket_eth[tf] = curr_bucket
-                    last_sent_score_eth[tf]  = score
-                    last_sent_price_eth[tf]  = closed_price
-
-
-            # ===== BTC 루프 (교체) =====
-            for tf in TIMEFRAMES_BTC:
-                try:
-                    # 0) 채널 확인
-                    channel = _get_channel_or_skip('BTC', tf)  # 없으면 로그 남기고 skip
-                    if channel is None:
-                        continue
-
-                    symbol_btc = 'BTC/USDT'
-
-                    # 1) 데이터/지표
-                    df = await safe_get_ohlcv(symbol_btc, tf, limit=300)
-                    df = await safe_add_indicators(df)
-
-                    # 닫힌 캔들 기준 타임스탬프/가격 (게이팅·리포팅 공용)
-                    c_ts = get_closed_ts(df)
-                    if not c_ts:
-                        log(f"⏭️ 닫힌 캔들 ts 없음: BTC {tf} → skip")
-                        continue
-                    c_c  = get_closed_price(df, 'close')
-                    if c_c is None:
-                        log(f"⏭️ 닫힌 캔들 종가 없음: BTC {tf} → skip")
-                        continue
-
-                    # 2) 신호 계산 (ETH와 동일 시그니처)
-                    signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = \
-                        calculate_signal(df, tf, symbol_btc)
-
-
-                    snap = await get_price_snapshot(symbol_btc)  # BTC/USDT
-                    live_price = snap.get("mid") or snap.get("last")
-                    display_price = live_price if isinstance(live_price, (int, float)) else c_c
-                    # [ANCHOR: daily_change_unify_btc]
-                    daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
-
-
-                    # 4) 진입 정보 (없으면 None)
-                    _epb = entry_data.get((symbol_btc, tf))  # (entry_price, entry_time)
-                    entry_price_local = _epb[0] if _epb else None
-                    entry_time_local  = _epb[1] if _epb else None
-
-                    # 5) 이미지 준비 (각 함수가 내부적으로 plt.close 처리)
-                    ichimoku_file    = save_ichimoku_chart(df, symbol_btc, tf)
-                    chart_files      = save_chart_groups(df, symbol_btc, tf)           # 묶음 차트
-                    score_file       = plot_score_history(symbol_btc, tf)              # 점수 히스토리
-                    perf_file        = analyze_performance_for(symbol_btc, tf)         # 누적 성과 그래프
-                    performance_file = generate_performance_stats(tf, symbol=symbol_btc)
-
-                    # 6) 메시지 (요약/본문/짧은 알림)
-                    main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
-                        tf=tf, signal=signal, price=c_c, pnl=None, strength=reasons, df=df,
-                        entry_time=entry_time_local, entry_price=entry_price_local,
-                        score=score, weights=weights, weights_detail=weights_detail,
-                        prev_score_value=previous_score_btc.get(tf),
-                        agree_long=agree_long, agree_short=agree_short,
-                        recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-                        daily_change_pct=daily_change_pct,
-                        symbol=symbol_btc,
-
-                        live_price=display_price,
-
-                        show_risk=False
-                    )
-
-                    display_price = sanitize_price_for_tf(symbol_btc, tf, c_c)
-
-                    # (선택) PDF 생성 — 파일 목록에 같이 첨부
-                    try:
-                        display_price = sanitize_price_for_tf(symbol_btc, tf, c_c)
-                        pdf_path = generate_pdf_report(
-                            df=df, tf=tf, symbol=symbol_btc,
-                            signal=signal, price=display_price, score=score,
-                            reasons=reasons, weights=weights,
-                            agree_long=agree_long, agree_short=agree_short,
-                            now=datetime.now(),
-                            chart_imgs=chart_files, ichimoku_img=ichimoku_file,
-                            daily_change_pct=daily_change_pct,
-                            discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
-                            entry_price=entry_price_local, entry_time=entry_time_local
-                        )
-                    except Exception as e:
-                        log(f"PDF 생성 경고: {e}")
-                        pdf_path = None
-
-                    # 7) 알림 억제(게이팅)
-                    curr_bucket = _score_bucket(score, CFG)
-                    trigger_mode = trigger_mode_for(tf)
-                    await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data)
-                    ok_to_send, why = _should_notify(
-                        tf, score, c_c, curr_bucket, c_ts,
-                        last_sent_ts_btc, last_sent_bucket_btc, last_sent_score_btc, last_sent_price_btc
-                    )
-                    if not ok_to_send:
-                        log(f"🔕 BTC {tf} 억제: {why}")
-                        previous_bucket_btc[tf] = curr_bucket
-                        previous_score_btc[tf]  = score
-                        previous_price_btc[tf]  = float(c_c)
-                        last_candle_ts_btc[tf]  = c_ts
-                        continue
-
-                    # 8) 디스코드 전송
-                    try:
-                        await channel.send(content=short_msg)
-                        files_to_send = [p for p in [*(chart_files or []), ichimoku_file, score_file, perf_file, performance_file, pdf_path] if p and os.path.exists(p)]
-                        await channel.send(
-                            content=main_msg_pdf,
-                            files=[discord.File(p) for p in files_to_send] if files_to_send else None,
-                            silent=True
-                        )
-                        if len(summary_msg_pdf) > 1900:
-                            summary_msg_pdf = summary_msg_pdf[:1900] + "\n...(이하 생략)"
-                        await channel.send(summary_msg_pdf, silent=True)
-                    except Exception as e:
-                        log(f"❌ BTC 전송 오류: {e}")
-
-                    # 9) 상태 업데이트(‘발송 성공’ 시점)
-                    hist = score_history_btc.setdefault(tf, deque(maxlen=4))
-                    if not hist or round(score, 1) != hist[-1]:
-                        hist.append(round(score, 1))
-
-                    previous_signal[(symbol_btc, tf)] = signal
-                    previous_score_btc[tf]  = score
-                    previous_bucket_btc[tf] = curr_bucket
-                    previous_price_btc[tf]  = float(c_c)
-                    last_candle_ts_btc[tf]  = c_ts
-
-                    last_sent_ts_btc[tf]     = c_ts
-                    last_sent_bucket_btc[tf] = curr_bucket
-                    last_sent_score_btc[tf]  = score
-                    last_sent_price_btc[tf]  = float(c_c)
-
-                except Exception as e:
-                    log(f"⚠️ BTC 루프 오류: {e}")
+            # [ANCHOR] SEND_TIMED_REPORTS_LOOP
+            # ===== 단일 리포트 채널로 모아 전송 =====
+            try:
+                report_ch_id = int(os.getenv("PNL_REPORT_CHANNEL_ID", "0"))
+                if report_ch_id:
+                    ch = client.get_channel(report_ch_id)
+                else:
+                    ch = None
+                if not ch:
+                    log("⏭ 리포트 채널(PNL_REPORT_CHANNEL_ID) 미설정 → 자동 리포트 건너뜀")
+                else:
+                    for symbol in ("ETH/USDT", "BTC/USDT"):
+                        for tf in ('15m', '1h', '4h', '1d'):
+                            await _send_report_oldstyle(client, ch, symbol, tf)
+            except Exception as e:
+                log(f"[AUTO_REPORT_WARN] {e}")
 
             await asyncio.sleep(90)  # 중복 방지
 
@@ -9134,6 +9430,15 @@ async def on_ready():
         try:
 
             gatekeeper_heartbeat(_now_ms())
+
+            # [ANCHOR: MARGIN_Q_SWEEP_LOOP_BEGIN]  << ADD NEW >>
+            try:
+                if os.getenv("MARGIN_Q_SWEEP_IN_LOOP", "1") == "1":
+                    if TRADE_MODE == "futures" and FUT_EXCHANGE:
+                        await _apply_all_pending_margin_switches(FUT_EXCHANGE)
+            except Exception as e:
+                log(f"[FUT] margin queue sweep(loop) warn: {e}")
+            # [ANCHOR: MARGIN_Q_SWEEP_LOOP_END]
 
             # ✅ 루프 1회마다 실시간 가격 스냅샷 활용 (TF 공통)
 
@@ -9224,18 +9529,20 @@ async def on_ready():
                     pass
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
-                k = f"{symbol_eth}|{tf}"
-                pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_eth) if TRADE_MODE == "futures" else None)
-                if pos:
-                    side = str(pos.get("side", "")).upper()
-                    entry = float(pos.get("entry_price") or pos.get("entry") or 0)
+                _reduced_this_cycle = False
+                if TRADE_MODE == "paper":
+                    for _side in ("LONG","SHORT"):
+                        k = _pp_key(symbol_eth, tf, _side)
+                        pos = PAPER_POS.get(k)
+                        if not pos: continue
+                        side = _side
+                        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
 
-                    # 틱 힌트를 1분봉으로 클램프
-                    clamped, bar1m = await safe_price_hint(symbol_eth)
-                    # 이상치면 무시
-                    if _outlier_guard(clamped, bar1m):
-                        pass
-                    else:
+                        # 틱 힌트를 1분봉으로 클램프
+                        clamped, bar1m = await safe_price_hint(symbol_eth)
+                        # 이상치면 무시
+                        if _outlier_guard(clamped, bar1m):
+                            continue
                         tp_price = pos.get("tp_price")
                         sl_price = pos.get("sl_price")
                         tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
@@ -9243,23 +9550,39 @@ async def on_ready():
                         op_ts = float(pos.get("opened_ts") or 0)/1000.0
                         ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
-                            exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
-                            if TRADE_MODE == "paper":
-                                info = await _paper_close(symbol_eth, tf, exec_px, reason)
-                                if info:
-                                    await _notify_trade_exit(
-                                        symbol_eth, tf,
-                                        side=info["side"],
-                                        entry_price=info["entry_price"],
-                                        exit_price=exec_px,
-                                        reason=reason, mode="paper",
-                                        pnl_pct=info.get("pnl_pct"),
-                                        qty=info.get("qty"),
-                                        pnl_usdt=info.get("net_usdt")
-                                    )
-                            else:
-                                await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=reason)
+                            exec_px = await _choose_exec_price(symbol_eth, tf, reason, side, float(trig_px), bar1m)
+                            info = await _paper_close(symbol_eth, tf, exec_px, reason, side=side)
+                            if info:
+                                await _notify_trade_exit(
+                                    symbol_eth, tf,
+                                    side=info["side"],
+                                    entry_price=info["entry_price"],
+                                    exit_price=exec_px,
+                                    reason=reason, mode="paper",
+                                    pnl_pct=info.get("pnl_pct"),
+                                    qty=info.get("qty"),
+                                    pnl_usdt=info.get("net_usdt")
+                                )
+                                _reduced_this_cycle = True
                             continue
+                else:
+                    pos = FUT_POS.get(symbol_eth)
+                    if pos:
+                        side = str(pos.get("side", "")).upper()
+                        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
+
+                        clamped, bar1m = await safe_price_hint(symbol_eth)
+                        if not _outlier_guard(clamped, bar1m):
+                            tp_price = pos.get("tp_price")
+                            sl_price = pos.get("sl_price")
+                            tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                            lev = float(pos.get("lev") or 1.0)
+                            op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                            ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
+                            if ok_exit:
+                                exec_px = await _choose_exec_price(symbol_eth, tf, reason, side, float(trig_px), bar1m)
+                                await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=reason)
+                                continue
 
 
 
@@ -9280,36 +9603,48 @@ async def on_ready():
                 last_price = float(display_price if 'display_price' in locals() else live_price)
                 try: set_last_price(symbol_eth, last_price)
                 except Exception: pass
-                pos = PAPER_POS.get(f"{symbol_eth}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol_eth)
-                if pos:
-                    side = str(pos.get("side","" )).upper()
-                    entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-                    tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
-                    tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
-                    lev = float(pos.get("lev") or 1.0)
-                    op_ts = float(pos.get("opened_ts") or 0)/1000.0
-                    ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
-                    log(f"[EXIT_CHECK] {symbol_eth} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
-                    if ok_exit:
-                        exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
-                        # 1분봉 바운드 체결가 계산
-                        _bar = _fetch_recent_bar_1m(symbol_eth)
-                        exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
-                        if TRADE_MODE=='paper':
-                            info = await _paper_close(symbol_eth, tf, exec_px, exit_reason)
+                if TRADE_MODE=='paper':
+                    for _side in ("LONG","SHORT"):
+                        pos = PAPER_POS.get(_pp_key(symbol_eth, tf, _side))
+                        if not pos: continue
+                        side = _side
+                        entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                        tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
+                        tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                        lev = float(pos.get("lev") or 1.0)
+                        op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
+                        log(f"[EXIT_CHECK] {symbol_eth} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
+                        if ok_exit:
+                            exit_reason = reason
+                            _bar = _fetch_recent_bar_1m(symbol_eth)
+                            exec_px = await _choose_exec_price(symbol_eth, tf, exit_reason, side, float(trig_px), _bar)
+                            info = await _paper_close(symbol_eth, tf, exec_px, exit_reason, side=side)
                             if info:
-
-                                await _notify_trade_exit(
-                                    symbol_eth, tf,
-                                    side=info['side'], entry_price=info['entry_price'],
-                                    exit_price=exec_px, reason=exit_reason, mode='paper',
-
-                                    pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt')
-                                )
-
-                        else:
+                                await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+                                _reduced_this_cycle = True
+                            continue
+                else:
+                    pos = FUT_POS.get(symbol_eth)
+                    if pos:
+                        side = str(pos.get("side","" )).upper()
+                        entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                        tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
+                        tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                        lev = float(pos.get("lev") or 1.0)
+                        op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
+                        log(f"[EXIT_CHECK] {symbol_eth} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
+                        if ok_exit:
+                            exit_reason = reason
+                            _bar = _fetch_recent_bar_1m(symbol_eth)
+                            exec_px = await _choose_exec_price(symbol_eth, tf, exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=exit_reason)
-                        continue
+                            continue
+
+                if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
+                    log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_eth} {tf}")
+                    return
 
 
 
@@ -9609,7 +9944,7 @@ async def on_ready():
                 
 
                 snap = await get_price_snapshot(symbol_btc)
-                live_price = snap.get("mid") or snap.get("last")
+                live_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
                 # [ANCHOR: daily_change_unify_btc]
 
@@ -9622,19 +9957,19 @@ async def on_ready():
                     pass
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
-                k = f"{symbol_btc}|{tf}"
                 key2 = (symbol_btc, tf)
-                pos = PAPER_POS.get(k) if TRADE_MODE == "paper" else (FUT_POS.get(symbol_btc) if TRADE_MODE == "futures" else None)
-                if pos:
-                    side = str(pos.get("side", "")).upper()
-                    entry = float(pos.get("entry_price") or pos.get("entry") or 0)
+                _reduced_this_cycle = False
+                if TRADE_MODE == "paper":
+                    for _side in ("LONG","SHORT"):
+                        k = _pp_key(symbol_btc, tf, _side)
+                        pos = PAPER_POS.get(k)
+                        if not pos: continue
+                        side = _side
+                        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
 
-                    # 틱 힌트를 1분봉으로 클램프
-                    clamped, bar1m = await safe_price_hint(symbol_btc)
-                    # 이상치면 무시
-                    if _outlier_guard(clamped, bar1m):
-                        pass
-                    else:
+                        clamped, bar1m = await safe_price_hint(symbol_btc)
+                        if _outlier_guard(clamped, bar1m):
+                            continue
                         tp_price = pos.get("tp_price")
                         sl_price = pos.get("sl_price")
                         tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
@@ -9642,22 +9977,38 @@ async def on_ready():
                         op_ts = float(pos.get("opened_ts") or 0)/1000.0
                         ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
-                            exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
-                            if TRADE_MODE == "paper":
-                                info = await _paper_close(symbol_btc, tf, exec_px, reason)
-                                if info:
-                                    await _notify_trade_exit(
-                                        symbol_btc, tf,
-                                        side=info["side"],
-                                        entry_price=info["entry_price"],
-                                        exit_price=exec_px,
-                                        reason=reason, mode="paper",
-                                        pnl_pct=info.get("pnl_pct"), qty=info.get("qty"), pnl_usdt=info.get("net_usdt")
+                            exec_px = await _choose_exec_price(symbol_btc, tf, reason, side, float(trig_px), bar1m)
+                            info = await _paper_close(symbol_btc, tf, exec_px, reason, side=side)
+                            if info:
+                                await _notify_trade_exit(
+                                    symbol_btc, tf,
+                                    side=info["side"],
+                                    entry_price=info["entry_price"],
+                                    exit_price=exec_px,
+                                    reason=reason, mode="paper",
+                                    pnl_pct=info.get("pnl_pct"), qty=info.get("qty"), pnl_usdt=info.get("net_usdt")
 
-                                    )
-                            else:
-                                await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=reason)
+                                )
+                                _reduced_this_cycle = True
                             continue
+                else:
+                    pos = FUT_POS.get(symbol_btc)
+                    if pos:
+                        side = str(pos.get("side", "")).upper()
+                        entry = float(pos.get("entry_price") or pos.get("entry") or 0)
+
+                        clamped, bar1m = await safe_price_hint(symbol_btc)
+                        if not _outlier_guard(clamped, bar1m):
+                            tp_price = pos.get("tp_price")
+                            sl_price = pos.get("sl_price")
+                            tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                            lev = float(pos.get("lev") or 1.0)
+                            op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                            ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
+                            if ok_exit:
+                                exec_px = await _choose_exec_price(symbol_btc, tf, reason, side, float(trig_px), bar1m)
+                                await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=reason)
+                                continue
 
 
                 # Use 1m bar extremes to update trailing baselines (never raw ticks)
@@ -9687,26 +10038,48 @@ async def on_ready():
                 last_price = float(display_price if 'display_price' in locals() else live_price)
                 try: set_last_price(symbol_btc, last_price)
                 except Exception: pass
-                pos = PAPER_POS.get(f"{symbol_btc}|{tf}") if TRADE_MODE=='paper' else FUT_POS.get(symbol_btc)
-                if pos:
-                    side = str(pos.get("side","" )).upper()
-                    entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-                    tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
-                    tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
-                    lev = float(pos.get("lev") or 1.0)
-                    op_ts = float(pos.get("opened_ts") or 0)/1000.0
-                    ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
-                    log(f"[EXIT_CHECK] {symbol_btc} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
-                    if ok_exit:
-                        exit_reason = reason  # 'SL' | 'TRAIL' | 'TP'
-                        if TRADE_MODE=='paper':
-                            info = await _paper_close(symbol_btc, tf, float(trig_px), exit_reason)
+                if TRADE_MODE=='paper':
+                    for _side in ("LONG","SHORT"):
+                        pos = PAPER_POS.get(_pp_key(symbol_btc, tf, _side))
+                        if not pos: continue
+                        side = _side
+                        entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                        tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
+                        tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                        lev = float(pos.get("lev") or 1.0)
+                        op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
+                        log(f"[EXIT_CHECK] {symbol_btc} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
+                        if ok_exit:
+                            exit_reason = reason
+                            _bar = _fetch_recent_bar_1m(symbol_btc)
+                            exec_px = await _choose_exec_price(symbol_btc, tf, exit_reason, side, float(trig_px), _bar)
+                            info = await _paper_close(symbol_btc, tf, exec_px, exit_reason, side=side)
                             if info:
-                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=float(trig_px), reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+                                await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+                                _reduced_this_cycle = True
+                            continue
+                else:
+                    pos = FUT_POS.get(symbol_btc)
+                    if pos:
+                        side = str(pos.get("side","" )).upper()
+                        entry_price = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                        tp_price = pos.get("tp_price"); sl_price = pos.get("sl_price")
+                        tr_pct_eff = pos.get("eff_tr_pct") if (pos.get("eff_tr_pct") is not None) else pos.get("tr_pct")
+                        lev = float(pos.get("lev") or 1.0)
+                        op_ts = float(pos.get("opened_ts") or 0)/1000.0
+                        ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry_price, last_price, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
+                        log(f"[EXIT_CHECK] {symbol_btc} {tf} {side} -> {ok_exit} reason={reason} {dbg}")
+                        if ok_exit:
+                            exit_reason = reason
+                            _bar = _fetch_recent_bar_1m(symbol_btc)
+                            exec_px = await _choose_exec_price(symbol_btc, tf, exit_reason, side, float(trig_px), _bar)
+                            await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=exit_reason)
+                            continue
 
-                        else:
-                            await futures_close_all(symbol_btc, tf, exit_price=float(trig_px), reason=exit_reason)
-                        continue
+                if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
+                    log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_btc} {tf}")
+                    return
 
 
 
@@ -10032,7 +10405,7 @@ async def on_message(message):
             await message.channel.send(f"⚠️ cap reset 실패: {e}")
         return
 
-    if content.startswith('!panic'):
+    if content.startswith(('!panic','!패닉')):
         _panic_on()
         if PANIC_CANCEL_OPEN:
             await cancel_all_open_orders()
@@ -10041,12 +10414,12 @@ async def on_message(message):
         await message.channel.send("⛔ panic ON (entries blocked)")
         return
 
-    if content.startswith('!unpanic'):
+    if content.startswith(('!unpanic','!패닉해제','!패닉off','!패닉해제해')):
         _panic_off()
         await message.channel.send("✅ panic OFF")
         return
 
-    if content.startswith('!limits'):
+    if content.startswith(('!limits','!제한')):
         st = _daily_state_load()
         await message.channel.send(
             f"limits — realized: {st.get('realized_usdt',0):.2f} USDT ({st.get('realized_pct',0):.2f}%), "
@@ -10054,7 +10427,7 @@ async def on_message(message):
         )
         return
 
-    if content.startswith('!limit set'):
+    if content.startswith(('!limit set','!제한 설정')):
         try:
             _,_,k,v = content.split()
             if k=='loss_usdt':
@@ -10069,7 +10442,7 @@ async def on_message(message):
         return
 
     # [ANCHOR: CONFIG_DUMP_HANDLER]
-    if content.startswith("!config"):
+    if content.startswith(("!config","!설정")):
         try:
             dump = _build_config_dump_text()
             await _send_long_text_or_file(message.channel, dump, CONFIG_FILENAME)
@@ -10078,18 +10451,18 @@ async def on_message(message):
         return
 
     # [ANCHOR: CMD_CLOSE_CLOSEALL]
-    if content.startswith("!closeall"):
+    if content.startswith(("!closeall","!모두청산","!전부청산","!포지션정리")):
         try:
             n = 0
-            # PAPER_POS key is "SYMBOL|TF" (string). Split safely.
+            # PAPER_POS key is now "SYMBOL|TF|SIDE"
             for key, pos in list(PAPER_POS.items()):
                 try:
-                    sym, tf = key.split("|", 1)
+                    sym, tf, side = key.split("|", 2)
                 except Exception:
                     continue
 
                 fallback = float(pos.get("entry_price", 0.0))
-                await _paper_close(sym, tf, get_last_price(sym, fallback), "MANUAL")
+                await _paper_close(sym, tf, get_last_price(sym, fallback), "MANUAL", side=side)
                 n += 1
             for tfk, sym in list(FUT_POS_TF.items()):
                 await futures_close_all(sym, tfk, reason="MANUAL")
@@ -10098,27 +10471,35 @@ async def on_message(message):
             if CLEAR_IDEMP_ON_CLOSEALL:
                 try: idem_clear_all()
                 except Exception: pass
-            await message.channel.send(f"🟢 closed all ({n})")
+            await message.channel.send(f"🟢 전체 청산 완료 · {n}건")
         except Exception as e:
             await message.channel.send(f"⚠️ closeall error: {e}")
         return
 
-    if content.startswith("!close "):
+    if content.startswith(("!close ","!청산 ")):
         try:
-            _, sym, tfx = content.split()
+            parts = content.split()
+            # allow: !close SYMBOL TF [SIDE]
+            _, sym, tfx, *opt = parts
+            side = (opt[0].upper() if opt else None)
             if TRADE_MODE == "paper":
-
-                await _paper_close(sym.upper(), tfx, get_last_price(sym.upper(), 0.0), "MANUAL")
-
+                symU = sym.upper()
+                if not side:
+                    both = [s for s in ("LONG","SHORT") if PAPER_POS.get(_pp_key(symU, tfx, s))]
+                    if len(both) > 1:
+                        await message.channel.send(f"⚠️ need side (LONG|SHORT) for {symU} {tfx}")
+                        return
+                    side = (both[0] if both else None)
+                await _paper_close(symU, tfx, get_last_price(symU, 0.0), "MANUAL", side=side)
             else:
                 await futures_close_symbol_tf(sym.upper(), tfx)
-            await message.channel.send(f"🟢 closed {sym.upper()} {tfx}")
+            await message.channel.send(f"🟢 청산 완료: {sym.upper()} {tfx}" + (f" {side}" if side else ""))
         except Exception as e:
             await message.channel.send(f"⚠️ close error: {e}")
         return
 
     # [ANCHOR: CMD_RISK_SET]
-    if content.startswith("!risk "):
+    if content.startswith(("!risk ","!리스크 ")):
         try:
             _, sym, tfx, *rest = content.split()
             sym = sym.upper()
@@ -10127,23 +10508,34 @@ async def on_message(message):
                 m = re.search(rf"{k}\s*=\s*([0-9]+(\.[0-9]+)?)", s)
                 return float(m.group(1)) if m else None
             tp = _parse_kv(args, "tp"); sl = _parse_kv(args, "sl"); tr = _parse_kv(args, "tr")
-            key = f"{sym}|{tfx}"
-            if TRADE_MODE == "paper" and key in PAPER_POS:
-                pos = PAPER_POS[key]
-                if tp is not None: pos["tp_pct"] = tp
-                if sl is not None: pos["sl_pct"] = sl
-                if tr is not None: pos["tr_pct"] = tr
-                avg = float(pos.get("entry_price") or pos.get("entry") or 0.0)
-                lev = float(pos.get("lev") or 1.0)
-                eff_tp_pct, eff_sl_pct, eff_tr_pct, _ = _eff_risk_pcts(pos.get("tp_pct"), pos.get("sl_pct"), pos.get("tr_pct"), lev)
-                pos["eff_tp_pct"] = eff_tp_pct; pos["eff_sl_pct"] = eff_sl_pct; pos["eff_tr_pct"] = eff_tr_pct
-                if str(pos.get("side", "")).upper()=="LONG":
-                    pos["tp_price"] = (avg*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                    pos["sl_price"] = (avg*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-                else:
-                    pos["tp_price"] = (avg*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                    pos["sl_price"] = (avg*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-                PAPER_POS[key] = pos; _save_json(PAPER_POS_FILE, PAPER_POS)
+            # allow side=LONG|SHORT in args
+            mside = re.search(r"side\s*=\s*(LONG|SHORT)", args, re.IGNORECASE)
+            side = (mside.group(1).upper() if mside else None)
+            if TRADE_MODE == "paper":
+                cand = []
+                for s in ("LONG","SHORT"):
+                    k = _pp_key(sym, tfx, s)
+                    if k in PAPER_POS: cand.append(k)
+                if not side and len(cand) > 1:
+                    await message.channel.send(f"⚠️ need side=LONG|SHORT for {sym} {tfx}")
+                    return
+                key = _pp_key(sym, tfx, side or ("LONG" if cand and cand[0].endswith("|LONG") else "SHORT"))
+                if key in PAPER_POS:
+                    pos = PAPER_POS[key]
+                    if tp is not None: pos["tp_pct"] = tp
+                    if sl is not None: pos["sl_pct"] = sl
+                    if tr is not None: pos["tr_pct"] = tr
+                    avg = float(pos.get("entry_price") or pos.get("entry") or 0.0)
+                    lev = float(pos.get("lev") or 1.0)
+                    eff_tp_pct, eff_sl_pct, eff_tr_pct, _ = _eff_risk_pcts(pos.get("tp_pct"), pos.get("sl_pct"), pos.get("tr_pct"), lev)
+                    pos["eff_tp_pct"] = eff_tp_pct; pos["eff_sl_pct"] = eff_sl_pct; pos["eff_tr_pct"] = eff_tr_pct
+                    if str(pos.get("side", "")).upper()=="LONG":
+                        pos["tp_price"] = (avg*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
+                        pos["sl_price"] = (avg*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
+                    else:
+                        pos["tp_price"] = (avg*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
+                        pos["sl_price"] = (avg*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
+                    PAPER_POS[key] = pos; _save_json(PAPER_POS_FILE, PAPER_POS)
             elif TRADE_MODE != "paper" and sym in FUT_POS:
                 pos = FUT_POS[sym]
                 if tp is not None: pos["tp_pct"] = tp
@@ -10169,12 +10561,14 @@ async def on_message(message):
             await message.channel.send(f"⚠️ risk error: {e}")
         return
 
-    if content.startswith("!help"):
+    if content.startswith(("!help","!도움말","!명령어")):
         lines = [
-            "• !set KEY=VALUE / !get KEY / !saveenv",
-            "• !pause [SYMBOL|ALL] [TF|ALL] [mins?] / !resume [SYMBOL|ALL] [TF|ALL]",
-            "• !close SYMBOL TF / !closeall",
-            "• !risk SYMBOL TF tp=5 sl=2.5 tr=1.8",
+            "• 설정: !set KEY=VALUE / !get KEY / !saveenv / !config(!설정)",
+            "• 일시정지/재개: !pause / !resume",
+            "• 청산: !close(!청산) SYMBOL TF [SIDE?] / !closeall(!모두청산|!전부청산)",
+            "• 리스크설정: !risk(!리스크) SYMBOL TF tp=5 sl=2.5 tr=1.8 [side=LONG|SHORT]",
+            "• 제한/패닉: !limits(!제한) / !limit set(!제한 설정) / !panic(!패닉) / !unpanic(!패닉해제)",
+            "• 리포트/상태: !report(!리포트) / !health / !상태 / !분석",
         ]
         await message.channel.send("\n".join(lines))
         return
@@ -10240,8 +10634,8 @@ async def on_message(message):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         snap = await get_price_snapshot(symbol)
-        live_price_val = snap.get("mid") or snap.get("last")
-        display_price = live_price_val if isinstance(live_price_val, (int, float)) else price
+        live_price_val = snap.get("chosen") or snap.get("mid") or snap.get("last")
+        display_price  = live_price_val if isinstance(live_price_val, (int, float)) else price
 
         main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
             tf=tf,
@@ -10280,125 +10674,25 @@ async def on_message(message):
     # ===== PDF 리포트 =====
     elif message.content.startswith("!리포트"):
         parts = message.content.split()
-        try:
-            symbol, tf = parse_symbol_tf(parts, default_symbol='ETH/USDT', default_tf='1h')
-        except ValueError as ve:
-            await message.channel.send(f"❌ {ve}")
-            return
-
-        if generate_pdf_report is None:
-            await message.channel.send("❌ PDF 모듈 임포트에 실패했습니다. (generate_pdf_report=None)")
-            return
-
-        # [ANCHOR: REPORT_PRICE_SNAPSHOT_BEGIN]
-        # 리포트에서도 전 TF와 동일한 '현재가 스냅샷'을 사용
-        try:
-            snap = await get_price_snapshot(symbol)
-            report_price = snap.get("mid") or snap.get("last")
-        except Exception:
-            report_price = None
-        try_live = None
-        try_close = None
-        # 마지막 보루: 스냅샷 실패 시 실시간/종가로 대체
-        if not isinstance(report_price, (int, float)):
+        # 사용법: !리포트 ETH 1d  |  !리포트 BTC 15m
+        if len(parts) >= 3:
+            sym_in = parts[1].upper()
+            tf     = parts[2].lower()
+            symbol = "ETH/USDT" if sym_in in ("ETH","ETH/USDT") else ("BTC/USDT" if sym_in in ("BTC","BTC/USDT") else sym_in)
+            await _send_report_oldstyle(client, message.channel, symbol, tf)
+        else:
+            # 인자 없으면 PnL PDF만(과거 동작 유지)
             try:
-                try_live = fetch_live_price(symbol)
-                report_price = try_live
-            except Exception:
-                try_live = None
-        if not isinstance(report_price, (int, float)):
-            # df가 있으면 마지막 종가로
-            try:
-                _df_tmp = get_ohlcv(symbol, tf, limit=2)
-                if _df_tmp is not None and len(_df_tmp) > 0:
-                    try_close = float(_df_tmp['close'].iloc[-1])
-                    report_price = try_close
-            except Exception:
-                pass
-        # [ANCHOR: REPORT_PRICE_SNAPSHOT_END]
-        log(f"[REPORT] {symbol} {tf} price(report/live/close)={report_price}/{try_live}/{try_close}")
-
-        df = get_ohlcv(symbol, tf, limit=300)
-        df = add_indicators(df)
-
-        # 분할 차트 생성 (PDF/첨부 둘 다 사용)
-        chart_files   = save_chart_groups(df, symbol, tf)
-        ichimoku_file = save_ichimoku_chart(df, symbol, tf)
-
-        df_1d = get_ohlcv(symbol, '1d', limit=300)
-        signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol)
-
-        # 일봉 변동률 계산
-
-        display_price = report_price
-        # [ANCHOR: daily_change_unify_eth_alt]
-        daily_change_pct = calc_daily_change_pct(symbol, display_price)
-
-
-
-        main_msg_pdf, summary_msg_pdf, _short_msg_pdf = format_signal_message(
-            tf=tf,
-            signal=signal,
-            price=price,
-            pnl=None,
-            strength=reasons,
-            df=df,
-            entry_time=None,
-            entry_price=None,
-            score=score,
-            weights=weights,
-            weights_detail=weights_detail,
-            prev_score_value=None,
-            agree_long=agree_long,
-            agree_short=agree_short,
-            daily_change_pct=daily_change_pct,
-            live_price=report_price,
-            show_risk=False
-        )
-        msg_for_pdf = f"{main_msg_pdf}\n\n{summary_msg_pdf}"
-
-        # 🟢 심볼·타임프레임 인자를 다른 함수에도 반영
-        score_file = plot_score_history(symbol, tf)
-        perf_file  = analyze_performance_for(symbol, tf)
-        performance_file = generate_performance_stats(tf, symbol=symbol)
-
-        display_price = sanitize_price_for_tf(symbol, tf, price)
-
-        pdf_path = generate_pdf_report(
-            df=df,
-            tf=tf,
-            symbol=symbol,
-            signal=signal,
-            price=report_price,
-            score=score,
-            reasons=reasons,
-            weights=weights,
-            agree_long=agree_long,
-            agree_short=agree_short,
-            now=datetime.now(),
-            chart_imgs=chart_files,                 # ✅ 분할차트 리스트
-            ichimoku_img=ichimoku_file,             # ✅ 이치모쿠
-            discord_message=msg_for_pdf,
-            daily_change_pct=daily_change_pct
-        )
-
-
-        # 심볼별 로그 저장
-
-        log_to_csv(symbol, tf, signal, report_price, rsi, macd, None, None, None, score, reasons, weights)
-
-        # 빈 메시지 가드 적용
-        # 보고서 안내 문구
-        content = f"📄 요청하신 {symbol} {tf} 보고서입니다."
-        files = [p for p in [*chart_files, ichimoku_file, pdf_path, score_file, perf_file, performance_file] if p and os.path.exists(p)]
-        await message.channel.send(content=content, files=[discord.File(p) for p in files] if files else None)
-
-
+                pdf = await generate_pnl_pdf()
+                if pdf:
+                    await message.channel.send(content="📊 선물 체결·PnL 요약 리포트", file=discord.File(pdf), silent=True)
+            except Exception as e:
+                await message.channel.send(f"리포트 생성 오류: {e}")
 
     # ===== 신호 이력 조회 =====
     elif message.content.startswith("!이력"):
         tf = parts[1] if len(parts) > 1 else "1h"
-        import csv, glob, os
+        import csv, glob
         rows = []
 
         # 1) 우선 통합 로그가 있으면 그걸 사용
