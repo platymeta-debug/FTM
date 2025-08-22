@@ -2137,6 +2137,7 @@ async def _fetch_recent_bar_1m_async(symbol: str):
         return None
 
 
+
 # ===== Fees helpers (env or exchange) =====
 def _fee_rates_for(symbol: str):
     """
@@ -2184,6 +2185,7 @@ def _estimate_fees_usdt(symbol: str, qty: float, entry: float, last: float):
         "notional_entry": notional_in,
         "notional_exit": notional_out,
     }
+
 
 
 # === [UTIL] calc_daily_change_pct — 퍼포먼스 스냅샷과 동일식 ===
@@ -7685,6 +7687,7 @@ _DASHBOARD_STATE = {"msg_id": 0, "ch_id": 0}
 _DASH_TASK_RUNNING = False
 _dash_state_load()
 
+
 async def _dash_channel(client):
     ch_id = DASHBOARD_CHANNEL_ID or int(os.getenv("PNL_REPORT_CHANNEL_ID","0") or 0)
     if not ch_id: return None
@@ -7699,6 +7702,7 @@ async def _dash_get_or_create_message(client):
     try:
         mid = int(_DASHBOARD_STATE.get("msg_id") or 0)
         if mid and _DASHBOARD_STATE.get("ch_id") == ch.id:
+
             return ch.get_partial_message(mid)  # no history fetch required
     except Exception:
         _DASHBOARD_STATE["msg_id"] = 0
@@ -7710,6 +7714,7 @@ async def _dash_get_or_create_message(client):
     _DASHBOARD_STATE["ch_id"] = ch.id
     _dash_state_save()
     log(f"[DASH] created dashboard msg id={m.id} ch={ch.id}")
+
     return ch.get_partial_message(m.id)
 
 def get_open_positions_iter():
@@ -7862,12 +7867,14 @@ async def _dash_loop(client):
                 try:
                     await msg.edit(content=txt)
                 except Exception as e:
+
                     if "Unknown Message" in str(e) or "Not Found" in str(e):
                         _DASHBOARD_STATE["msg_id"] = 0
                         _dash_state_save()
                         log("[DASH] dashboard message missing – will recreate")
                     else:
                         log(f"[DASH] edit warn: {e}")
+
             if PRESENCE_ENABLE:
 
                 if os.getenv("DASH_TRACE","0")=="1":
