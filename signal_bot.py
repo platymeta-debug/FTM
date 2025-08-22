@@ -7926,6 +7926,7 @@ async def _dash_render_text():
         )
 
     # [ANCHOR: DASH_RENDER_BEGIN]
+
     if os.getenv("DASH_LOCALE", "ko") == "ko":
         lev_mode = (os.getenv("DASH_LEV_HEADER_MODE", "applied") or "applied").lower()
         if lev_mode == "applied" and rows:
@@ -7952,6 +7953,7 @@ async def _dash_render_text():
         else:
             lev_line = os.getenv("TF_LEVERAGE", "")
         lines.append(f"mode:{os.getenv('TRADE_MODE')} / lev:{lev_line} / slippage:{os.getenv('SLIPPAGE_PCT')}%")
+
 
     # 합계 UPNL(수수료 옵션 포함)
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
