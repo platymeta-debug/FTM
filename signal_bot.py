@@ -5316,6 +5316,12 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
             "notional": notional,
         }
 
+        if pos.get("eff_margin") is not None:
+            try:
+                r["eff_margin"] = float(pos.get("eff_margin"))
+            except Exception:
+                pass
+
         fees = _estimate_fees_usdt(symbol, qty, entry, last)
         r["fee_entry_usdt"] = fees["entry_fee"]
         r["fee_exit_est_usdt"] = fees["exit_fee_est"]
@@ -5332,6 +5338,15 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
         upnl_sum_net += upnl_net
         fees_exit_est_sum += fees["exit_fee_est"]
         fees_entry_sum += fees["entry_fee"]
+
+        # === margin used (real capital) ===
+        try:
+            notional = abs(r.get("qty", 0.0)) * float(r.get("entry", 0.0))
+            lev_now = float(r.get("lev", 0.0) or 1.0)
+            margin_used = float(r.get("eff_margin") or (notional / max(1.0, lev_now)))
+            r["margin_used_usdt"] = margin_used
+        except Exception:
+            r["margin_used_usdt"] = 0.0
 
         rows.append(r)
 
@@ -6972,31 +6987,56 @@ def _fmt_pct(frac):
 # (구) _fmt_aloc_line는 더이상 사용하지 않음 → 알림에서 바로 포맷팅
 
 # [ANCHOR: NOTIFY_ENTRY_BEGIN]
-def _format_entry_message(symbol: str, tf: str, side: str, mode: str, price: float, lev: float,
-                          qty: float, notional: float, tp: float, sl: float, trail_pct: float,
-                          strength_label: str, strength_mult: float, equity_now: float):
-    ko = (os.getenv("DASH_LOCALE", "ko") == "ko")
+def _format_entry_message(symbol:str, tf:str, side:str, mode:str, price:float, lev:float,
+                          qty:float, notional:float, tp:float, sl:float, trail_pct:float,
+                          strength_label:str, strength_mult:float, equity_now:float,
+                          strength_score:float=None, eff_margin_used:float=None,
+                          tp_pct:float=None, sl_pct:float=None):
+    """
+    Entry alert formatter (KO/EN). Shows REAL capital used (margin), optional notional,
+    TP/SL with +/-%, and strength score if given.
+    """
+    ko = (os.getenv("DASH_LOCALE","ko") == "ko")
+    show_notional = (os.getenv("ALERT_SHOW_NOTIONAL","0") == "1")
     fees = _estimate_fees_usdt(symbol, qty, price, price)
+    # real capital used
+    margin_used = float(eff_margin_used) if eff_margin_used is not None else (abs(qty)*float(price) / max(1.0, float(lev or 1.0)))
+
+    # helper: percent labels
+    def _pct_label(x, sign="+"):
+        try:
+            return f"{float(x):.2f}%"
+        except Exception:
+            return "n/a"
+
     if ko:
-        head_emoji = "🟢" if side.upper() == "BUY" or side.upper().startswith("LONG") else "🔴"
+        head_emoji = "🟢" if side.upper().startswith("LONG") or "BUY" in side.upper() else "🔴"
         side_kr = "LONG" if side.upper().startswith("LONG") or "BUY" in side.upper() else "SHORT"
-        return (
-            f"{head_emoji} 진입 | {symbol} · {tf} · {side_kr} ×{lev:g}\n"
-            f"• 가격/수량: ${price:,.2f} / {qty:.4f} (노치오날 ${notional:,.2f})\n"
-            f"• 자본 사용: ${notional:,.2f} / 현재자본 ${equity_now:,.2f}\n"
-            f"• 강도: {strength_label} (×{strength_mult:.2f})\n"
-            f"• 리스크: TP ${tp:,.2f} / SL ${sl:,.2f} / 트레일 {trail_pct:.2f}%\n"
-            f"• 수수료(진입/추정청산): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
-        )
+        score_seg = (f" / 점수 {float(strength_score):.2f}" if strength_score is not None else "")
+        line1 = f"{head_emoji} 진입 | {symbol} · {tf} · {side_kr} ×{lev:g}"
+        line2 = f"• 가격/수량: ${price:,.2f} / {qty:.4f}"
+        if show_notional:
+            line2 += f"  (노치오날 ${notional:,.2f})"
+        line3 = f"• 실자본 사용: ${margin_used:,.2f} / 현재자본 ${equity_now:,.2f}"
+        line4 = f"• 강도: {strength_label} (×{strength_mult:.2f}){score_seg}"
+        tp_txt = f"+{_pct_label(tp_pct)}" if tp_pct is not None else ""
+        sl_txt = f"-{_pct_label(sl_pct)}" if sl_pct is not None else ""
+        line5 = f"• 리스크: TP ${tp:,.2f} {tp_txt} / SL ${sl:,.2f} {sl_txt} / 트레일 {float(trail_pct):.2f}%"
+        line6 = f"• 수수료(진입/추정청산): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
+        return "\n".join([line1, line2, line3, line4, line5, line6])
     else:
-        return (
-            f"🟢 ENTRY | {symbol} · {tf} · {side} ×{lev:g}\n"
-            f"• Price/Qty: ${price:,.2f} / {qty:.4f} (Notional ${notional:,.2f})\n"
-            f"• Equity Use: ${notional:,.2f} / Equity ${equity_now:,.2f}\n"
-            f"• Strength: {strength_label} (×{strength_mult:.2f})\n"
-            f"• Risk: TP ${tp:,.2f} / SL ${sl:,.2f} / Trail {trail_pct:.2f}%\n"
-            f"• Fees (entry/est. close): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
-        )
+        score_seg = (f" / score {float(strength_score):.2f}" if strength_score is not None else "")
+        line1 = f"🟢 ENTRY | {symbol} · {tf} · {side} ×{lev:g}"
+        line2 = f"• Price/Qty: ${price:,.2f} / {qty:.4f}"
+        if show_notional:
+            line2 += f"  (Notional ${notional:,.2f})"
+        line3 = f"• Real capital used: ${margin_used:,.2f} / Equity ${equity_now:,.2f}"
+        line4 = f"• Strength: {strength_label} (×{strength_mult:.2f}){score_seg}"
+        tp_txt = f"+{_pct_label(tp_pct)}" if tp_pct is not None else ""
+        sl_txt = f"-{_pct_label(sl_pct)}" if sl_pct is not None else ""
+        line5 = f"• Risk: TP ${tp:,.2f} {tp_txt} / SL ${sl:,.2f} {sl_txt} / Trail {float(trail_pct):.2f}%"
+        line6 = f"• Fees (entry/est. close): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
+        return "\n".join([line1, line2, line3, line4, line5, line6])
 
 
 async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
@@ -7071,6 +7111,7 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
         except Exception:
             pass
 
+        eff_margin_used = float(eff_margin) if eff_margin is not None else None
         msg = _format_entry_message(
             symbol,
             tf,
@@ -7086,6 +7127,10 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             strength_label or "",
             float(sf or 0.0),
             capital_get(),
+            strength_score=score,
+            eff_margin_used=eff_margin_used,
+            tp_pct=eff_tp_pct if 'eff_tp_pct' in locals() else None,
+            sl_pct=eff_sl_pct if 'eff_sl_pct' in locals() else None,
         )
         await ch.send(msg)
     except Exception as e:
@@ -7881,10 +7926,34 @@ async def _dash_render_text():
         )
 
     # [ANCHOR: DASH_RENDER_BEGIN]
-    if os.getenv("DASH_LOCALE","ko")=="ko":
-        lines.append(f"모드:{os.getenv('TRADE_MODE')} / 레버리지:{os.getenv('TF_LEVERAGE')} / 슬리피지:{os.getenv('SLIPPAGE_PCT')}%")
+
+    if os.getenv("DASH_LOCALE", "ko") == "ko":
+        lev_mode = (os.getenv("DASH_LEV_HEADER_MODE", "applied") or "applied").lower()
+        if lev_mode == "applied" and rows:
+            _bkt = {}
+            for r in rows:
+                sym = str(r["symbol"]).split("/")[0]
+                tfv = r["tf"]
+                lv = int(float(r.get("lev", 0) or 0))
+                _bkt.setdefault(sym, []).append(f"{tfv}={lv}")
+            lev_line = "; ".join(f"{k} " + ", ".join(sorted(set(vs))) for k, vs in _bkt.items())
+        else:
+            lev_line = os.getenv("TF_LEVERAGE", "")
+        lines.append(f"모드:{os.getenv('TRADE_MODE')} / 레버리지:{lev_line} / 슬리피지:{os.getenv('SLIPPAGE_PCT')}%")
     else:
-        lines.append(f"mode:{os.getenv('TRADE_MODE')} / lev:{os.getenv('TF_LEVERAGE')} / slippage:{os.getenv('SLIPPAGE_PCT')}%")
+        lev_mode = (os.getenv("DASH_LEV_HEADER_MODE", "applied") or "applied").lower()
+        if lev_mode == "applied" and rows:
+            _bkt = {}
+            for r in rows:
+                sym = str(r["symbol"]).split("/")[0]
+                tfv = r["tf"]
+                lv = int(float(r.get("lev", 0) or 0))
+                _bkt.setdefault(sym, []).append(f"{tfv}={lv}")
+            lev_line = "; ".join(f"{k} " + ", ".join(sorted(set(vs))) for k, vs in _bkt.items())
+        else:
+            lev_line = os.getenv("TF_LEVERAGE", "")
+        lines.append(f"mode:{os.getenv('TRADE_MODE')} / lev:{lev_line} / slippage:{os.getenv('SLIPPAGE_PCT')}%")
+
 
     # 합계 UPNL(수수료 옵션 포함)
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
@@ -7909,26 +7978,43 @@ async def _dash_render_text():
     lines.append("— 포지션 —" if ko else "— open positions —")
     # 포지션 목록
     for r in rows:
-        # 1행 요약
-        if ko:
-            base = (
-                f"{r['symbol']} {r['tf']} {r['side']} ×{r['lev']:g}  "
-                f"{r['qty']:.4f} @ {r['entry']:.2f} → {r['last']:.2f}  "
-                f"| UPNL {r['upnl_pct_on_margin']:+.2f}% / {r.get('upnl_usdt_net', r['upnl_usdt']):+,.2f} USDT"
-            )
-        else:
-            base = (
-                f"{r['symbol']} {r['tf']} {r['side']} {r['qty']:.4f} @ {r['entry']:.2f} → {r['last']:.2f} ×{r['lev']:g} "
-                f"| UPNL {r['upnl_pct_on_margin']:+.2f}% / {r.get('upnl_usdt_net', r['upnl_usdt']):+,.2f} USDT"
-            )
-        # 2행 보조
-        extra = f" | MAE {r.get('mae_pct',0.0):+.2f}% · MFE {r.get('mfe_pct',0.0):+.2f}%"
-        if show_fees:
-            fe = r.get("fee_entry_usdt", 0.0)
-            fx = r.get("fee_exit_est_usdt", 0.0)
-            extra += f" | 수수료 진입 -{fe:.2f} · 청산(추정) -{fx:.2f}"
+        # 불릿+줄바꿈 포맷 (ko/en)
+        upnl_net = r.get("upnl_usdt_net", r.get("upnl_usdt", 0.0))
+        mae = r.get("mae_pct", 0.0); mfe = r.get("mfe_pct", 0.0)
+        fe  = float(r.get("fee_entry_usdt",0.0)); fx = float(r.get("fee_exit_est_usdt",0.0))
+        margin_used = float(r.get("margin_used_usdt", 0.0))
+        show_notional = (os.getenv("DASH_SHOW_NOTIONAL","0") == "1")
+        notional = abs(r.get("qty",0.0))*float(r.get("entry",0.0))
+        # 리스크 항목(있을 때만)
+        tp_price = r.get("tp_price"); sl_price = r.get("sl_price")
+        tp_pct = r.get("eff_tp_pct", r.get("tp_pct")); sl_pct = r.get("eff_sl_pct", r.get("sl_pct"))
 
-        lines.append(base + extra)
+        if ko:
+            head = f"• {r['symbol']} · {r['tf']} · {r['side']} ×{r['lev']:g}"
+            line_price = f"  • 가격/수량: ${float(r['entry']):,.2f} → ${float(r['last']):,.2f} / {r['qty']:.4f}"
+            if show_notional:
+                line_price += f"  (노치오날 ${notional:,.2f})"
+            line_cap   = f"  • 실자본 사용: ${margin_used:,.2f}"
+            line_pnl   = f"  • 손익: {r['upnl_pct_on_margin']:+.2f}% / {upnl_net:+,.2f} USDT   ·   MAE {mae:+.2f}% · MFE {mfe:+.2f}%"
+            line_fee   = (f"  • 수수료: 진입 -${fe:.2f} / 청산(추정) -${fx:.2f}") if show_fees else ""
+            line_risk  = ""
+            if (tp_price is not None) and (sl_price is not None) and (tp_pct is not None) and (sl_pct is not None):
+                line_risk = f"  • 리스크: TP ${float(tp_price):,.2f} (+{float(tp_pct):.2f}%) / SL ${float(sl_price):,.2f} (-{float(sl_pct):.2f}%)"
+            chunk = "\n".join([s for s in [head, line_price, line_cap, line_pnl, line_fee, line_risk] if s])
+            lines.append(chunk)
+        else:
+            head = f"• {r['symbol']} · {r['tf']} · {r['side']} ×{r['lev']:g}"
+            line_price = f"  • Price/Qty: ${float(r['entry']):,.2f} → ${float(r['last']):,.2f} / {r['qty']:.4f}"
+            if show_notional:
+                line_price += f"  (Notional ${notional:,.2f})"
+            line_cap   = f"  • Margin used: ${margin_used:,.2f}"
+            line_pnl   = f"  • PnL: {r['upnl_pct_on_margin']:+.2f}% / {upnl_net:+,.2f} USDT   ·   MAE {mae:+.2f}% · MFE {mfe:+.2f}%"
+            line_fee   = (f"  • Fees: entry -${fe:.2f} / close(est) -${fx:.2f}") if show_fees else ""
+            line_risk  = ""
+            if (tp_price is not None) and (sl_price is not None) and (tp_pct is not None) and (sl_pct is not None):
+                line_risk = f"  • Risk: TP ${float(tp_price):,.2f} (+{float(tp_pct):.2f}%) / SL ${float(sl_price):,.2f} (-{float(sl_pct):.2f}%)"
+            chunk = "\n".join([s for s in [head, line_price, line_cap, line_pnl, line_fee, line_risk] if s])
+            lines.append(chunk)
 
     return "\n".join(lines), st, eq_now, totals
 
@@ -8093,6 +8179,54 @@ def _req_trail_pct(symbol: str, tf: str, tf_map: dict) -> float:
     if base in _TRAIL_BY_SYMBOL and tf in _TRAIL_BY_SYMBOL[base]:
         return float(_TRAIL_BY_SYMBOL[base][tf])
     return _req_float_map(_TRAIL_BY_SYMBOL.get(base, {}), tf_map, tf, 0.0)
+
+# [ANCHOR: CFG_RESOLUTION_BEGIN]
+def eff_leverage(symbol: str, tf: str) -> int:
+    """Resolve effective leverage for symbol×tf."""
+    try:
+        return int(_req_leverage(symbol, tf))
+    except Exception:
+        try:
+            return int(TF_LEVERAGE.get(tf, 1))
+        except Exception:
+            return 1
+
+def eff_margin(symbol: str, tf: str) -> str:
+    """Resolve effective margin mode for symbol×tf."""
+    try:
+        mode, _ = _req_margin_mode(symbol, tf)
+        return mode
+    except Exception:
+        return FUT_MARGIN
+
+def eff_slippage(symbol: str, tf: str) -> float:
+    """Resolve effective slippage percent for symbol×tf."""
+    try:
+        return float(_req_slippage_pct(symbol, tf))
+    except Exception:
+        return float(os.getenv("SLIPPAGE_PCT", "0.0"))
+
+def eff_tp_pct(symbol: str, tf: str) -> float:
+    """Resolve effective TP% for symbol×tf."""
+    try:
+        return float(_req_tp_pct(symbol, tf, (take_profit_pct or {})))
+    except Exception:
+        return 0.0
+
+def eff_sl_pct(symbol: str, tf: str) -> float:
+    """Resolve effective SL% for symbol×tf."""
+    try:
+        return float(_req_sl_pct(symbol, tf, (HARD_STOP_PCT or {})))
+    except Exception:
+        return 0.0
+
+def eff_trail_pct(symbol: str, tf: str) -> float:
+    """Resolve effective trailing-stop % for symbol×tf."""
+    try:
+        return float(_req_trail_pct(symbol, tf, (trailing_stop_pct or {})))
+    except Exception:
+        return 0.0
+# [ANCHOR: CFG_RESOLUTION_END]
 
 # === Trailing helpers (apply to all TFs) ===
 
