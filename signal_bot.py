@@ -4489,14 +4489,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                     avg = float(existing_paper["entry_price"])
                     tp_pct = float(existing_paper.get("tp_pct", 0.0))
                     sl_pct = float(existing_paper.get("sl_pct", 0.0))
-                    if existing_paper.get("side") == "LONG":
-                        existing_paper["tp_price"] = (avg * (1 + tp_pct/100.0)) if tp_pct>0 else None
-                        existing_paper["sl_price"] = (avg * (1 - sl_pct/100.0)) if sl_pct>0 else None
-                    else:
-                        existing_paper["tp_price"] = (avg * (1 - tp_pct/100.0)) if tp_pct>0 else None
-                        existing_paper["sl_price"] = (avg * (1 + sl_pct/100.0)) if sl_pct>0 else None
-
+                    tr_pct = float(existing_paper.get("tr_pct", 0.0))
                     PAPER_POS[key] = existing_paper
+                    try:
+                        _paper_ensure_tp_sl_trailing(symbol, tf, existing_paper.get("side"), avg, tp_pct, sl_pct, tr_pct, existing_paper.get("lev"))
+                    except Exception as e:
+                        log(f"[PAPER] ensure tp/sl/tr warn {symbol} {tf}: {e}")
                     _save_json(PAPER_POS_FILE, PAPER_POS)
                     did_scale = True
                 else:
@@ -4708,19 +4706,22 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 "low": float(last_price),
 
             }
-            # (NEW) persist risk to paper JSON and CSV
-            slip   = _req_slippage_pct(symbol, tf)
-            eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
-            if PAPER_POS[key]["side"] == "LONG":
-                tp_price = (float(last_price)*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                sl_price = (float(last_price)*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-            else:
-                tp_price = (float(last_price)*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-                sl_price = (float(last_price)*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-            tr_pct_eff = eff_tr_pct
+            slip = _req_slippage_pct(symbol, tf)
+            eff_tp_pct, eff_sl_pct, _, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
+            try:
+                tp_price, sl_price, tr_pct_eff = _paper_ensure_tp_sl_trailing(
+                    symbol, tf, side,
+                    entry_price=float(last_price),
+                    tp_pct=(tp_pct if (tp_pct is not None) else None),
+                    sl_pct=(sl_pct if (sl_pct is not None) else None),
+                    tr_pct=(tr_pct if (tr_pct is not None) else None),
+                    lev=float(lev_used or 1.0)
+                )
+            except Exception as e:
+                log(f"[PAPER] ensure tp/sl/tr warn {symbol} {tf}: {e}")
+                tr_pct_eff = None
             PAPER_POS[key].update({
                 "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
-                "tp_price": tp_price, "sl_price": sl_price,
                 "lev": float(lev_used or 1.0),
                 "eff_tp_pct": eff_tp_pct, "eff_sl_pct": eff_sl_pct, "eff_tr_pct": tr_pct_eff,
                 "risk_mode": RISK_INTERPRET_MODE,
@@ -4746,19 +4747,22 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             "low": float(last_price),
 
         }
-        # (NEW) persist risk to paper JSON and CSV
-        slip   = _req_slippage_pct(symbol, tf)
-        eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
-        if PAPER_POS[key]["side"] == "LONG":
-            tp_price = (float(last_price)*(1+(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-            sl_price = (float(last_price)*(1-(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-        else:
-            tp_price = (float(last_price)*(1-(eff_tp_pct or 0)/100)) if eff_tp_pct else None
-            sl_price = (float(last_price)*(1+(eff_sl_pct or 0)/100)) if eff_sl_pct else None
-        tr_pct_eff = eff_tr_pct
+        slip = _req_slippage_pct(symbol, tf)
+        eff_tp_pct, eff_sl_pct, _, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev_used)
+        try:
+            tp_price, sl_price, tr_pct_eff = _paper_ensure_tp_sl_trailing(
+                symbol, tf, side,
+                entry_price=float(last_price),
+                tp_pct=(tp_pct if (tp_pct is not None) else None),
+                sl_pct=(sl_pct if (sl_pct is not None) else None),
+                tr_pct=(tr_pct if (tr_pct is not None) else None),
+                lev=float(lev_used or 1.0)
+            )
+        except Exception as e:
+            log(f"[PAPER] ensure tp/sl/tr warn {symbol} {tf}: {e}")
+            tr_pct_eff = None
         PAPER_POS[key].update({
             "tp_pct": tp_pct, "sl_pct": sl_pct, "tr_pct": tr_pct,
-            "tp_price": tp_price, "sl_price": sl_price,
             "lev": float(lev_used or 1.0),
             "eff_tp_pct": eff_tp_pct, "eff_sl_pct": eff_sl_pct, "eff_tr_pct": tr_pct_eff,
             "risk_mode": RISK_INTERPRET_MODE,
@@ -6176,6 +6180,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         # [ANCHOR: PAPER_FEES_FUNDING_BEGIN]
         ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
 
+
         side_up = 1 if str(side).upper() == "LONG" else -1
         gross_usdt = (float(exit_price) - float(entry)) * float(qty) * side_up
 
@@ -6205,6 +6210,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         else:
             fee_entry = 0.0
             fee_exit  = 0.0
+
 
         fees_usdt = float(fee_entry + fee_exit)
         if ESTIMATE_FUNDING_IN_PNL:
@@ -8508,6 +8514,44 @@ def eff_trail_pct(symbol: str, tf: str) -> float:
         return 0.0
 # [ANCHOR: CFG_RESOLUTION_END]
 
+# [ANCHOR: PAPER_PROTECT_ORDERS_BEGIN]
+def _paper_ensure_tp_sl_trailing(symbol: str, tf: str, side: str,
+                                 entry_price: float, tp_pct: float | None,
+                                 sl_pct: float | None, tr_pct: float | None,
+                                 lev: float | None) -> tuple[float | None, float | None, float | None]:
+    """
+    Compute and persist paper tp/sl and effective trailing pct using the same math
+    futures uses (eff on price, leverage-aware when RISK_INTERPRET_MODE=MARGIN_RETURN).
+    Returns (tp_price, sl_price, eff_tr_pct).
+    """
+    eff_tp_pct, eff_sl_pct, eff_tr_pct, _ = _eff_risk_pcts(tp_pct, sl_pct, tr_pct, lev)
+    tp_price = None
+    sl_price = None
+
+    if eff_tp_pct and eff_tp_pct > 0:
+        if str(side).upper() == "LONG":
+            tp_price = float(entry_price) * (1.0 + eff_tp_pct / 100.0)
+        else:
+            tp_price = float(entry_price) * (1.0 - eff_tp_pct / 100.0)
+
+    if eff_sl_pct and eff_sl_pct > 0:
+        if str(side).upper() == "LONG":
+            sl_price = float(entry_price) * (1.0 - eff_sl_pct / 100.0)
+        else:
+            sl_price = float(entry_price) * (1.0 + eff_sl_pct / 100.0)
+
+    k = _pp_key(symbol, tf, side)
+    pos = PAPER_POS.get(k) or {}
+    pos["tp_price"] = tp_price
+    pos["sl_price"] = sl_price
+    pos["eff_tr_pct"] = eff_tr_pct
+    if os.getenv("PAPER_EXIT_REDUCEONLY", "1") == "1":
+        pos["reduce_only"] = True
+    PAPER_POS[k] = pos
+    _save_json(PAPER_POS_FILE, PAPER_POS)
+    return tp_price, sl_price, eff_tr_pct
+# [ANCHOR: PAPER_PROTECT_ORDERS_END]
+
 # === Trailing helpers (apply to all TFs) ===
 
 TRAIL_ARM_DELTA_MIN_PCT = float(cfg_get("TRAIL_ARM_DELTA_MIN_PCT", "0.0"))
@@ -9513,6 +9557,7 @@ async def on_ready():
                     pass
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
+                _reduced_this_cycle = False
                 if TRADE_MODE == "paper":
                     for _side in ("LONG","SHORT"):
                         k = _pp_key(symbol_eth, tf, _side)
@@ -9546,6 +9591,8 @@ async def on_ready():
                                     qty=info.get("qty"),
                                     pnl_usdt=info.get("net_usdt")
                                 )
+                                _reduced_this_cycle = True
+
                             continue
                 else:
                     pos = FUT_POS.get(symbol_eth)
@@ -9604,6 +9651,8 @@ async def on_ready():
                             info = await _paper_close(symbol_eth, tf, exec_px, exit_reason, side=side)
                             if info:
                                 await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+
+                                _reduced_this_cycle = True
                             continue
                 else:
                     pos = FUT_POS.get(symbol_eth)
@@ -9622,6 +9671,10 @@ async def on_ready():
                             exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=exit_reason)
                             continue
+                if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
+                    log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_eth} {tf}")
+                    return
+
 
 
 
@@ -9935,6 +9988,7 @@ async def on_ready():
 
                 # === 재시작 보호: 이미 열린 포지션 보호조건 재평가 ===
                 key2 = (symbol_btc, tf)
+                _reduced_this_cycle = False
                 if TRADE_MODE == "paper":
                     for _side in ("LONG","SHORT"):
                         k = _pp_key(symbol_btc, tf, _side)
@@ -9965,6 +10019,7 @@ async def on_ready():
                                     pnl_pct=info.get("pnl_pct"), qty=info.get("qty"), pnl_usdt=info.get("net_usdt")
 
                                 )
+                                _reduced_this_cycle = True
                             continue
                 else:
                     pos = FUT_POS.get(symbol_btc)
@@ -10032,6 +10087,7 @@ async def on_ready():
                             info = await _paper_close(symbol_btc, tf, exec_px, exit_reason, side=side)
                             if info:
                                 await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+                                _reduced_this_cycle = True
                             continue
                 else:
                     pos = FUT_POS.get(symbol_btc)
@@ -10050,6 +10106,10 @@ async def on_ready():
                             exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=exit_reason)
                             continue
+                if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
+                    log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_btc} {tf}")
+                    return
+
 
 
 
