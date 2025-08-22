@@ -6498,6 +6498,113 @@ async def _apply_all_pending_margin_switches(ex):
             log(f"[FUT] margin queue process warn {sym}: {e}")
 
 
+# [ANCHOR: FUT_MARGIN_LEV_FETCH_BEGIN]  << ADD NEW >>
+async def _fetch_current_margin_leverage(ex, symbol: str):
+    """
+    Return (mode, lev) where:
+      mode ∈ {'ISOLATED','CROSSED'} (None if unknown)
+      lev  ∈ int or None
+    Tries Binance 'positionRisk' first; falls back to fetch_positions().
+    """
+    try:
+        m = ex.market(symbol)
+        sym_id = m.get('id') or symbol.replace('/', '')
+    except Exception:
+        sym_id = symbol.replace('/', '')
+
+    mode = None
+    lev  = None
+
+    # 1) Binance positionRisk (preferred)
+    try:
+        if hasattr(ex, 'fapiPrivate_get_positionrisk'):
+            rows = await _post(ex.fapiPrivate_get_positionrisk, {'symbol': sym_id})
+            row = rows[0] if isinstance(rows, list) and rows else rows
+            if row:
+                iso = row.get('isolated')
+                try:
+                    if isinstance(iso, str):
+                        iso = iso.lower() in ('true', '1', 'yes')
+                    mode = 'ISOLATED' if iso else 'CROSSED'
+                except Exception:
+                    pass
+                try:
+                    lev = int(float(row.get('leverage') or 0))
+                except Exception:
+                    pass
+    except Exception as e:
+        log(f"[FUT] margin/lev fetch warn {symbol}: {e}")
+
+    # 2) Fallback: fetch_positions
+    if mode is None or lev is None:
+        try:
+            pos = await _post(ex.fetch_positions, [symbol])
+            if isinstance(pos, list) and pos:
+                p = pos[0] if isinstance(pos[0], dict) else {}
+                info = p.get('info', {}) if isinstance(p, dict) else {}
+                if lev is None:
+                    try:
+                        lev = int(float(p.get('leverage') or info.get('leverage') or 0))
+                    except Exception:
+                        pass
+                if mode is None:
+                    iso = info.get('isolated') if isinstance(info, dict) else None
+                    if iso is not None:
+                        if isinstance(iso, str):
+                            iso = iso.lower() in ('true','1','yes')
+                        mode = 'ISOLATED' if iso else 'CROSSED'
+        except Exception:
+            pass
+
+    return (mode, lev)
+# [ANCHOR: FUT_MARGIN_LEV_FETCH_END]
+
+# [ANCHOR: FUT_PRECHECK_BEGIN]  << ADD NEW >>
+async def _check_and_sync_symbol_settings(ex, symbol: str, tf: str) -> bool:
+    """
+    Verify current margin/leverage equals requested; fix if possible; enqueue & attempt immediate switch if margin mismatch persists.
+    Returns True if settings are aligned; otherwise False (the caller should skip ordering).
+    """
+    try:
+        wanted_margin, _ = _req_margin_mode(symbol, tf)
+    except Exception:
+        wanted_margin = 'ISOLATED'
+
+    try:
+        req_lev = int(_req_leverage(symbol, tf))
+        lim = _market_limits(ex, symbol)
+        req_lev = int(_clamp(req_lev, 1, int(lim.get('max_lev', 125))))
+    except Exception:
+        req_lev = 1
+
+    cur_mode, cur_lev = await _fetch_current_margin_leverage(ex, symbol)
+    if cur_mode == wanted_margin and (cur_lev is None or int(cur_lev) == int(req_lev)):
+        return True
+
+    # Try to apply settings normally
+    try:
+        await _ensure_symbol_settings(ex, symbol, tf)
+    except Exception as e:
+        log(f"[FUT] precheck ensure warn {symbol}: {e}")
+
+    cur_mode2, cur_lev2 = await _fetch_current_margin_leverage(ex, symbol)
+    if cur_mode2 == wanted_margin and (cur_lev2 is not None and int(cur_lev2) == int(req_lev)):
+        return True
+
+    # If margin still mismatched, enqueue & attempt immediate switch
+    try:
+        if cur_mode2 != wanted_margin:
+            _enqueue_margin_switch(symbol, wanted_margin, why="pre-order mismatch")
+            await _apply_margin_switch_if_possible(ex, symbol)
+            cur_mode3, cur_lev3 = await _fetch_current_margin_leverage(ex, symbol)
+            if cur_mode3 == wanted_margin and (cur_lev3 is not None and int(cur_lev3) == int(req_lev)):
+                return True
+    except Exception as e:
+        log(f"[FUT] precheck queue/apply warn {symbol}: {e}")
+
+    return False
+# [ANCHOR: FUT_PRECHECK_END]
+
 # ==========================
 #   USDT-M Futures Engine
 # ==========================
@@ -7636,6 +7743,17 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
 
     await _ensure_account_settings(ex)            # 듀얼 모드 등
     await _ensure_symbol_settings(ex, symbol, tf) # TF별 레버리지/마진
+
+    # [ANCHOR: PREORDER_MARGIN_PRECHECK_BEGIN]  << ADD NEW >>
+    try:
+        if os.getenv("MARGIN_PRECHECK_ENFORCE", "1") == "1":
+            ok = await _check_and_sync_symbol_settings(ex, symbol, tf)
+            if not ok:
+                log(f"[FUT] skip {symbol} {tf}: margin/leverage not ready")
+                return
+    except Exception as e:
+        log(f"[FUT] precheck warn {symbol} {tf}: {e}")
+    # [ANCHOR: PREORDER_MARGIN_PRECHECK_END]
 
     # --- 슬리피지 가드(심볼×TF 오버라이드 반영) ---
     limit_pct = _req_slippage_pct(symbol, tf)  # ex) BTC 4h=0.4, ETH 4h=0.9
@@ -9198,6 +9316,15 @@ async def on_ready():
         try:
 
             gatekeeper_heartbeat(_now_ms())
+
+            # [ANCHOR: MARGIN_Q_SWEEP_LOOP_BEGIN]  << ADD NEW >>
+            try:
+                if os.getenv("MARGIN_Q_SWEEP_IN_LOOP", "1") == "1":
+                    if TRADE_MODE == "futures" and FUT_EXCHANGE:
+                        await _apply_all_pending_margin_switches(FUT_EXCHANGE)
+            except Exception as e:
+                log(f"[FUT] margin queue sweep(loop) warn: {e}")
+            # [ANCHOR: MARGIN_Q_SWEEP_LOOP_END]
 
             # ✅ 루프 1회마다 실시간 가격 스냅샷 활용 (TF 공통)
 
