@@ -1567,39 +1567,43 @@ def detect_market_regime(tf='1h'):
 
 # === 실시간 가격(티커) 유틸 ===
  # === [ANCHOR: PRICE_SNAPSHOT_UTIL] 심볼별 라이브 프라이스 스냅샷 (공통 현재가) ===
-PRICE_SNAPSHOT = {}  # {symbol: {"ts": ms, "last": float|None, "bid": float|None, "ask": float|None, "mid": float|None, "chosen": float|None}}
+PRICE_SNAPSHOT = {}  # {symbol: {"ts": ms, "last": float|None, "bid": float|None, "ask": float|None, "mid": float|None, "mark": float|None, "index": float|None, "chosen": float|None}}
 PRICE_SNAPSHOT_TTL_MS = 500  # 동일 틱 처리용 짧은 TTL
 
 async def get_price_snapshot(symbol: str) -> dict:
     """
-    전 TF(15m/1h/4h/1d)에서 동일하게 쓸 '현재가 스냅샷'을 만든다.
-    chosen = mid(가능) 또는 last(대체). 실패 시 None.
+    Build a unified 'live price snapshot' used across TFs.
+    chosen follows PRICE_FALLBACK_ORDER (e.g., mark,last,mid,index).
+    In paper mode, we still query a public futures exchange for mark/index.
     """
     now_ms = int(time.time() * 1000)
     rec = PRICE_SNAPSHOT.get(symbol)
     if rec and (now_ms - rec.get("ts", 0) < PRICE_SNAPSHOT_TTL_MS):
         return rec
 
-    # 1) 선물 모드면 선물 인스턴스 우선, 2) 아니면 스팟 티커
-    last = bid = ask = mid = mark = chosen = None
-    try:
-        ex = FUT_EXCHANGE if (TRADE_MODE == "futures" and FUT_EXCHANGE) else None
-        if ex:
+    last = bid = ask = mid = mark = index = None
+
+    # Prefer authenticated FUT_EXCHANGE; else fall back to PUB_FUT_EXCHANGE; else spot last.
+    ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
+    if ex:
+        try:
             t = await _post(ex.fetch_ticker, symbol)
             last = float(t.get('last') or 0) or None
             bid  = float(t.get('bid')  or 0) or None
             ask  = float(t.get('ask')  or 0) or None
             try:
-                mark = float(
-                    t.get('markPrice')
-                    or (t.get('info', {}).get('markPrice') if isinstance(t.get('info'), dict) else 0)
-                ) or None
+                info  = t.get('info', {}) if isinstance(t.get('info'), dict) else {}
+                mark  = float(t.get('markPrice')  or info.get('markPrice')  or 0) or None
+                index = float(t.get('indexPrice') or info.get('indexPrice') or 0) or None
             except Exception:
-                mark = None
-        else:
+                pass
+        except Exception:
+            pass
+    else:
+        try:
             last = float(fetch_live_price(symbol) or 0) or None
-    except Exception:
-        pass
+        except Exception:
+            last = None
 
     if bid and ask:
         try:
@@ -1607,8 +1611,22 @@ async def get_price_snapshot(symbol: str) -> dict:
         except Exception:
             mid = None
 
-    chosen = mid or last
-    PRICE_SNAPSHOT[symbol] = {"ts": now_ms, "last": last, "bid": bid, "ask": ask, "mid": mid, "mark": mark, "chosen": chosen}
+    # Decide chosen by fallback order
+    chosen = None
+    for k in PRICE_FALLBACK_ORDER:
+        if k == "mark"  and mark  is not None: chosen = mark;  break
+        if k == "last"  and last  is not None: chosen = last;  break
+        if k == "mid"   and mid   is not None: chosen = mid;   break
+        if k == "index" and index is not None: chosen = index; break
+
+    # Optional: if you never want to use raw 'mark' as the final number for display
+    if MARK_CLAMP_TO_LAST and (chosen is not None) and (mark is not None) and (chosen == mark) and (last is not None):
+        chosen = last
+
+    PRICE_SNAPSHOT[symbol] = {
+        "ts": now_ms, "last": last, "bid": bid, "ask": ask,
+        "mid": mid, "mark": mark, "index": index, "chosen": chosen
+    }
     return PRICE_SNAPSHOT[symbol]
 
 def fetch_live_price(symbol: str) -> float | None:
@@ -4996,7 +5014,7 @@ import asyncio as _asyncio
 
 PRICE_FETCH_MAX_RETRY = int(os.getenv("PRICE_FETCH_MAX_RETRY","3") or 3)
 PRICE_FETCH_BACKOFF_MS = int(os.getenv("PRICE_FETCH_BACKOFF_MS","200") or 200)
-PRICE_FALLBACK_ORDER = [x.strip() for x in os.getenv("PRICE_FALLBACK_ORDER","last,mid,mark,index").split(",")]
+PRICE_FALLBACK_ORDER = [x.strip() for x in os.getenv("PRICE_FALLBACK_ORDER","mark,last,mid,index").split(",")]
 MARK_CLAMP_TO_LAST = int(os.getenv("MARK_CLAMP_TO_LAST","1") or 1)
 
 async def _sleep_ms(ms:int):
@@ -6566,6 +6584,44 @@ def _mk_ex():
         log(f"[FUT] init error: {e}")
     return ex
 
+# [ANCHOR: FUT_PUB_EX_BEGIN]  << ADD NEW >>
+PUB_FUT_EXCHANGE = None
+
+def _mk_pub_fut_ex():
+    """
+    Build a public futures exchange instance (no API keys) so that
+    paper mode can still read futures mark/index prices.
+    """
+    try:
+        ex_id = EXCHANGE_ID
+        # Map common spot id -> its futures counterpart (Binance)
+        if ex_id == "binance":
+            ex_id = "binanceusdm"
+        cls = getattr(ccxt, ex_id)
+    except Exception as e:
+        log(f"[FUT_PUB] Unsupported exchange id for public futures: {EXCHANGE_ID} ({e})")
+        return None
+    try:
+        ex = cls({
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future', 'adjustForTimeDifference': True}
+        })
+        # Optional: honor SANDBOX if explicitly desired
+        try:
+            if SANDBOX:
+                ex.set_sandbox_mode(True)
+        except Exception:
+            pass
+        try:
+            ex.load_markets()
+        except Exception as e:
+            log(f"[FUT_PUB] load_markets warn: {e}")
+        return ex
+    except Exception as e:
+        log(f"[FUT_PUB] init failed: {e}")
+        return None
+# [ANCHOR: FUT_PUB_EX_END]
+
 
 async def _post(fn, *args, **kwargs):
     return await asyncio.to_thread(fn, *args, **kwargs)
@@ -7803,6 +7859,14 @@ except Exception as e:
     log(f"[FUT] exchange init fail: {e}")
     FUT_EXCHANGE = None
 
+# [ANCHOR: FUT_PUB_BOOT_BEGIN]  << ADD NEW >>
+try:
+    PUB_FUT_EXCHANGE = _mk_pub_fut_ex()
+except Exception as e:
+    log(f"[FUT_PUB] init fail: {e}")
+    PUB_FUT_EXCHANGE = None
+# [ANCHOR: FUT_PUB_BOOT_END]
+
 
 _DASHBOARD_STATE = {"msg_id": 0, "ch_id": 0}
 _DASH_TASK_RUNNING = False
@@ -8802,7 +8866,7 @@ async def send_timed_reports():
                         continue
 
                     snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
-                    live_price = snap.get("mid") or snap.get("last")
+                    live_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
                     display_price = live_price if isinstance(live_price, (int, float)) else closed_price
                     # [ANCHOR: daily_change_unify_eth_alt]
                     daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
@@ -8857,7 +8921,7 @@ async def send_timed_reports():
 
 
                     snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
-                    display_price = snap.get("mid") or snap.get("last") or closed_price
+                    display_price = snap.get("chosen") or snap.get("mid") or snap.get("last") or closed_price
 
 
                     pdf_path = generate_pdf_report(
@@ -8945,7 +9009,7 @@ async def send_timed_reports():
 
 
                     snap = await get_price_snapshot(symbol_btc)  # BTC/USDT
-                    live_price = snap.get("mid") or snap.get("last")
+                    live_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
                     display_price = live_price if isinstance(live_price, (int, float)) else c_c
                     # [ANCHOR: daily_change_unify_btc]
                     daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
@@ -9609,7 +9673,7 @@ async def on_ready():
                 
 
                 snap = await get_price_snapshot(symbol_btc)
-                live_price = snap.get("mid") or snap.get("last")
+                live_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
                 display_price = live_price if isinstance(live_price, (int, float)) else c_c
                 # [ANCHOR: daily_change_unify_btc]
 
@@ -10240,8 +10304,8 @@ async def on_message(message):
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
         snap = await get_price_snapshot(symbol)
-        live_price_val = snap.get("mid") or snap.get("last")
-        display_price = live_price_val if isinstance(live_price_val, (int, float)) else price
+        live_price_val = snap.get("chosen") or snap.get("mid") or snap.get("last")
+        display_price  = live_price_val if isinstance(live_price_val, (int, float)) else price
 
         main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
             tf=tf,
@@ -10294,7 +10358,7 @@ async def on_message(message):
         # 리포트에서도 전 TF와 동일한 '현재가 스냅샷'을 사용
         try:
             snap = await get_price_snapshot(symbol)
-            report_price = snap.get("mid") or snap.get("last")
+            report_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
         except Exception:
             report_price = None
         try_live = None
