@@ -4743,6 +4743,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"[FILL_MODEL] missing ref price for entry {symbol} {tf}")
         return
 
+
     _ex_guard = _ex_guard if '_ex_guard' in locals() else (FUT_EXCHANGE or PUB_FUT_EXCHANGE)
     if ENFORCE_MARKET_RULES and _ex_guard:
         # futures-aware rounding + min_notional gate
@@ -5513,6 +5514,13 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
             "upnl_pct_on_margin": roe_pct,
             "notional": notional,
         }
+
+        # 표시용 마진모드 (요청값 기준; 실선물은 fetch로 동기화되므로 거의 일치)
+        try:
+            _mm, _ = _req_margin_mode(symbol, tf)
+            r["margin_mode"] = _mm
+        except Exception:
+            r["margin_mode"] = os.getenv("FUT_MARGIN","ISOLATED")
 
         if pos.get("eff_margin") is not None:
             try:
@@ -6310,13 +6318,15 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         key = _pp_key(symbol, tf, use_side)
         pos = PAPER_POS.get(key)
         if not pos: return None
-        side = (pos.get("side") or use_side or "").upper()
+
+        eff_side = (pos.get("side") or use_side or "").upper()
+
         entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
         qty   = float(pos.get("qty") or pos.get("quantity") or 0.0)
         pnl_pct = None
         try:
             if entry > 0 and exit_price > 0:
-                gross = ((exit_price - entry) / entry) * 100.0 if side == "LONG" else ((entry - exit_price) / entry) * 100.0
+                gross = ((exit_price - entry) / entry) * 100.0 if eff_side == "LONG" else ((entry - exit_price) / entry) * 100.0
                 pnl_pct = gross
         except Exception:
             pnl_pct = None
@@ -6324,7 +6334,9 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         PAPER_POS.pop(key, None)
         # Free TF occupancy only if no side remains for this (symbol, tf)
         try:
-            other = "SHORT" if side=="LONG" else "LONG"
+
+            other = "SHORT" if eff_side=="LONG" else "LONG"
+
             still_open = PAPER_POS.get(_pp_key(symbol, tf, other))
             if not still_open and PAPER_POS_TF.get(tf) == symbol:
                 PAPER_POS_TF.pop(tf, None)
@@ -6339,7 +6351,8 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
 
 
-        side_up = 1 if str(side).upper() == "LONG" else -1
+        side_up = 1 if str(eff_side).upper() == "LONG" else -1
+
         gross_usdt = (float(exit_price) - float(entry)) * float(qty) * side_up
 
         # --- funding estimation (optional) ---
@@ -6399,7 +6412,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
                     f"pnl_pct_on_margin={(pnl_on_margin if pnl_on_margin is not None else 0):.4f}",
                     f"reason={exit_reason}"
                 ])
-                _log_trade_csv(symbol, tf, "CLOSE", side, float((pos or {}).get('qty',0.0)), float(exit_price), extra=extra)
+                _log_trade_csv(symbol, tf, "CLOSE", eff_side, float((pos or {}).get('qty',0.0)), float(exit_price), extra=extra)
 
         except Exception as e:
             log(f"[CSV_CLOSE_WARN] paper {symbol} {tf}: {e}")
@@ -6408,7 +6421,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         try:
             await capital_ledger_write(
                 "CLOSE",
-                symbol=symbol, tf=tf, side=side, reason=(exit_reason or ""),
+                symbol=symbol, tf=tf, side=eff_side, reason=(exit_reason or ""),
                 entry_price=f"{entry:.8f}", exit_price=f"{exit_price:.8f}",
                 qty=f"{qty:.8f}",
                 gross_usdt=f"{gross_usdt:.8f}", fees_usdt=f"{fees_usdt:.8f}", net_usdt=f"{net_usdt:.8f}",
@@ -6420,7 +6433,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         realized_pnl_usdt = net_usdt
         # [ANCHOR: REENTRY_ON_CLOSE]  << ADD NEAR CLOSE LEDGER/SAVE >>
         try:
-            key = (symbol, tf, side)
+            key = (symbol, tf, eff_side)
             node = _REENTRY_MEM.get(str(key), {})
             node["last_exit_px"] = float(exit_price)
             node["last_entry_score"] = float(entry_score) if "entry_score" in locals() else float(node.get("last_entry_score") or 0.0)
@@ -6441,7 +6454,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         try: idem_clear_symbol_tf(symbol, tf)
         except Exception: pass
 
-        return {"side": side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty, "net_usdt": net_usdt}
+        return {"side": eff_side, "entry_price": entry, "pnl_pct": pnl_pct, "qty": qty, "net_usdt": net_usdt}
 
     if _POS_LOCK:
         async with _POS_LOCK:
@@ -8386,15 +8399,16 @@ async def _dash_render_text():
 
 
     lines = []
-    ko = (os.getenv("DASH_LOCALE", "ko") == "ko")
+    ko = os.getenv("DASH_LOCALE", "ko").lower().startswith("ko")
     show_fees = (os.getenv("DASH_SHOW_FEES", "1") == "1")
     eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE", "live") or "live").lower()
 
     # 헤더
     if ko:
-        lines.append(f"Equity(총자본): ${eq_now:,.2f}" + (" (실시간)" if eq_mode == "live" else " (실현기준)"))
+        lines.append(f"자산: **${eq_now:,.2f}**" + (" **(live)**" if eq_mode == "live" else " **(realized)**"))
         lines.append(
-            f"당일손익: {float(st.get('realized_usdt',0.0)):+.2f} USDT ({float(st.get('realized_pct',0.0)):+.2f}%) | 청산수={int(st.get('closes',0))}"
+            f"일일 손익: {float(st.get('realized_usdt',0.0)):+.2f} USDT "
+            f"({float(st.get('realized_pct',0.0)):+.2f}%) | 청산건수={int(st.get('closes',0))}"
         )
     else:
         lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode == "live" else " (realized)"))
@@ -8404,7 +8418,8 @@ async def _dash_render_text():
 
     # [ANCHOR: DASH_RENDER_BEGIN]
 
-    if os.getenv("DASH_LOCALE", "ko") == "ko":
+    ko = os.getenv("DASH_LOCALE","ko").lower().startswith("ko")
+    if ko:
         lev_mode = (os.getenv("DASH_LEV_HEADER_MODE", "applied") or "applied").lower()
         if lev_mode == "applied" and rows:
             _bkt = {}
@@ -8436,18 +8451,18 @@ async def _dash_render_text():
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
         up_sum = float(totals.get("upnl_usdt_sum", 0.0))
         up_net = float(totals.get("upnl_usdt_sum_net", up_sum))
-        pct_on_eq = (up_net / max(1.0, eq_now)) * 100.0
+        pct_on_eq = float(totals.get("upnl_pct_on_equity", 0.0))
         if ko:
-            lines.append(f"미실현손익(UPNL): {up_net:+.2f} USDT ({pct_on_eq:+.2f}% / 자본대비)")
+            lines.append(f"미실현 손익: **{up_net:+.2f} USDT** (**{pct_on_eq:+.2f}%** of equity)")
+            if os.getenv("DASH_SHOW_FEES","1") == "1":
+                fe = float(totals.get("fees_entry_sum",0.0))
+                fx = float(totals.get("fees_exit_est_sum",0.0))
+                lines.append(f"수수료(누적/예상청산): -{fe:.2f} / -{fx:.2f} USDT")
         else:
             lines.append(f"Open UPNL: {up_net:+.2f} USDT ({pct_on_eq:+.2f}% of equity)")
-
-        if show_fees:
-            fe = float(totals.get("fees_entry_sum", 0.0))
-            fx = float(totals.get("fees_exit_est_sum", 0.0))
-            if ko:
-                lines.append(f"수수료(누적/예상청산): -{fe:.2f} / -{fx:.2f} USDT")
-            else:
+            if show_fees:
+                fe = float(totals.get("fees_entry_sum", 0.0))
+                fx = float(totals.get("fees_exit_est_sum", 0.0))
                 lines.append(f"Fees (paid/est. close): -{fe:.2f} / -{fx:.2f} USDT")
 
     # 섹션 제목
@@ -8467,12 +8482,15 @@ async def _dash_render_text():
         tp_pct = r.get("eff_tp_pct", r.get("tp_pct")); sl_pct = r.get("eff_sl_pct", r.get("sl_pct"))
 
         if ko:
-            head = f"• {r['symbol']} · {r['tf']} · {r['side']} ×{r['lev']:g}"
+            head = f"• **{r['symbol']} · {r['tf']} · {r['side']} ×{r['lev']:g} ({r.get('margin_mode','ISOLATED')})**"
             line_price = f"  • 가격/수량: ${float(r['entry']):,.2f} → ${float(r['last']):,.2f} / {r['qty']:.4f}"
             if show_notional:
                 line_price += f"  (노치오날 ${notional:,.2f})"
-            line_cap   = f"  • 실자본 사용: ${margin_used:,.2f}"
-            line_pnl   = f"  • 손익: {r['upnl_pct_on_margin']:+.2f}% / {upnl_net:+,.2f} USDT   ·   MAE {mae:+.2f}% · MFE {mfe:+.2f}%"
+            line_cap   = f"  • 실자본 사용: **${margin_used:,.2f}**"
+            line_pnl   = (
+                f"  • 손익: **{r['upnl_pct_on_margin']:+.2f}% / {upnl_net:+,.2f} USDT**"
+                f"   ·   MAE {mae:+.2f}% · MFE {mfe:+.2f}%"
+            )
             line_fee   = (f"  • 수수료: 진입 -${fe:.2f} / 청산(추정) -${fx:.2f}") if show_fees else ""
             line_risk  = ""
             if (tp_price is not None) and (sl_price is not None) and (tp_pct is not None) and (sl_pct is not None):
@@ -10638,7 +10656,7 @@ async def on_message(message):
             await message.channel.send(f"⚠️ cap reset 실패: {e}")
         return
 
-    if content.startswith('!panic'):
+    if content.startswith(('!panic','!패닉')):
         _panic_on()
         if PANIC_CANCEL_OPEN:
             await cancel_all_open_orders()
@@ -10647,12 +10665,12 @@ async def on_message(message):
         await message.channel.send("⛔ panic ON (entries blocked)")
         return
 
-    if content.startswith('!unpanic'):
+    if content.startswith(('!unpanic','!패닉해제','!패닉off','!패닉해제해')):
         _panic_off()
         await message.channel.send("✅ panic OFF")
         return
 
-    if content.startswith('!limits'):
+    if content.startswith(('!limits','!제한')):
         st = _daily_state_load()
         await message.channel.send(
             f"limits — realized: {st.get('realized_usdt',0):.2f} USDT ({st.get('realized_pct',0):.2f}%), "
@@ -10660,7 +10678,7 @@ async def on_message(message):
         )
         return
 
-    if content.startswith('!limit set'):
+    if content.startswith(('!limit set','!제한 설정')):
         try:
             _,_,k,v = content.split()
             if k=='loss_usdt':
@@ -10675,7 +10693,7 @@ async def on_message(message):
         return
 
     # [ANCHOR: CONFIG_DUMP_HANDLER]
-    if content.startswith("!config"):
+    if content.startswith(("!config","!설정")):
         try:
             dump = _build_config_dump_text()
             await _send_long_text_or_file(message.channel, dump, CONFIG_FILENAME)
@@ -10684,7 +10702,7 @@ async def on_message(message):
         return
 
     # [ANCHOR: CMD_CLOSE_CLOSEALL]
-    if content.startswith("!closeall"):
+    if content.startswith(("!closeall","!모두청산","!전부청산","!포지션정리")):
         try:
             n = 0
             # PAPER_POS key is now "SYMBOL|TF|SIDE"
@@ -10704,12 +10722,12 @@ async def on_message(message):
             if CLEAR_IDEMP_ON_CLOSEALL:
                 try: idem_clear_all()
                 except Exception: pass
-            await message.channel.send(f"🟢 closed all ({n})")
+            await message.channel.send(f"🟢 전체 청산 완료 · {n}건")
         except Exception as e:
             await message.channel.send(f"⚠️ closeall error: {e}")
         return
 
-    if content.startswith("!close "):
+    if content.startswith(("!close ","!청산 ")):
         try:
             parts = content.split()
             # allow: !close SYMBOL TF [SIDE]
@@ -10726,13 +10744,15 @@ async def on_message(message):
                 await _paper_close(symU, tfx, get_last_price(symU, 0.0), "MANUAL", side=side)
             else:
                 await futures_close_symbol_tf(sym.upper(), tfx)
-            await message.channel.send(f"🟢 closed {sym.upper()} {tfx}" + (f" {side}" if side else ""))
+
+            await message.channel.send(f"🟢 청산 완료: {sym.upper()} {tfx}" + (f" {side}" if side else ""))
+
         except Exception as e:
             await message.channel.send(f"⚠️ close error: {e}")
         return
 
     # [ANCHOR: CMD_RISK_SET]
-    if content.startswith("!risk "):
+    if content.startswith(("!risk ","!리스크 ")):
         try:
             _, sym, tfx, *rest = content.split()
             sym = sym.upper()
@@ -10794,12 +10814,14 @@ async def on_message(message):
             await message.channel.send(f"⚠️ risk error: {e}")
         return
 
-    if content.startswith("!help"):
+    if content.startswith(("!help","!도움말","!명령어")):
         lines = [
-            "• !set KEY=VALUE / !get KEY / !saveenv",
-            "• !pause [SYMBOL|ALL] [TF|ALL] [mins?] / !resume [SYMBOL|ALL] [TF|ALL]",
-            "• !close SYMBOL TF / !closeall",
-            "• !risk SYMBOL TF tp=5 sl=2.5 tr=1.8",
+            "• 설정: !set KEY=VALUE / !get KEY / !saveenv / !config(!설정)",
+            "• 일시정지/재개: !pause / !resume",
+            "• 청산: !close(!청산) SYMBOL TF [SIDE?] / !closeall(!모두청산|!전부청산)",
+            "• 리스크설정: !risk(!리스크) SYMBOL TF tp=5 sl=2.5 tr=1.8 [side=LONG|SHORT]",
+            "• 제한/패닉: !limits(!제한) / !limit set(!제한 설정) / !panic(!패닉) / !unpanic(!패닉해제)",
+            "• 리포트/상태: !report(!리포트) / !health / !상태 / !분석",
         ]
         await message.channel.send("\n".join(lines))
         return
