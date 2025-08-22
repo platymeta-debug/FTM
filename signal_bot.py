@@ -6164,12 +6164,45 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
 
         # === 실현손익(USDT) 및 수수료 추정 ===
         qty = float(pos.get("qty") or 0.0)
-        side_up = 1 if str(side).upper()=="LONG" else -1
-        gross_usdt = (float(exit_price) - float(entry)) * qty * side_up
+        # [ANCHOR: PAPER_FEES_FUNDING_BEGIN]
+        ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
 
-        fee_bps = _fee_bps(order_type="MARKET", ex=None, symbol=symbol)
-        fees_usdt = _fee_usdt(entry, qty, fee_bps) + _fee_usdt(exit_price, qty, fee_bps)
-        net_usdt = gross_usdt - fees_usdt
+        side_up = 1 if str(side).upper() == "LONG" else -1
+        gross_usdt = (float(exit_price) - float(entry)) * float(qty) * side_up
+
+        # --- funding estimation (optional) ---
+        opened_ms = None
+        try:
+            opened_ms = int(pos.get("ts_ms") or pos.get("opened_ts") or 0)
+        except Exception:
+            opened_ms = None
+        closed_ms = int(time.time() * 1000)
+
+        funding_fee = 0.0
+        if ESTIMATE_FUNDING_IN_PNL:
+            try:
+                avg_px = ((float(entry) + float(exit_price)) / 2.0) if (entry and exit_price) else 0.0
+                notional = float(avg_px) * float(qty)
+                funding_fee = await _estimate_funding_fee(ex, symbol, notional, opened_ms, closed_ms)
+            except Exception:
+                funding_fee = 0.0
+
+        # --- fees (dynamic when USE_DYNAMIC_FEE=1) ---
+        if INCLUDE_FEES_IN_PNL:
+            entry_bps = _fee_bps("MARKET", ex=ex, symbol=symbol)
+            exit_bps  = _fee_bps("MARKET", ex=ex, symbol=symbol)
+            fee_entry = _fee_usdt(entry, float(qty), entry_bps)
+            fee_exit  = _fee_usdt(exit_price, float(qty), exit_bps)
+        else:
+            fee_entry = 0.0
+            fee_exit  = 0.0
+
+        fees_usdt = float(fee_entry + fee_exit)
+        if ESTIMATE_FUNDING_IN_PNL:
+            fees_usdt += float(funding_fee)
+
+        net_usdt = float(gross_usdt) - float(fees_usdt)
+        # [ANCHOR: PAPER_FEES_FUNDING_END]
 
 
         before_cap = capital_get()
