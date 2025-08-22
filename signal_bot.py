@@ -216,6 +216,7 @@ EXIT_RESOLUTION = cfg_get("EXIT_RESOLUTION", "1m").lower()  # must be "1m"
 EXIT_EVAL_MODE  = cfg_get("EXIT_EVAL_MODE", "TOUCH").upper()  # TOUCH | CLOSE (on 1m)
 # Which price feed to read before clamping. 'mark' is not allowed to trigger directly (we clamp anyway).
 EXIT_PRICE_SOURCE = cfg_get("EXIT_PRICE_SOURCE", "last").lower()  # last | index | mark(→forced last)
+TRIGGER_PRICE_SOURCE = cfg_get("STOP_TRIGGER_PRICE", os.getenv("EXIT_PRICE_SOURCE", "mark")).lower()
 # 1m outlier spike guard (fraction, e.g., 0.03=3% vs 1m open/close); 0 disables
 
 OUTLIER_MAX_1M = float(cfg_get("OUTLIER_MAX_1M", "0.03"))
@@ -5159,13 +5160,20 @@ async def safe_price_hint(symbol:str):
             return _sanitize_exit_price(symbol, last)
         return _sanitize_exit_price(symbol, 0.0)
 
-    # 후보 가격 선택
-    cand = None
-    for k in PRICE_FALLBACK_ORDER:
-        v = snap.get(k)
+    # 트리거 소스 우선(존재하면 cand 고정)
+    pref = (TRIGGER_PRICE_SOURCE or "").strip().lower()
+    if pref and (pref in snap) and (snap.get(pref) is not None):
+        cand = float(snap.get(pref))
+    else:
+        cand = None
 
-        if v is not None:
-            cand = float(v); break
+    # 후보 가격 선택
+    if cand is None:
+        for k in PRICE_FALLBACK_ORDER:
+            v = snap.get(k)
+
+            if v is not None:
+                cand = float(v); break
 
     # mark 직접사용 제한 → last 있으면 last로 클램프
 
@@ -6904,8 +6912,8 @@ EXCHANGE_ID  = os.getenv("EXCHANGE_ID", "binanceusdm")
 SANDBOX      = os.getenv("SANDBOX", "1") == "1"
 
 FUT_MGN_USDT = float(os.getenv("FUT_MGN_USDT", "10"))    # 1회 진입 증거금(USDT)
-FUT_LEVERAGE = int(os.getenv("LEVERAGE", "3"))
-FUT_MARGIN   = os.getenv("MARGIN_TYPE", "ISOLATED").upper()  # ISOLATED|CROSS
+FUT_LEVERAGE = int(os.getenv("FUT_LEVERAGE", os.getenv("LEVERAGE", "3")))
+FUT_MARGIN   = os.getenv("FUT_MARGIN", os.getenv("MARGIN_TYPE", "ISOLATED")).upper()  # ISOLATED|CROSS
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.25"))  # 허용 슬리피지(%)
 
 # TF별 TP/SL 퍼센트는 기존 설정을 그대로 사용:
@@ -7533,14 +7541,6 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
         notional  = None
         if eff_margin and base_margin:
             use_frac = float(eff_margin) / float(base_margin)
-
-        if eff_margin and lev_used:
-            try:
-                notional = float(eff_margin) * int(lev_used)
-            except Exception:
-                pass
-
-        notional = None
         if eff_margin and lev_used:
             try:
                 notional = float(eff_margin) * int(lev_used)
@@ -8600,8 +8600,8 @@ HEDGE_MODE   = os.getenv("HEDGE_MODE", "1") == "1"
 
 import re
 
-TF_LEVERAGE = _parse_tf_map(os.getenv("LEVERAGE_BY_TF", ""), int)   # 예: {'15m':7,'1h':5,...}
-TF_MARGIN   = _parse_tf_map(os.getenv("MARGIN_BY_TF", ""), lambda x: x.upper())                  # 예: {'15m':'ISOLATED','4h':'CROSS',...}
+TF_LEVERAGE = _parse_tf_map(os.getenv("TF_LEVERAGE", os.getenv("LEVERAGE_BY_TF", "")), int)   # 예: {'15m':7,'1h':5,...}
+TF_MARGIN   = _parse_tf_map(os.getenv("TF_MARGIN", os.getenv("MARGIN_BY_TF", "")), lambda x: x.upper())                  # 예: {'15m':'ISOLATED','4h':'CROSS',...}
 
 # === Per-symbol per-TF margin-mode overrides ===
 import re as _re
@@ -9173,7 +9173,7 @@ def _fut_min_notional_ok(ex, symbol, price, qty):
     except Exception:
         min_cost = 0.0
     try:
-        env_min = float(os.getenv("FUT_MIN_NOTIONAL", "5"))
+        env_min = float(os.getenv("FUT_MIN_NOTIONAL", os.getenv("MIN_NOTIONAL", "5")))
     except Exception:
         env_min = 5.0
     need = max(min_cost, env_min)
