@@ -4717,7 +4717,6 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if exec_price is None:
         log(f"[FILL_MODEL] missing ref price for entry {symbol} {tf}")
         return
-
     _ex_guard = _ex_guard if '_ex_guard' in locals() else (FUT_EXCHANGE or PUB_FUT_EXCHANGE)
     if ENFORCE_MARKET_RULES and _ex_guard:
         # futures-aware rounding + min_notional gate
@@ -4726,6 +4725,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             logging.warning(f"[PAPER_RULES] below min_notional: {symbol} {tf} qty={qty}")
             return
         exec_price = _price_to_precision(_ex_guard, symbol, float(exec_price))
+
 
     if DEBUG or os.getenv("FILL_MODEL_DEBUG","0") == "1":
         try:
@@ -4953,7 +4953,9 @@ import json, csv, os, datetime as _dt
 
 CAPITAL_PERSIST       = int(os.getenv("CAPITAL_PERSIST","1") or 1)
 CAPITAL_STATE_PATH    = os.getenv("CAPITAL_STATE_PATH","./data/capital_state.json")
-CAPITAL_LEDGER_CSV    = os.getenv("CAPITAL_LEDGER_CSV","./data/capital_ledger.csv")
+# BACKWARD-COMPAT: allow legacy CAPITAL_CSV_PATH as alias
+_CAPITAL_CSV_PATH_ALIAS = (os.getenv("CAPITAL_CSV_PATH","") or "").strip()
+CAPITAL_LEDGER_CSV    = (os.getenv("CAPITAL_LEDGER_CSV") or _CAPITAL_CSV_PATH_ALIAS or "./data/capital_ledger.csv")
 CAPITAL_LEDGER_ENABLE = int(os.getenv("CAPITAL_LEDGER_ENABLE","1") or 1)
 CAPITAL_LEDGER_APPEND_HEADERS = int(os.getenv("CAPITAL_LEDGER_APPEND_HEADERS","1") or 1)
 
@@ -7686,6 +7688,39 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
                 _log_trade_csv(symbol, tf, "CLOSE", side, abs(qty), float(exit_price or entry), extra=extra)
         except Exception as e:
             log(f"[CSV_CLOSE_WARN] futures {symbol} {tf}: {e}")
+
+        # Ledger: futures CLOSE (paper와 동일 스키마)
+        try:
+            ent = float(entry or 0.0)
+            exi = float(exit_price or ent)
+            qty_abs = float(abs(qty))
+            # gross_usdt: 방향성 반영 (LONG: exi-ent, SHORT: ent-exi) × 수량
+            gross_usdt = (exi - ent) * qty_abs if side.upper() == "LONG" else (ent - exi) * qty_abs
+
+            # fees_usdt: maker/taker 동적 소스 포함(이미 _fee_bps/INCLUDE_FEES_IN_PNL 경로 존재 가정)
+            if INCLUDE_FEES_IN_PNL:
+                try:
+                    entry_bps = _fee_bps("MARKET", ex=ex, symbol=symbol)
+                    exit_bps  = _fee_bps("MARKET",  ex=ex, symbol=symbol)
+                    fees_usdt = qty_abs * ent * (entry_bps/10000.0) + qty_abs * exi * (exit_bps/10000.0)
+                except Exception:
+                    fees_usdt = max(0.0, float(locals().get("fee_est_usdt", 0.0)))  # 기존 추정치가 있으면 사용
+            else:
+                fees_usdt = 0.0
+
+            net_usdt  = gross_usdt - fees_usdt
+            after_cap = capital_get() + float(net_usdt)  # futures 모드에선 상태 반영은 안 하고 원장에만 'after' 필드로 기록
+
+            await capital_ledger_write(
+                "CLOSE",
+                symbol=symbol, tf=tf, side=str(side or "").upper(), reason=str(reason or "CLOSE"),
+                entry_price=f"{ent:.8f}", exit_price=f"{exi:.8f}",
+                qty=f"{qty_abs:.8f}", gross_usdt=f"{gross_usdt:.8f}",
+                fees_usdt=f"{fees_usdt:.8f}", net_usdt=f"{net_usdt:.8f}",
+                capital_after=f"{after_cap:.8f}",
+            )
+        except Exception as le:
+            log(f"[CAPITAL] futures ledger warn {symbol} {tf}: {le}")
 
         # --- B-2: 선물 청산 알림(공통 헬퍼 호출) ---
         try:
