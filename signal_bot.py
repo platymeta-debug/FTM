@@ -219,6 +219,30 @@ def _sanitize_exit_price(symbol: str, last_hint: float|None = None):
     clamped = max(min(float(last_raw), hi), lo)
     return clamped, bar
 
+def _sanitize_exit_price_with_bar(symbol: str, price: float, bar_1m):
+    """
+    Same clamp/outlier logic as _sanitize_exit_price(), but DOES NOT fetch OHLCV.
+    'bar_1m' should be a single 1m candle tuple/list or None.
+    """
+    if bar_1m is None:
+        return _sanitize_exit_price(symbol, price)
+    try:
+        if isinstance(bar_1m, dict):
+            bar = {k: float(bar_1m[k]) for k in ("open", "high", "low", "close")}
+        else:
+            bar = {
+                "open": float(bar_1m[1]),
+                "high": float(bar_1m[2]),
+                "low": float(bar_1m[3]),
+                "close": float(bar_1m[4]),
+            }
+    except Exception:
+        return _sanitize_exit_price(symbol, price)
+    last_raw = _raw_exit_price(symbol, price)
+    hi, lo = float(bar["high"]), float(bar["low"])
+    clamped = max(min(float(last_raw), hi), lo)
+    return clamped, bar
+
 def _outlier_guard(clamped: float, bar: dict) -> bool:
     """
     True → skip this minute as outlier (|Δ| > OUTLIER_MAX_1M vs 1m open/close).
@@ -2084,6 +2108,82 @@ def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
+
+# --- async bridges for blocking ccxt calls ---
+# ENV: AIO_CCXT_POOL=1 enables offloading to thread pool
+import functools
+
+async def _to_thread(func, *args, **kwargs):
+    if os.getenv("AIO_CCXT_POOL", "1") != "1":
+        # fallback (sync) – not recommended
+        return func(*args, **kwargs)
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(func, *args, **kwargs)
+    return await loop.run_in_executor(None, bound)
+
+async def aio_get_ohlcv(symbol: str, timeframe: str, limit: int = 1):
+    # wrap existing sync get_ohlcv() with executor
+    return await _to_thread(get_ohlcv, symbol, timeframe, limit)
+
+async def _fetch_recent_bar_1m_async(symbol: str):
+    """Return last 1m bar (ts, open, high, low, close, vol) without blocking event loop."""
+    try:
+        ohlc = await aio_get_ohlcv(symbol, "1m", limit=1)
+        if hasattr(ohlc, "iloc"):
+            row = ohlc.iloc[-1].tolist()
+            return row
+        return ohlc[-1] if ohlc else None
+    except Exception:
+        return None
+
+
+# ===== Fees helpers (env or exchange) =====
+def _fee_rates_for(symbol: str):
+    """
+    Return (maker, taker) as floats (e.g., 0.0002, 0.0004).
+    Prefers exchange metadata if FEE_SOURCE=exchange and available.
+    """
+    if os.getenv("FEE_SOURCE", "env") == "exchange":
+        try:
+            ex = globals().get("exchange") or globals().get("GLOBAL_EXCHANGE")
+            if ex:
+                m = ex.market(symbol)
+                mk = float(m.get("maker") or os.getenv("FEE_MAKER_RATE", "0.0002"))
+                tk = float(m.get("taker") or os.getenv("FEE_TAKER_RATE", "0.0004"))
+                return mk, tk
+        except Exception:
+            pass
+    return (
+        float(os.getenv("FEE_MAKER_RATE", "0.0002")),
+        float(os.getenv("FEE_TAKER_RATE", "0.0004")),
+    )
+
+
+def _role_rate(role: str, maker: float, taker: float) -> float:
+    return maker if str(role).lower() == "maker" else taker
+
+
+def _estimate_fees_usdt(symbol: str, qty: float, entry: float, last: float):
+    """
+    Returns dict:
+      {
+        'entry_fee': <USDT>,      # 체결 시점 수수료(가정)
+        'exit_fee_est': <USDT>,   # 현재가 기준 청산 수수료(추정)
+        'notional_entry': <USDT>,
+        'notional_exit': <USDT>,
+      }
+    """
+    mk, tk = _fee_rates_for(symbol)
+    rr_in = _role_rate(os.getenv("FEE_ENTRY_ROLE", "taker"), mk, tk)
+    rr_out = _role_rate(os.getenv("FEE_EXIT_ROLE", "taker"), mk, tk)
+    notional_in = abs(qty) * float(entry)
+    notional_out = abs(qty) * float(last or entry)
+    return {
+        "entry_fee": notional_in * rr_in,
+        "exit_fee_est": notional_out * rr_out,
+        "notional_entry": notional_in,
+        "notional_exit": notional_out,
+    }
 
 
 # === [UTIL] calc_daily_change_pct — 퍼포먼스 스냅샷과 동일식 ===
@@ -4885,15 +4985,16 @@ async def safe_price_hint(symbol:str):
 
             cand = float(last)
 
-    clamped, bar = _sanitize_exit_price(symbol, float(cand or 0.0))
+    bar_async = await _fetch_recent_bar_1m_async(symbol)
+    clamped, bar = _sanitize_exit_price_with_bar(symbol, float(cand or 0.0), bar_async)
 
     # 이상치면 1회 재조회(✅ None 가드)
     if _outlier_guard(clamped, bar):
 
         snap2 = (await _fetch_with_retry(get_price_snapshot, symbol)) or {}
         cand2 = float(snap2.get("last") or snap2.get("mid") or cand or 0.0)
-
-        clamped, bar = _sanitize_exit_price(symbol, cand2)
+        bar_async = await _fetch_recent_bar_1m_async(symbol)
+        clamped, bar = _sanitize_exit_price_with_bar(symbol, cand2, bar_async)
 
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
@@ -4945,12 +5046,32 @@ RISK_WARN_NEAR_SL_PCT = float(os.getenv("RISK_WARN_NEAR_SL_PCT","0.5") or 0.5)
 RISK_BAR_WIDTH = int(os.getenv("RISK_BAR_WIDTH","12") or 12)
 POS_STATS_STATE_PATH = os.getenv("POS_STATS_STATE_PATH","./data/pos_stats.json")
 
+DASH_STATE_PATH = os.getenv("DASH_STATE_PATH", "./data/dashboard_state.json")
+
 DASHBOARD_FUNDING = int(os.getenv("DASHBOARD_FUNDING","1") or 1)
 FUNDING_COUNTDOWN_ONLY = int(os.getenv("FUNDING_COUNTDOWN_ONLY","1") or 1)
 FUNDING_EXCHANGE_HINT = os.getenv("FUNDING_EXCHANGE_HINT","")
 
 # 포지션별 극값/MAE/MFE 저장소 (세션 지속)
 _POS_STATS = None
+
+def _dash_state_load():
+    try:
+        with open(DASH_STATE_PATH, "r", encoding="utf-8") as f:
+            s = _json.load(f)
+            if isinstance(s, dict) and s.get("msg_id") and s.get("ch_id"):
+                _DASHBOARD_STATE.update(s)
+    except Exception:
+        pass
+
+def _dash_state_save():
+    try:
+        _pathlib.Path(DASH_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
+        with open(DASH_STATE_PATH, "w", encoding="utf-8") as f:
+            _json.dump({"msg_id": _DASHBOARD_STATE.get("msg_id", 0),
+                        "ch_id":  _DASHBOARD_STATE.get("ch_id", 0)}, f)
+    except Exception as e:
+        log(f"[DASH] state save warn: {e}")
 
 def _pos_stats_key(symbol:str, tf:str, side:str, entry:float, qty:float) -> str:
     return f"{symbol}|{tf}|{side}|{entry:.8f}|{qty:.8f}"
@@ -4961,21 +5082,19 @@ def _pos_stats_load():
     파일이 없거나, 손상되었거나, null/비-dict이면 {}로 정규화.
     """
     global _POS_STATS
-    # 이미 메모리에 dict가 있으면 그대로 사용
     if isinstance(_POS_STATS, dict):
         return _POS_STATS
 
     data = None
     try:
         with open(POS_STATS_STATE_PATH, "r", encoding="utf-8") as f:
-            data = _json.load(f)  # ← null이면 None로 들어옴(예외 아님)
+            data = _json.load(f)  # null이면 None
     except Exception:
         data = {}
 
     if not isinstance(data, dict):
         log("[DASH] pos_stats file not dict -> reset to {}")
         data = {}
-        # ⬇ 자동수복(기본 ON, .env로 끊기 가능)
         if os.getenv("POS_STATS_AUTOFIX", "1") == "1":
             try:
                 _pathlib.Path(POS_STATS_STATE_PATH).parent.mkdir(parents=True, exist_ok=True)
@@ -5098,6 +5217,9 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     """
     rows: List[Dict] = []
     upnl_sum = 0.0
+    upnl_sum_net = 0.0
+    fees_exit_est_sum = 0.0
+    fees_entry_sum = 0.0
     # 포지션 소스: 페이퍼/실거래 공용 요약 유틸 사용 (프로젝트 내 존재). 없다면 PAPER_POS를 직접 순회.
     for pos in get_open_positions_iter():
 
@@ -5117,12 +5239,37 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
         roe_pct = _pnl_pct_on_margin(side, entry, last, lev)
         notional = last * qty
 
-        rows.append({
-            "symbol": symbol, "tf": tf, "side": side, "qty": qty, "entry": entry,
-            "last": last, "lev": lev, "upnl_usdt": upnl, "upnl_pct_on_margin": roe_pct,
-            "notional": notional
-        })
+        r = {
+            "symbol": symbol,
+            "tf": tf,
+            "side": side,
+            "qty": qty,
+            "entry": entry,
+            "last": last,
+            "lev": lev,
+            "upnl_usdt": upnl,
+            "upnl_pct_on_margin": roe_pct,
+            "notional": notional,
+        }
+
+        fees = _estimate_fees_usdt(symbol, qty, entry, last)
+        r["fee_entry_usdt"] = fees["entry_fee"]
+        r["fee_exit_est_usdt"] = fees["exit_fee_est"]
+
+        mode = (os.getenv("UPNL_INCLUDE_FEES", "exit_only") or "exit_only").lower()
+        upnl_net = r["upnl_usdt"]
+        if mode in ("both", "all"):
+            upnl_net = upnl_net - fees["exit_fee_est"] - fees["entry_fee"]
+        elif mode in ("exit", "exit_only"):
+            upnl_net = upnl_net - fees["exit_fee_est"]
+        r["upnl_usdt_net"] = upnl_net
+
         upnl_sum += upnl
+        upnl_sum_net += upnl_net
+        fees_exit_est_sum += fees["exit_fee_est"]
+        fees_entry_sum += fees["entry_fee"]
+
+        rows.append(r)
 
 
         # === MAE/MFE 업데이트 ===
@@ -5142,10 +5289,14 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
         # === 펀딩 힌트 ===
         fund = await _funding_hint(symbol)
 
-        rows[-1].update({
-            "mae_pct": mae_pct, "mfe_pct": mfe_pct,
-            "dist_sl_pct": dist_sl_pct, "dist_tp_pct": dist_tp_pct,
-            "riskbar": riskbar, "warn": warn, "fund": fund
+        r.update({
+            "mae_pct": mae_pct,
+            "mfe_pct": mfe_pct,
+            "dist_sl_pct": dist_sl_pct,
+            "dist_tp_pct": dist_tp_pct,
+            "riskbar": riskbar,
+            "warn": warn,
+            "fund": fund,
         })
 
 
@@ -5162,7 +5313,10 @@ async def gather_positions_upnl() -> Tuple[List[Dict], Dict]:
     eq_base = float(capital_get() or 1.0)
     totals = {
         "upnl_usdt_sum": upnl_sum,
-        "upnl_pct_on_equity": (upnl_sum / eq_base * 100.0)
+        "upnl_usdt_sum_net": upnl_sum_net,
+        "fees_exit_est_sum": fees_exit_est_sum,
+        "fees_entry_sum": fees_entry_sum,
+        "upnl_pct_on_equity": (upnl_sum / eq_base * 100.0),
     }
 
     _pos_stats_save()
@@ -6739,6 +6893,34 @@ def _fmt_pct(frac):
 
 # (구) _fmt_aloc_line는 더이상 사용하지 않음 → 알림에서 바로 포맷팅
 
+# [ANCHOR: NOTIFY_ENTRY_BEGIN]
+def _format_entry_message(symbol: str, tf: str, side: str, mode: str, price: float, lev: float,
+                          qty: float, notional: float, tp: float, sl: float, trail_pct: float,
+                          strength_label: str, strength_mult: float, equity_now: float):
+    ko = (os.getenv("DASH_LOCALE", "ko") == "ko")
+    fees = _estimate_fees_usdt(symbol, qty, price, price)
+    if ko:
+        head_emoji = "🟢" if side.upper() == "BUY" or side.upper().startswith("LONG") else "🔴"
+        side_kr = "LONG" if side.upper().startswith("LONG") or "BUY" in side.upper() else "SHORT"
+        return (
+            f"{head_emoji} 진입 | {symbol} · {tf} · {side_kr} ×{lev:g}\n"
+            f"• 가격/수량: ${price:,.2f} / {qty:.4f} (노치오날 ${notional:,.2f})\n"
+            f"• 자본 사용: ${notional:,.2f} / 현재자본 ${equity_now:,.2f}\n"
+            f"• 강도: {strength_label} (×{strength_mult:.2f})\n"
+            f"• 리스크: TP ${tp:,.2f} / SL ${sl:,.2f} / 트레일 {trail_pct:.2f}%\n"
+            f"• 수수료(진입/추정청산): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
+        )
+    else:
+        return (
+            f"🟢 ENTRY | {symbol} · {tf} · {side} ×{lev:g}\n"
+            f"• Price/Qty: ${price:,.2f} / {qty:.4f} (Notional ${notional:,.2f})\n"
+            f"• Equity Use: ${notional:,.2f} / Equity ${equity_now:,.2f}\n"
+            f"• Strength: {strength_label} (×{strength_mult:.2f})\n"
+            f"• Risk: TP ${tp:,.2f} / SL ${sl:,.2f} / Trail {trail_pct:.2f}%\n"
+            f"• Fees (entry/est. close): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
+        )
+
+
 async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
                               mode: str,              # 'futures' or 'spot' or 'paper'
                               price: float, qty: float|None,
@@ -6787,136 +6969,47 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
             except Exception:
                 pass
 
-        # 헤더/요약
-        title = "🟢 **진입 (BUY)**" if signal == "BUY" else "🔴 **진입 (SELL)**"
-        mode_text = '🧪 페이퍼' if mode=='paper' else ('선물' if mode=='futures' else '현물')
-        lines = [
-            f"{title} 〔{symbol} · {tf}〕",
-            f"• 모드/가격: {mode_text} / {_fmt_usd(price)}" + (f" / 레버리지 ×{int(lev_used)}" if lev_used else ""),
-        ]
-
-        # 강도/MTF
-        if strength_label and sf is not None:
-            lines.append(f"• 강도: {strength_label} (계수 ×{sf:.2f})")
-        if mf is not None:
-            lines.append(f"• 상위TF: {align_text} (계수 ×{mf:.2f}" + (" · ALL" if all_align else "") + ")")
-
-        try:
-            if pb_label and ALERT_CTX_LINES:
-                lines.append(f"• 플레이북: { pb_label } (강도 { pb_w:.2f }, 배분×{ pb_alloc_mul:.2f })")
-        except Exception:
-            pass
-
-
-        try:
-            if ALERT_CTX_LINES and '_pb' in locals() and _pb:
-                cap_str = ""
-                if float(_pb.get("alloc_abs_cap", 0) or 0) > 0:
-                    cap_str += f" cap=${_pb.get('alloc_abs_cap')}"
-                if float(_pb.get("lev_cap", 0) or 0) > 0:
-                    cap_str += f" lev≤{_pb.get('lev_cap')}"
-                sc_str = f" scale(step×{_pb.get('scale_step_mul'):.2f}, reduce×{_pb.get('scale_reduce_mul'):.2f}, legs{_pb.get('scale_legs_add'):+d})"
-                lines.append(f"• 플레이북(확장):{cap_str}{sc_str}")
-        except Exception:
-            pass
-
-
-        if ALERT_CTX_LINES:
+        notional = None
+        if eff_margin and lev_used:
             try:
-                st = CTX_STATE.get(symbol)
-                if st:
-                    regime = st.get("regime"); rs = st.get("regime_strength"); r2 = st.get("r2"); adx = st.get("adx")
-                    hhhl = st.get("hhhl"); z = st.get("channel_z"); bias = st.get("ctx_bias")
-                    lines.append(f"• 컨텍스트: {regime} (+{rs:.2f}, R² {r2:.2f}, ADX~{adx:.0f})")
-                    lines.append(f"• 구조: {hhhl}, 채널 z={z:.2f}, 바이어스={bias:.2f}")
-            except Exception as e:
-                lines.append(f"• 컨텍스트: N/A ({e})")
+                notional = float(eff_margin) * int(lev_used)
+            except Exception:
+                notional = None
 
-        # 배분 브레이크다운
-        # ① 총자본 → TF배정
-
-        # total_cap 은 base(미실현 제외), TF배정은 plan_cap*tf_pct 로 계산
+        tp_price = sl_price = None
+        tr_pct_eff = 0.0
         try:
-            base_cap, upnl_contrib, plan_cap = planning_capital_for_allocation()
-        except Exception:
-            base_cap, upnl_contrib, plan_cap = (TOTAL_CAPITAL_USDT, 0.0, TOTAL_CAPITAL_USDT)
-
-        tf_pct = None
-        try:
-            tf_pct = float(ALLOC_TF.get(tf)) if ALLOC_TF else None
-        except Exception:
-            tf_pct = None
-
-        if base_cap and base_margin:
-            if tf_pct is not None:
-                lines.append(f"• 배분(1): 총자본 {_fmt_usd(base_cap)} → TF배정 {_fmt_usd(base_margin)} ({_fmt_pct(tf_pct)})")
-            else:
-                alloc_pct_calc = (float(base_margin)/float(base_cap))*100.0 if base_cap>0 else None
-                lines.append(f"• 배분(1): 총자본 {_fmt_usd(base_cap)} → TF배정 {_fmt_usd(base_margin)} ({_fmt_pct(alloc_pct_calc) if alloc_pct_calc is not None else '-'} )")
-
-        elif base_margin:
-            lines.append(f"• 배분(1): TF배정 {_fmt_usd(base_margin)}")
-
-        # (디버그) UPNL 기여/계획자본
-        if ALLOC_USE_UPNL and ALLOC_DEBUG:
-            sign = "+" if upnl_contrib >= 0 else "-"
-            lines.append(f"• 배분(1a): UPNL 기여({sign}) {_fmt_usd(abs(upnl_contrib))} → 계획자본 {_fmt_usd(plan_cap)}")
-
-        # ② 강도×MTF 적용(최종 사용비율/금액)
-        if eff_margin is not None:
-            # 표시: “강도×MTF = ×sf ×mf → 사용 {_fmt_pct(use_frac)} = {_fmt_usd(eff_margin)}”
-            sf_txt = f"×{sf:.2f}" if sf is not None else "-"
-            mf_txt = f"×{mf:.2f}" if mf is not None else "-"
-            use_txt = _fmt_pct(use_frac) if use_frac is not None else "-"
-            lines.append(f"• 배분(2): 강도×MTF = {sf_txt} {mf_txt} → 사용 {use_txt} = {_fmt_usd(eff_margin)}")
-            # ⚠️ 설명: 최종 사용비율은 기본적으로 min(1.00, sf*mf)로 100%를 넘지 않도록 안전 클램프되어 있습니다.
-            # 메시지에는 1.25 같은 중간 계수가 보일 수 있지만, 실제 사용 비율은 100%를 초과하지 않습니다.
-
-        # 수량/노치오날
-        if qty is not None or notional is not None:
-            qtxt = f"{_fmt_qty(qty)}" if qty is not None else "-"
-            ntx  = _fmt_usd(notional) if notional is not None else "-"
-            lines.append(f"• 수량/노치오날: {qtxt} @ {_fmt_usd(price)} / {ntx}")
-        
-        # [ANCHOR: entry_risk_prices]
-        try:
-            show_price  = os.getenv("ENTRY_SHOW_RISK_PRICE","1") == "1"
-            show_pct    = os.getenv("ENTRY_SHOW_RISK_PERCENT","0") == "1"
-
             tpv = _req_tp_pct(symbol, tf, (take_profit_pct or {}))
             slv = _req_sl_pct(symbol, tf, (HARD_STOP_PCT or {}))
             trv = _req_trail_pct(symbol, tf, (trailing_stop_pct or {}))
-            sv  = _req_slippage_pct(symbol, tf)
-
-            if show_pct:
-                lines.append(f"• Risk: TP {tpv:.2f}% / SL {slv:.2f}% / TR {trv:.2f}% / Slippage {sv:.2f}%")
-
-            if show_price:
-                eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tpv, slv, trv, lev_used)
-                if signal == "BUY":
-                    tp_price = price*(1+(eff_tp_pct or 0)/100) if eff_tp_pct else None
-                    sl_price = price*(1-(eff_sl_pct or 0)/100) if eff_sl_pct else None
-                else:
-                    tp_price = price*(1-(eff_tp_pct or 0)/100) if eff_tp_pct else None
-                    sl_price = price*(1+(eff_sl_pct or 0)/100) if eff_sl_pct else None
-
-                tp_price_fmt = _fmt_usd(tp_price) if tp_price else "-"
-                sl_price_fmt = _fmt_usd(sl_price) if sl_price else "-"
-                tr_pct_eff = eff_tr_pct if eff_tr_pct is not None else 0.0
-                _lev_show = f" ×{float(lev_used or 1.0):.0f}"
-                _tp_pct_price = eff_tp_pct if eff_tp_pct is not None else tpv
-                _sl_pct_price = eff_sl_pct if eff_sl_pct is not None else slv
-                _tp_pct_margin = (float(tpv) if tpv is not None else (_tp_pct_price*(float(lev_used or 1.0))))
-                _sl_pct_margin = (float(slv) if slv is not None else (_sl_pct_price*(float(lev_used or 1.0))))
-                lines.append(
-                    f"• Risk (price): TP: {tp_price_fmt} (+{_tp_pct_price:.2f}% | +{_tp_pct_margin:.2f}% on margin{_lev_show}) / "
-                    f"SL: {sl_price_fmt} (-{_sl_pct_price:.2f}% | -{_sl_pct_margin:.2f}% on margin{_lev_show}) / "
-                    f"TR: {tr_pct_eff:.2f}% (percent trail)"
-                )
+            eff_tp_pct, eff_sl_pct, eff_tr_pct, _src = _eff_risk_pcts(tpv, slv, trv, lev_used)
+            if signal == "BUY":
+                tp_price = price * (1 + (eff_tp_pct or 0) / 100) if eff_tp_pct else None
+                sl_price = price * (1 - (eff_sl_pct or 0) / 100) if eff_sl_pct else None
+            else:
+                tp_price = price * (1 - (eff_tp_pct or 0) / 100) if eff_tp_pct else None
+                sl_price = price * (1 + (eff_sl_pct or 0) / 100) if eff_sl_pct else None
+            tr_pct_eff = eff_tr_pct if eff_tr_pct is not None else 0.0
         except Exception:
             pass
 
-        await ch.send("\n".join(lines))
+        msg = _format_entry_message(
+            symbol,
+            tf,
+            signal,
+            mode,
+            float(price),
+            float(lev_used or 1),
+            float(qty or 0.0),
+            float(notional or 0.0),
+            float(tp_price or 0.0),
+            float(sl_price or 0.0),
+            float(tr_pct_eff or 0.0),
+            strength_label or "",
+            float(sf or 0.0),
+            capital_get(),
+        )
+        await ch.send(msg)
     except Exception as e:
         log(f"[NOTIFY] trade entry warn {symbol} {tf}: {e}")
 
@@ -7588,7 +7681,9 @@ except Exception as e:
     FUT_EXCHANGE = None
 
 
-_DASHBOARD_STATE = {"msg_id": 0}
+_DASHBOARD_STATE = {"msg_id": 0, "ch_id": 0}
+_DASH_TASK_RUNNING = False
+_dash_state_load()
 
 async def _dash_channel(client):
     ch_id = DASHBOARD_CHANNEL_ID or int(os.getenv("PNL_REPORT_CHANNEL_ID","0") or 0)
@@ -7598,15 +7693,24 @@ async def _dash_channel(client):
 
 async def _dash_get_or_create_message(client):
     ch = await _dash_channel(client)
-    if not ch: return None
-    if _DASHBOARD_STATE["msg_id"]:
-        try:
-            return await ch.fetch_message(_DASHBOARD_STATE["msg_id"])
-        except Exception:
-            _DASHBOARD_STATE["msg_id"] = 0
+    if not ch:
+        return None
+
+    try:
+        mid = int(_DASHBOARD_STATE.get("msg_id") or 0)
+        if mid and _DASHBOARD_STATE.get("ch_id") == ch.id:
+            return ch.get_partial_message(mid)  # no history fetch required
+    except Exception:
+        _DASHBOARD_STATE["msg_id"] = 0
+        _dash_state_save()
+
+    # create once
     m = await ch.send("📊 initializing dashboard…")
     _DASHBOARD_STATE["msg_id"] = m.id
-    return m
+    _DASHBOARD_STATE["ch_id"] = ch.id
+    _dash_state_save()
+    log(f"[DASH] created dashboard msg id={m.id} ch={ch.id}")
+    return ch.get_partial_message(m.id)
 
 def get_open_positions_iter():
     """Yield unified open position dicts from paper/futures stores."""
@@ -7667,43 +7771,77 @@ async def _dash_render_text():
             raise TypeError(f"DASH rows bad entries: {bad[:5]}")
 
 
-    eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE","live") or "live").lower()
+    eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE", "live") or "live").lower()
     if eq_mode == "live":
-        eq_now = float(cap_realized) + float((totals or {}).get("upnl_usdt_sum", 0.0))
+        eq_now = float(cap_realized) + float(
+            (totals or {}).get(
+                "upnl_usdt_sum_net", (totals or {}).get("upnl_usdt_sum", 0.0)
+            )
+        )
     else:
         eq_now = float(cap_realized)
 
 
     lines = []
-    lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode=="live" else " (realized)"))
-    lines.append(f"Day PnL: {st.get('realized_usdt',0):+.2f} USDT ({st.get('realized_pct',0):+.2f}%) | closes={st.get('closes',0)}")
+    ko = (os.getenv("DASH_LOCALE", "ko") == "ko")
+    show_fees = (os.getenv("DASH_SHOW_FEES", "1") == "1")
+    eq_mode = (os.getenv("DASHBOARD_EQUITY_MODE", "live") or "live").lower()
 
-    if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL","1")=="1":
+    # 헤더
+    if ko:
+        lines.append(f"Equity(총자본): ${eq_now:,.2f}" + (" (실시간)" if eq_mode == "live" else " (실현기준)"))
         lines.append(
-            f"Open UPNL: {float((totals or {}).get('upnl_usdt_sum',0.0)):+.2f} USDT "
-            f"({float((totals or {}).get('upnl_pct_on_equity',0.0)):+.2f}% of equity)"
+            f"당일손익: {float(st.get('realized_usdt',0.0)):+.2f} USDT ({float(st.get('realized_pct',0.0)):+.2f}%) | 청산수={int(st.get('closes',0))}"
         )
-        lines.append(f"Open UPNL Detail: {len(rows)} pos | sort={os.getenv('DASHBOARD_SORT')}")
+    else:
+        lines.append(f"Equity: ${eq_now:,.2f}" + (" (live)" if eq_mode == "live" else " (realized)"))
+        lines.append(
+            f"Day PnL: {float(st.get('realized_usdt',0.0)):+.2f} USDT ({float(st.get('realized_pct',0.0)):+.2f}%) | closes={int(st.get('closes',0))}"
+        )
 
-    lines.append("— open positions —" if rows else "— no open positions —")
+    # 합계 UPNL(수수료 옵션 포함)
+    if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
+        up_sum = float(totals.get("upnl_usdt_sum", 0.0))
+        up_net = float(totals.get("upnl_usdt_sum_net", up_sum))
+        pct_on_eq = (up_net / max(1.0, eq_now)) * 100.0
+        if ko:
+            lines.append(f"미실현손익(UPNL): {up_net:+.2f} USDT ({pct_on_eq:+.2f}% / 자본대비)")
+        else:
+            lines.append(f"Open UPNL: {up_net:+.2f} USDT ({pct_on_eq:+.2f}% of equity)")
 
-    show_usdt = os.getenv("DASHBOARD_SHOW_POS_USDT","1")=="1"
-    show_mae = DASHBOARD_MAE_MFE
-    show_risk = DASHBOARD_RISK_BAR
+        if show_fees:
+            fe = float(totals.get("fees_entry_sum", 0.0))
+            fx = float(totals.get("fees_exit_est_sum", 0.0))
+            if ko:
+                lines.append(f"수수료(누적/예상청산): -{fe:.2f} / -{fx:.2f} USDT")
+            else:
+                lines.append(f"Fees (paid/est. close): -{fe:.2f} / -{fx:.2f} USDT")
 
+    # 섹션 제목
+    count = len(rows)
+    lines.append("— 포지션 —" if ko else "— open positions —")
+    # 포지션 목록
     for r in rows:
-        base = (f"{r['symbol']} {r['tf']} {r['side']} {r['qty']:.4f} @ {r['entry']:.2f} "
-                f"→ {r['last']:.2f} ×{r['lev']:g} | UPNL {r['upnl_pct_on_margin']:+.2f}%")
-        if show_usdt:
-            base += f" / {r['upnl_usdt']:+.2f} USDT"
-        if show_mae:
-            base += f" | MAE {r.get('mae_pct',0.0):+.2f}% · MFE {r.get('mfe_pct',0.0):+.2f}%"
-        if show_risk and (r.get('dist_sl_pct') is not None) and (r.get('dist_tp_pct') is not None):
-            base += f" {r.get('riskbar','')}"
-            base += f" SL {r['dist_sl_pct']:.2f}% · TP {r['dist_tp_pct']:.2f}%"
-            base += r.get('warn','')
-        base += r.get('fund','')
-        lines.append(base)
+        # 1행 요약
+        if ko:
+            base = (
+                f"{r['symbol']} {r['tf']} {r['side']} ×{r['lev']:g}  "
+                f"{r['qty']:.4f} @ {r['entry']:.2f} → {r['last']:.2f}  "
+                f"| UPNL {r['upnl_pct_on_margin']:+.2f}% / {r.get('upnl_usdt_net', r['upnl_usdt']):+,.2f} USDT"
+            )
+        else:
+            base = (
+                f"{r['symbol']} {r['tf']} {r['side']} {r['qty']:.4f} @ {r['entry']:.2f} → {r['last']:.2f} ×{r['lev']:g} "
+                f"| UPNL {r['upnl_pct_on_margin']:+.2f}% / {r.get('upnl_usdt_net', r['upnl_usdt']):+,.2f} USDT"
+            )
+        # 2행 보조
+        extra = f" | MAE {r.get('mae_pct',0.0):+.2f}% · MFE {r.get('mfe_pct',0.0):+.2f}%"
+        if show_fees:
+            fe = r.get("fee_entry_usdt", 0.0)
+            fx = r.get("fee_exit_est_usdt", 0.0)
+            extra += f" | 수수료 진입 -{fe:.2f} · 청산(추정) -{fx:.2f}"
+
+        lines.append(base + extra)
 
     return "\n".join(lines), st, eq_now, totals
 
@@ -7721,7 +7859,15 @@ async def _dash_loop(client):
             if os.getenv("DASH_TRACE","0")=="1":
                 log(f"[DASH:TRACE] render_ok types st={type(st).__name__}, totals={type(totals).__name__}")
             if msg:
-                await msg.edit(content=txt)
+                try:
+                    await msg.edit(content=txt)
+                except Exception as e:
+                    if "Unknown Message" in str(e) or "Not Found" in str(e):
+                        _DASHBOARD_STATE["msg_id"] = 0
+                        _dash_state_save()
+                        log("[DASH] dashboard message missing – will recreate")
+                    else:
+                        log(f"[DASH] edit warn: {e}")
             if PRESENCE_ENABLE:
 
                 if os.getenv("DASH_TRACE","0")=="1":
@@ -8716,7 +8862,12 @@ def _get_channel_or_skip(asset: str, tf: str):
 async def on_ready():
     log(f'✅ Logged in as {client.user}')
     if DASHBOARD_ENABLE:
-        client.loop.create_task(_dash_loop(client))
+        global _DASH_TASK_RUNNING
+        if not _DASH_TASK_RUNNING:
+            _DASH_TASK_RUNNING = True
+            asyncio.create_task(_dash_loop(client))
+        else:
+            log("[DASH] loop already running – skip spawn")
 
     timeframes = ['15m', '1h', '4h', '1d']
 
