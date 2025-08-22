@@ -10556,7 +10556,7 @@ async def on_message(message):
     # using global LAST_PRICE cache defined at module scope
 
     # [ANCHOR: CMD_SET_GET_SAVEENV]
-    if content.startswith("!set "):
+    if content.startswith(('!set ','!변경')):
         try:
             payload = content[5:].strip()
             if "=" in payload:
@@ -10571,14 +10571,14 @@ async def on_message(message):
             await message.channel.send(f"⚠️ set error: {e}")
         return
 
-    if content.startswith("!get "):
+    if content.startswith(('!get ','!값')):
         k = content[5:].strip()
         eff = cfg_get(k)
         ov = RUNTIME_CFG.get(k, None)
         await message.channel.send(f"🔎 {k}\n• effective: ```{eff}```\n• overlay: ```{ov}```")
         return
 
-    if content.startswith("!saveenv"):
+    if content.startswith(('!saveenv','!저장')):
         try:
             path = cfg_get("KEY_ENV_PATH", "key.env")
             with open(path, "r", encoding="utf-8") as f:
@@ -10599,7 +10599,7 @@ async def on_message(message):
         return
 
     # [ANCHOR: CMD_PAUSE_RESUME]
-    if content.startswith("!pause"):
+    if content.startswith(('!pause','!정지')):
         try:
             _, *args = content.split()
             sym = args[0] if len(args) > 0 else "ALL"
@@ -10611,7 +10611,7 @@ async def on_message(message):
             await message.channel.send(f"⚠️ pause error: {e}")
         return
 
-    if content.startswith("!resume"):
+    if content.startswith(('!resume','!시작')):
         try:
             _, *args = content.split()
             sym = args[0] if len(args) > 0 else "ALL"
@@ -10631,7 +10631,7 @@ async def on_message(message):
         return
 
     # [ANCHOR: DISCORD_CMD_CAP_RESET]
-    if content.lower().startswith("!cap reset") and CAP_RESET_ALLOW:
+    if content.lower().startswith(('!cap reset','!자본리셋')) and CAP_RESET_ALLOW:
         try:
             parts = content.split()
             amount = None
@@ -10816,9 +10816,10 @@ async def on_message(message):
 
     if content.startswith(("!help","!도움말","!명령어")):
         lines = [
-            "• 설정: !set KEY=VALUE / !get KEY / !saveenv / !config(!설정)",
-            "• 일시정지/재개: !pause / !resume",
+            "• 설정: !set(!변경) KEY=VALUE / !get(값) KEY / !saveenv(!저장) / !config(!설정)",
+            "• 일시정지/재개: !pause(!정지) / !resume(!시작)",
             "• 청산: !close(!청산) SYMBOL TF [SIDE?] / !closeall(!모두청산|!전부청산)",
+            "• 총자본: !cap reset(!자본리셋)"
             "• 리스크설정: !risk(!리스크) SYMBOL TF tp=5 sl=2.5 tr=1.8 [side=LONG|SHORT]",
             "• 제한/패닉: !limits(!제한) / !limit set(!제한 설정) / !panic(!패닉) / !unpanic(!패닉해제)",
             "• 리포트/상태: !report(!리포트) / !health / !상태 / !분석",
@@ -11166,4 +11167,3 @@ if __name__ == "__main__":
         except Exception as e:
             log(f"⚠️ Discord client crashed: {e}. 5초 후 재시도...")
             time.sleep(5)
-
