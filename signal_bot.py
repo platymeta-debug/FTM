@@ -399,7 +399,9 @@ async def _choose_exec_price(symbol: str, tf: str, reason: str, side: str, trig_
     _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
     final_px = _exec_price_model(_ex_guard, symbol, tf, side, "exit", snap, bar1m, ref_override=float(base_px))
 
+
     if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+
         try:
             log(f"[FILL_MODEL] EXIT {symbol} {tf} side={side} reason={reason} ref={os.getenv('EXIT_PRICE_SOURCE','mark')} slp={_resolve_slippage_pct(symbol, tf, 'exit')}")
         except Exception:
@@ -4375,7 +4377,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             op_ts = float(pos.get("opened_ts") or 0)/1000.0
             ok_exit, reason, trig_px, dbg = _eval_exit(symbol, tf, side, entry, clamped, tp_price, sl_price, tr_eff, (symbol, tf), lev, op_ts)
             if ok_exit:
+
                 exec_px = await _choose_exec_price(symbol, tf, reason, side, float(trig_px), bar1m)
+
                 info = await _paper_close(symbol, tf, exec_px, reason, side=side) if TRADE_MODE=="paper" else None
                 if info:
 
@@ -4404,7 +4408,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
+
     if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+
         try:
             log(f"[GK] mode={TRIGGER_MODE} px_src(entry)={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} px_src(exit)={os.getenv('EXIT_PRICE_SOURCE','mark')} clamp={os.getenv('BAR_BOUND_CLAMP','1')}")
         except Exception:
@@ -4742,6 +4748,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
 
+
     side = "LONG" if exec_signal == "BUY" else "SHORT"
 
     snap = await get_price_snapshot(symbol)
@@ -4750,6 +4757,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     if exec_price is None:
         log(f"[FILL_MODEL] missing ref price for entry {symbol} {tf}")
         return
+
 
     _ex_guard = _ex_guard if '_ex_guard' in locals() else (FUT_EXCHANGE or PUB_FUT_EXCHANGE)
     if ENFORCE_MARKET_RULES and _ex_guard:
@@ -4760,7 +4768,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             return
         exec_price = _price_to_precision(_ex_guard, symbol, float(exec_price))
 
+
     if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+
         try:
             log(f"[FILL_MODEL] ENTRY {symbol} {tf} side={side} ref={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} slp={_resolve_slippage_pct(symbol, tf, 'entry')}")
         except Exception:
@@ -4826,6 +4836,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             tp_price, sl_price, tr_pct_eff = _paper_ensure_tp_sl_trailing(
                 symbol, tf, side,
                 entry_price=float(exec_price),
+
                 tp_pct=(tp_pct if (tp_pct is not None) else None),
                 sl_pct=(sl_pct if (sl_pct is not None) else None),
                 tr_pct=(tr_pct if (tr_pct is not None) else None),
@@ -6324,6 +6335,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         pos = PAPER_POS.get(key)
         if not pos: return None
         eff_side = (pos.get("side") or use_side or "").upper()
+
         entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
         qty   = float(pos.get("qty") or pos.get("quantity") or 0.0)
         pnl_pct = None
@@ -6337,7 +6349,9 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         PAPER_POS.pop(key, None)
         # Free TF occupancy only if no side remains for this (symbol, tf)
         try:
+
             other = "SHORT" if eff_side=="LONG" else "LONG"
+
             still_open = PAPER_POS.get(_pp_key(symbol, tf, other))
             if not still_open and PAPER_POS_TF.get(tf) == symbol:
                 PAPER_POS_TF.pop(tf, None)
@@ -6350,6 +6364,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         qty = float(pos.get("qty") or 0.0)
         # [ANCHOR: PAPER_FEES_FUNDING_BEGIN]
         ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
+
 
         side_up = 1 if str(eff_side).upper() == "LONG" else -1
         gross_usdt = (float(exit_price) - float(entry)) * float(qty) * side_up
@@ -6381,9 +6396,11 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
             fee_entry = 0.0
             fee_exit  = 0.0
 
+
         fees_usdt = float(fee_entry + fee_exit)
         if ESTIMATE_FUNDING_IN_PNL:
             fees_usdt += float(funding_fee)
+
 
         net_usdt = float(gross_usdt) - float(fees_usdt)
         # [ANCHOR: PAPER_FEES_FUNDING_END]
@@ -9328,6 +9345,7 @@ async def send_timed_reports():
             except Exception as e:
                 log(f"PNL PDF send warn: {e}")
 
+
             # [ANCHOR] SEND_TIMED_REPORTS_LOOP
             # ===== 단일 리포트 채널로 모아 전송 =====
             try:
@@ -9344,6 +9362,7 @@ async def send_timed_reports():
                             await _send_report_oldstyle(client, ch, symbol, tf)
             except Exception as e:
                 log(f"[AUTO_REPORT_WARN] {e}")
+
 
             await asyncio.sleep(90)  # 중복 방지
 
@@ -9550,7 +9569,9 @@ async def on_ready():
                         op_ts = float(pos.get("opened_ts") or 0)/1000.0
                         ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
+
                             exec_px = await _choose_exec_price(symbol_eth, tf, reason, side, float(trig_px), bar1m)
+
                             info = await _paper_close(symbol_eth, tf, exec_px, reason, side=side)
                             if info:
                                 await _notify_trade_exit(
@@ -9564,6 +9585,7 @@ async def on_ready():
                                     pnl_usdt=info.get("net_usdt")
                                 )
                                 _reduced_this_cycle = True
+
                             continue
                 else:
                     pos = FUT_POS.get(symbol_eth)
@@ -9580,7 +9602,9 @@ async def on_ready():
                             op_ts = float(pos.get("opened_ts") or 0)/1000.0
                             ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                             if ok_exit:
+
                                 exec_px = await _choose_exec_price(symbol_eth, tf, reason, side, float(trig_px), bar1m)
+
                                 await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=reason)
                                 continue
 
@@ -9618,10 +9642,12 @@ async def on_ready():
                         if ok_exit:
                             exit_reason = reason
                             _bar = _fetch_recent_bar_1m(symbol_eth)
+
                             exec_px = await _choose_exec_price(symbol_eth, tf, exit_reason, side, float(trig_px), _bar)
                             info = await _paper_close(symbol_eth, tf, exec_px, exit_reason, side=side)
                             if info:
                                 await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+
                                 _reduced_this_cycle = True
                             continue
                 else:
@@ -9977,7 +10003,9 @@ async def on_ready():
                         op_ts = float(pos.get("opened_ts") or 0)/1000.0
                         ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
+
                             exec_px = await _choose_exec_price(symbol_btc, tf, reason, side, float(trig_px), bar1m)
+
                             info = await _paper_close(symbol_btc, tf, exec_px, reason, side=side)
                             if info:
                                 await _notify_trade_exit(
@@ -10006,7 +10034,9 @@ async def on_ready():
                             op_ts = float(pos.get("opened_ts") or 0)/1000.0
                             ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                             if ok_exit:
+
                                 exec_px = await _choose_exec_price(symbol_btc, tf, reason, side, float(trig_px), bar1m)
+
                                 await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=reason)
                                 continue
 
@@ -10054,6 +10084,7 @@ async def on_ready():
                             exit_reason = reason
                             _bar = _fetch_recent_bar_1m(symbol_btc)
                             exec_px = await _choose_exec_price(symbol_btc, tf, exit_reason, side, float(trig_px), _bar)
+
                             info = await _paper_close(symbol_btc, tf, exec_px, exit_reason, side=side)
                             if info:
                                 await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
@@ -10073,6 +10104,7 @@ async def on_ready():
                         if ok_exit:
                             exit_reason = reason
                             _bar = _fetch_recent_bar_1m(symbol_btc)
+
                             exec_px = await _choose_exec_price(symbol_btc, tf, exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=exit_reason)
                             continue
@@ -10080,6 +10112,7 @@ async def on_ready():
                 if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
                     log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_btc} {tf}")
                     return
+
 
 
 
@@ -10305,7 +10338,7 @@ async def on_message(message):
     # using global LAST_PRICE cache defined at module scope
 
     # [ANCHOR: CMD_SET_GET_SAVEENV]
-    if content.startswith("!set "):
+    if content.startswith(('!set ','!변경')):
         try:
             payload = content[5:].strip()
             if "=" in payload:
@@ -10320,14 +10353,14 @@ async def on_message(message):
             await message.channel.send(f"⚠️ set error: {e}")
         return
 
-    if content.startswith("!get "):
+    if content.startswith(('!get ','!값')):
         k = content[5:].strip()
         eff = cfg_get(k)
         ov = RUNTIME_CFG.get(k, None)
         await message.channel.send(f"🔎 {k}\n• effective: ```{eff}```\n• overlay: ```{ov}```")
         return
 
-    if content.startswith("!saveenv"):
+    if content.startswith(('!saveenv','!저장')):
         try:
             path = cfg_get("KEY_ENV_PATH", "key.env")
             with open(path, "r", encoding="utf-8") as f:
@@ -10348,7 +10381,7 @@ async def on_message(message):
         return
 
     # [ANCHOR: CMD_PAUSE_RESUME]
-    if content.startswith("!pause"):
+    if content.startswith(('!pause','!정지')):
         try:
             _, *args = content.split()
             sym = args[0] if len(args) > 0 else "ALL"
@@ -10360,7 +10393,7 @@ async def on_message(message):
             await message.channel.send(f"⚠️ pause error: {e}")
         return
 
-    if content.startswith("!resume"):
+    if content.startswith(('!resume','!시작')):
         try:
             _, *args = content.split()
             sym = args[0] if len(args) > 0 else "ALL"
@@ -10380,7 +10413,7 @@ async def on_message(message):
         return
 
     # [ANCHOR: DISCORD_CMD_CAP_RESET]
-    if content.lower().startswith("!cap reset") and CAP_RESET_ALLOW:
+    if content.lower().startswith(('!cap reset','!자본리셋')) and CAP_RESET_ALLOW:
         try:
             parts = content.split()
             amount = None
@@ -10493,7 +10526,9 @@ async def on_message(message):
                 await _paper_close(symU, tfx, get_last_price(symU, 0.0), "MANUAL", side=side)
             else:
                 await futures_close_symbol_tf(sym.upper(), tfx)
+
             await message.channel.send(f"🟢 청산 완료: {sym.upper()} {tfx}" + (f" {side}" if side else ""))
+
         except Exception as e:
             await message.channel.send(f"⚠️ close error: {e}")
         return
@@ -10563,9 +10598,10 @@ async def on_message(message):
 
     if content.startswith(("!help","!도움말","!명령어")):
         lines = [
-            "• 설정: !set KEY=VALUE / !get KEY / !saveenv / !config(!설정)",
-            "• 일시정지/재개: !pause / !resume",
+            "• 설정: !set(!변경) KEY=VALUE / !get(값) KEY / !saveenv(!저장) / !config(!설정)",
+            "• 일시정지/재개: !pause(!정지) / !resume(!시작)",
             "• 청산: !close(!청산) SYMBOL TF [SIDE?] / !closeall(!모두청산|!전부청산)",
+            "• 총자본: !cap reset(!자본리셋)"
             "• 리스크설정: !risk(!리스크) SYMBOL TF tp=5 sl=2.5 tr=1.8 [side=LONG|SHORT]",
             "• 제한/패닉: !limits(!제한) / !limit set(!제한 설정) / !panic(!패닉) / !unpanic(!패닉해제)",
             "• 리포트/상태: !report(!리포트) / !health / !상태 / !분석",
@@ -10674,6 +10710,7 @@ async def on_message(message):
     # ===== PDF 리포트 =====
     elif message.content.startswith("!리포트"):
         parts = message.content.split()
+
         # 사용법: !리포트 ETH 1d  |  !리포트 BTC 15m
         if len(parts) >= 3:
             sym_in = parts[1].upper()
@@ -10682,6 +10719,7 @@ async def on_message(message):
             await _send_report_oldstyle(client, message.channel, symbol, tf)
         else:
             # 인자 없으면 PnL PDF만(과거 동작 유지)
+
             try:
                 pdf = await generate_pnl_pdf()
                 if pdf:
@@ -10813,4 +10851,3 @@ if __name__ == "__main__":
         except Exception as e:
             log(f"⚠️ Discord client crashed: {e}. 5초 후 재시도...")
             time.sleep(5)
-
