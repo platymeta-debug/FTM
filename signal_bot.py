@@ -10,10 +10,51 @@ import matplotlib.pyplot as plt
 import platform
 import os, sys, logging
 import discord
-from dotenv import load_dotenv
-load_dotenv("key.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
+
+# [ANCHOR: ENV_CHAIN_BEGIN]
+def load_env_chain(paths=("key.env", "key.advanced.env", "token.env")):
+    """
+    Load .env files in order; later files override earlier ones.
+    Each file is optional.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+    for p in paths:
+        try:
+            fp = _Path(p)
+            if fp.exists():
+                with open(fp, "r", encoding="utf-8") as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip(); v = v.strip()
+                        _os.environ[k] = v
+        except Exception as e:
+            print(f"[ENV] warn: {p}: {e}")
+
+def _boot_env_summary():
+    keys = [
+        "AUTO_TRADE","TRADE_MODE","EXCHANGE_ID","HEDGE_MODE",
+        "CAPITAL_SOURCE","CAPITAL_BASE","CAPITAL_INCLUDE_UPNL",
+        "DASH_LOCALE","DASHBOARD_CHANNEL_ID","TRADE_CHANNEL_ID",
+        "DASHBOARD_EQUITY_MODE","DASHBOARD_UPDATE_SEC",
+        "DASH_SHOW_FEES","UPNL_INCLUDE_FEES","FEE_SOURCE",
+        "FEE_TAKER_RATE","FEE_MAKER_RATE",
+        "TF_LEVERAGE","TF_MARGIN",
+    ]
+    vals = {k: os.getenv(k, "") for k in keys}
+    print(f"[BOOT_ENV_SUMMARY] {vals}")
+# [ANCHOR: ENV_CHAIN_END]
+
+# ENV chain: key.env → key.advanced.env → token.env
+load_env_chain()
+_boot_env_summary()
 
 # [ANCHOR: LOCKS_BEGIN]
 import asyncio
@@ -7804,6 +7845,12 @@ async def _dash_render_text():
             f"Day PnL: {float(st.get('realized_usdt',0.0)):+.2f} USDT ({float(st.get('realized_pct',0.0)):+.2f}%) | closes={int(st.get('closes',0))}"
         )
 
+    # [ANCHOR: DASH_RENDER_BEGIN]
+    if os.getenv("DASH_LOCALE","ko")=="ko":
+        lines.append(f"모드:{os.getenv('TRADE_MODE')} / 레버리지:{os.getenv('TF_LEVERAGE')} / 슬리피지:{os.getenv('SLIPPAGE_PCT')}%")
+    else:
+        lines.append(f"mode:{os.getenv('TRADE_MODE')} / lev:{os.getenv('TF_LEVERAGE')} / slippage:{os.getenv('SLIPPAGE_PCT')}%")
+
     # 합계 UPNL(수수료 옵션 포함)
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
         up_sum = float(totals.get("upnl_usdt_sum", 0.0))
@@ -10291,19 +10338,6 @@ if __name__ == "__main__":
     log(f"[BOOT] CAPITAL: restored={int(bool(CAPITAL_PERSIST))} base={CAPITAL_BASE:,.2f} now={capital_get():,.2f}")
     log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
 
-    # [ANCHOR: BOOT_ENV_SUMMARY]
-    try:
-        lines = [
-            f"OBS={os.getenv('GATEKEEPER_OBS_SEC','-')}",
-            f"COOLDOWN={os.getenv('POST_EXIT_COOLDOWN_SEC','-')}",
-            f"WAIT_TARGET={os.getenv('WAIT_TARGET_ENABLE','0')}/{os.getenv('TARGET_SCORE_BY_TF','-')}/{os.getenv('WAIT_TARGET_SEC','-')}/{os.getenv('TARGET_WAIT_MODE','-')}",
-            f"IGNORE_OCCUPANCY_TFS={os.getenv('IGNORE_OCCUPANCY_TFS','')}",
-            f"TRADE_MODE={os.getenv('TRADE_MODE','paper')}",
-            f"CAPITAL_BASE={CAPITAL_BASE:,.2f} (paper), ALERT_SHOW_CAPITAL={int(ALERT_SHOW_CAPITAL)}",
-        ]
-        log("[BOOT] ENV SUMMARY: " + ", ".join(lines))
-    except Exception as _e:
-        log(f"[BOOT] ENV SUMMARY warn: {_e}")
     import time
     while True:
         try:
