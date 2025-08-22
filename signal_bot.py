@@ -339,24 +339,36 @@ def _eval_exit_touch(side: str, entry: float, tf: str, bar: dict):
             return True, "TP", tp_price
     return False, None, None
 
-def _choose_exec_price(reason: str, side: str, trig_px: float, bar: dict) -> float:
+async def _choose_exec_price(symbol: str, tf: str, reason: str, side: str, trig_px: float, bar: dict) -> float:
     """
-    EXIT_FILL_MODE에 따라 실제 기록할 '종결가' 선택.
-    - threshold: 임계값 그대로
-    - bar_bound: 분봉 경계값으로 치환
+    EXIT_FILL_MODE에 따라 실제 기록할 '종결가' 선택 후 공통 실행가격 모델 적용.
     """
     hi, lo = float(bar["high"]), float(bar["low"])
     if EXIT_FILL_MODE == "threshold":
-        return float(trig_px)
-    side = str(side).upper()
-    reason = (reason or "").upper()
-    if reason == "TRAIL":
-        return lo if side == "LONG" else hi
-    if reason == "SL":
-        return max(trig_px, lo) if side == "LONG" else min(trig_px, hi)
-    if reason == "TP":
-        return min(trig_px, hi) if side == "LONG" else max(trig_px, lo)
-    return max(min(trig_px, hi), lo)
+        base_px = float(trig_px)
+    else:
+        side = str(side).upper()
+        reasonU = (reason or "").upper()
+        if reasonU == "TRAIL":
+            base_px = lo if side == "LONG" else hi
+        elif reasonU == "SL":
+            base_px = max(trig_px, lo) if side == "LONG" else min(trig_px, hi)
+        elif reasonU == "TP":
+            base_px = min(trig_px, hi) if side == "LONG" else max(trig_px, lo)
+        else:
+            base_px = max(min(trig_px, hi), lo)
+
+    snap = await get_price_snapshot(symbol)
+    bar1m = _fetch_recent_bar_1m(symbol)
+    _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+    final_px = _exec_price_model(_ex_guard, symbol, tf, side, "exit", snap, bar1m, ref_override=float(base_px))
+
+    if DEBUG or os.getenv("FILL_MODEL_DEBUG","0") == "1":
+        try:
+            log(f"[FILL_MODEL] EXIT {symbol} {tf} side={side} reason={reason} ref={os.getenv('EXIT_PRICE_SOURCE','mark')} slp={_resolve_slippage_pct(symbol, tf, 'exit')}")
+        except Exception:
+            pass
+    return final_px
 # [ANCHOR: EXIT_EVAL_HELPERS_END]
 
 
@@ -4213,7 +4225,15 @@ async def handle_trigger(symbol, tf, trigger_mode, signal, display_price, c_ts, 
                     ARMED_SIGNAL.pop(key, None)
                     ARMED_TS.pop(key, None)
         elif state == 'CONFIRMED':
-            await maybe_execute_trade(symbol, tf, signal, last_price=display_price, candle_ts=c_ts)
+            side_c = "LONG" if signal == "BUY" else "SHORT"
+            snap2 = await get_price_snapshot(symbol)
+            bar1m = _fetch_recent_bar_1m(symbol)
+            _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+            exec_price = _exec_price_model(_ex_guard, symbol, tf, side_c, "entry", snap2, bar1m)
+            if exec_price is None:
+                log(f"[FILL_MODEL] intrabar_confirm missing price {symbol} {tf}")
+                return
+            await maybe_execute_trade(symbol, tf, signal, last_price=exec_price, candle_ts=c_ts)
             if signal not in ('BUY', 'SELL'):
                 TRIGGER_STATE[key] = 'FLAT'
                 ARMED_SIGNAL.pop(key, None)
@@ -4319,7 +4339,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             op_ts = float(pos.get("opened_ts") or 0)/1000.0
             ok_exit, reason, trig_px, dbg = _eval_exit(symbol, tf, side, entry, clamped, tp_price, sl_price, tr_eff, (symbol, tf), lev, op_ts)
             if ok_exit:
-                exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+
+                exec_px = await _choose_exec_price(symbol, tf, reason, side, float(trig_px), bar1m)
+
                 info = await _paper_close(symbol, tf, exec_px, reason, side=side) if TRADE_MODE=="paper" else None
                 if info:
 
@@ -4347,6 +4369,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏸ {symbol} {tf}: pending gatekeeper (waiting/loser)")
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
+
+    if DEBUG or os.getenv("FILL_MODEL_DEBUG","0") == "1":
+        try:
+            log(f"[GK] mode={TRIGGER_MODE} px_src(entry)={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} px_src(exit)={os.getenv('EXIT_PRICE_SOURCE','mark')} clamp={os.getenv('BAR_BOUND_CLAMP','1')}")
+        except Exception:
+            pass
 
     occ = PAPER_POS_TF.get(tf)
     if tf not in IGNORE_OCCUPANCY_TFS and occ:
@@ -4680,30 +4708,42 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
 
+
+    side = "LONG" if exec_signal == "BUY" else "SHORT"
+
+    snap = await get_price_snapshot(symbol)
+    bar1m = _fetch_recent_bar_1m(symbol)
+    exec_price = _exec_price_model(_ex_guard, symbol, tf, side, "entry", snap, bar1m)
+    if exec_price is None:
+        log(f"[FILL_MODEL] missing ref price for entry {symbol} {tf}")
+        return
+
     _ex_guard = _ex_guard if '_ex_guard' in locals() else (FUT_EXCHANGE or PUB_FUT_EXCHANGE)
     if ENFORCE_MARKET_RULES and _ex_guard:
         # futures-aware rounding + min_notional gate
         qty = _fut_amount_to_precision(_ex_guard, symbol, qty)
-        if not _fut_min_notional_ok(_ex_guard, symbol, float(last_price), qty):
+        if not _fut_min_notional_ok(_ex_guard, symbol, exec_price, qty):
             logging.warning(f"[PAPER_RULES] below min_notional: {symbol} {tf} qty={qty}")
             return
-        last_price = _price_to_precision(_ex_guard, symbol, float(last_price))
+        exec_price = _price_to_precision(_ex_guard, symbol, float(exec_price))
 
-    side = "LONG" if exec_signal == "BUY" else "SHORT"
-
-
+    if DEBUG or os.getenv("FILL_MODEL_DEBUG","0") == "1":
+        try:
+            log(f"[FILL_MODEL] ENTRY {symbol} {tf} side={side} ref={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} slp={_resolve_slippage_pct(symbol, tf, 'entry')}")
+        except Exception:
+            pass
     if _POS_LOCK:
         async with _POS_LOCK:
             PAPER_POS[key] = {
                 "side": side,
-                "entry": float(last_price),
-                "entry_price": float(last_price),
+                "entry": float(exec_price),
+                "entry_price": float(exec_price),
                 "qty": qty,
                 "eff_margin": eff_margin,
                 "lev": lev_used,
                 "ts_ms": int(time.time()*1000),
-                "high": float(last_price),
-                "low": float(last_price),
+                "high": float(exec_price),
+                "low": float(exec_price),
 
             }
             slip = _req_slippage_pct(symbol, tf)
@@ -4711,7 +4751,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             try:
                 tp_price, sl_price, tr_pct_eff = _paper_ensure_tp_sl_trailing(
                     symbol, tf, side,
-                    entry_price=float(last_price),
+                    entry_price=float(exec_price),
                     tp_pct=(tp_pct if (tp_pct is not None) else None),
                     sl_pct=(sl_pct if (sl_pct is not None) else None),
                     tr_pct=(tr_pct if (tr_pct is not None) else None),
@@ -4737,14 +4777,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     else:
         PAPER_POS[key] = {
             "side": side,
-            "entry": float(last_price),
-            "entry_price": float(last_price),
+            "entry": float(exec_price),
+            "entry_price": float(exec_price),
             "qty": qty,
             "eff_margin": eff_margin,
             "lev": lev_used,
             "ts_ms": int(time.time()*1000),
-            "high": float(last_price),
-            "low": float(last_price),
+            "high": float(exec_price),
+            "low": float(exec_price),
 
         }
         slip = _req_slippage_pct(symbol, tf)
@@ -4752,7 +4792,8 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         try:
             tp_price, sl_price, tr_pct_eff = _paper_ensure_tp_sl_trailing(
                 symbol, tf, side,
-                entry_price=float(last_price),
+                entry_price=float(exec_price),
+
                 tp_pct=(tp_pct if (tp_pct is not None) else None),
                 sl_pct=(sl_pct if (sl_pct is not None) else None),
                 tr_pct=(tr_pct if (tr_pct is not None) else None),
@@ -4790,7 +4831,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
           f"pb_alloc_mul={_pb_alloc_mul if '_pb_alloc_mul' in locals() else ''}"
       ])
     if PAPER_CSV_OPEN_LOG:
-        _log_trade_csv(symbol, tf, "OPEN", side, qty, last_price, extra=extra)
+        _log_trade_csv(symbol, tf, "OPEN", side, qty, exec_price, extra=extra)
 # [ANCHOR: REENTRY_ON_ENTRY_SUCCESS]  << ADD WHERE ORDER SUCCEEDS >>
     try:
         key = (symbol, tf, side)
@@ -4810,7 +4851,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         if isinstance(pos_obj, dict):
             # persist legs array and last-realloc metadata
             pos_obj.setdefault("legs", [])  # list of {"notional":..., "price":..., "ts":...}
-            pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(last_price)))
+            pos_obj.setdefault("plan_total_notional", float(notional_used if 'notional_used' in locals() else qty*float(exec_price)))
             pos_obj.setdefault("last_ctx", CTX_STATE.get(symbol))
             pos_obj.setdefault("last_realloc_ts", 0.0)
     except Exception:
@@ -4818,7 +4859,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     # initialize trailing baseline at entry (per (symbol, tf))
     try:
         k2 = (symbol, tf)
-        entry_price = float(last_price)
+        entry_price = float(exec_price)
         if str(side).upper() == "LONG":
             highest_price[k2] = entry_price
             lowest_price.pop(k2, None)
@@ -4829,14 +4870,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     except Exception:
         pass
     previous_signal[(symbol, tf)] = exec_signal
-    entry_data[(symbol, tf)] = (float(last_price), datetime.now().strftime("%m월 %d일 %H:%M"))
+    entry_data[(symbol, tf)] = (float(exec_price), datetime.now().strftime("%m월 %d일 %H:%M"))
 
     if TRADE_MODE == "paper" and PAPER_STRICT_NONZERO and (not base_margin or not eff_margin or not qty):
         logging.warning("[PAPER_WARN] zero allocation on paper entry: check PART A")
 
     await _notify_trade_entry(
         symbol, tf, exec_signal,
-        mode="paper", price=float(last_price),
+        mode="paper", price=float(exec_price),
         qty=qty,
         base_margin=base_margin, eff_margin=eff_margin,
         lev_used=lev_used,
@@ -5103,6 +5144,95 @@ async def safe_price_hint(symbol:str):
     return clamped, bar
 # [ANCHOR: RESILIENT_FETCHERS_END]
 
+# [ANCHOR: EXEC_PRICE_MODEL_BEGIN]  << ADD NEW >>
+def _resolve_slippage_pct(symbol: str, tf: str, when: str) -> float:
+    """
+    Resolve slippage pct priority:
+      SLIPPAGE_BY_TF > SLIPPAGE_PCT_ENTRY/EXIT > SLIPPAGE_PCT (global) > 0.0
+    """
+    try:
+        by_tf = os.getenv("SLIPPAGE_BY_TF", "")
+        if by_tf:
+            for kv in by_tf.split(","):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    if k.strip() == tf:
+                        return float(v.strip())
+    except Exception:
+        pass
+    try:
+        if when == "entry":
+            v = os.getenv("SLIPPAGE_PCT_ENTRY")
+            if v:
+                return float(v)
+        elif when == "exit":
+            v = os.getenv("SLIPPAGE_PCT_EXIT")
+            if v:
+                return float(v)
+    except Exception:
+        pass
+    try:
+        v = os.getenv("SLIPPAGE_PCT")
+        return float(v) if v else 0.0
+    except Exception:
+        return 0.0
+
+def _bar_clamp(px: float, bar: dict|None) -> float:
+    """Clamp price within current 1m bar bounds if BAR_BOUND_CLAMP=1."""
+    if os.getenv("BAR_BOUND_CLAMP", "1") != "1":
+        return px
+    try:
+        lo = float(bar.get("low")) if bar and bar.get("low") is not None else None
+        hi = float(bar.get("high")) if bar and bar.get("high") is not None else None
+        if lo is not None and px < lo:
+            return lo
+        if hi is not None and px > hi:
+            return hi
+    except Exception:
+        pass
+    return px
+
+def _pick_ref_price(symbol: str, when: str, snap: dict) -> float|None:
+    """
+    Choose a reference price from snapshot for execution.
+    Entry: ENTRY_EXEC_PRICE_SOURCE (default 'chosen').
+    Exit:  EXIT_PRICE_SOURCE      (default 'mark').
+    """
+    src = os.getenv("ENTRY_EXEC_PRICE_SOURCE", "chosen") if when == "entry" else os.getenv("EXIT_PRICE_SOURCE", "mark")
+    return (
+        snap.get(src)
+        or snap.get("chosen")
+        or snap.get("mid")
+        or snap.get("last")
+        or snap.get("mark")
+        or snap.get("index")
+    )
+
+def _exec_price_model(ex, symbol: str, tf: str, side: str, when: str, snap: dict, bar: dict|None, ref_override: float|None = None) -> float|None:
+    """
+    Compute the execution price:
+      1) pick reference (or use ref_override),
+      2) apply worst-case slippage by side (+ for BUY, - for SELL),
+      3) clamp to 1m bar if enabled,
+      4) precision-round via exchange if available.
+    """
+    sideU = (side or "").upper()
+    base = float(ref_override) if (ref_override is not None) else _pick_ref_price(symbol, when, snap)
+    if base is None:
+        return None
+    slp = _resolve_slippage_pct(symbol, tf, when)
+    if sideU in ("LONG", "BUY"):
+        px = base * (1.0 + slp / 100.0)
+    else:
+        px = base * (1.0 - slp / 100.0)
+    px = _bar_clamp(px, bar)
+    try:
+        if ex:
+            px = _price_to_precision(ex, symbol, px)
+    except Exception:
+        pass
+    return float(px)
+# [ANCHOR: EXEC_PRICE_MODEL_END]
 
 # [ANCHOR: TRAIL_GUARDS_BEGIN]
 def _tf_map_get(env_key:str, tf:str, default:float) -> float:
@@ -6211,10 +6341,10 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
             fee_entry = 0.0
             fee_exit  = 0.0
 
-
         fees_usdt = float(fee_entry + fee_exit)
         if ESTIMATE_FUNDING_IN_PNL:
             fees_usdt += float(funding_fee)
+
 
         net_usdt = float(gross_usdt) - float(fees_usdt)
         # [ANCHOR: PAPER_FEES_FUNDING_END]
@@ -9578,7 +9708,9 @@ async def on_ready():
                         op_ts = float(pos.get("opened_ts") or 0)/1000.0
                         ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
-                            exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+
+                            exec_px = await _choose_exec_price(symbol_eth, tf, reason, side, float(trig_px), bar1m)
+
                             info = await _paper_close(symbol_eth, tf, exec_px, reason, side=side)
                             if info:
                                 await _notify_trade_exit(
@@ -9609,7 +9741,9 @@ async def on_ready():
                             op_ts = float(pos.get("opened_ts") or 0)/1000.0
                             ok_exit, reason, trig_px, dbg = _eval_exit(symbol_eth, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                             if ok_exit:
-                                exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+
+                                exec_px = await _choose_exec_price(symbol_eth, tf, reason, side, float(trig_px), bar1m)
+
                                 await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=reason)
                                 continue
 
@@ -9647,7 +9781,8 @@ async def on_ready():
                         if ok_exit:
                             exit_reason = reason
                             _bar = _fetch_recent_bar_1m(symbol_eth)
-                            exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
+
+                            exec_px = await _choose_exec_price(symbol_eth, tf, exit_reason, side, float(trig_px), _bar)
                             info = await _paper_close(symbol_eth, tf, exec_px, exit_reason, side=side)
                             if info:
                                 await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
@@ -9668,13 +9803,13 @@ async def on_ready():
                         if ok_exit:
                             exit_reason = reason
                             _bar = _fetch_recent_bar_1m(symbol_eth)
-                            exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
+                            exec_px = await _choose_exec_price(symbol_eth, tf, exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=exit_reason)
                             continue
+
                 if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
                     log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_eth} {tf}")
                     return
-
 
 
 
@@ -10007,7 +10142,9 @@ async def on_ready():
                         op_ts = float(pos.get("opened_ts") or 0)/1000.0
                         ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                         if ok_exit:
-                            exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+
+                            exec_px = await _choose_exec_price(symbol_btc, tf, reason, side, float(trig_px), bar1m)
+
                             info = await _paper_close(symbol_btc, tf, exec_px, reason, side=side)
                             if info:
                                 await _notify_trade_exit(
@@ -10036,7 +10173,9 @@ async def on_ready():
                             op_ts = float(pos.get("opened_ts") or 0)/1000.0
                             ok_exit, reason, trig_px, dbg = _eval_exit(symbol_btc, tf, side, entry, clamped, tp_price, sl_price, tr_pct_eff, key2, lev, op_ts)
                             if ok_exit:
-                                exec_px = _choose_exec_price(reason, side, float(trig_px), bar1m)
+
+                                exec_px = await _choose_exec_price(symbol_btc, tf, reason, side, float(trig_px), bar1m)
+
                                 await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=reason)
                                 continue
 
@@ -10083,7 +10222,8 @@ async def on_ready():
                         if ok_exit:
                             exit_reason = reason
                             _bar = _fetch_recent_bar_1m(symbol_btc)
-                            exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
+                            exec_px = await _choose_exec_price(symbol_btc, tf, exit_reason, side, float(trig_px), _bar)
+
                             info = await _paper_close(symbol_btc, tf, exec_px, exit_reason, side=side)
                             if info:
                                 await _notify_trade_exit(symbol_btc, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
@@ -10103,9 +10243,11 @@ async def on_ready():
                         if ok_exit:
                             exit_reason = reason
                             _bar = _fetch_recent_bar_1m(symbol_btc)
-                            exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
+
+                            exec_px = await _choose_exec_price(symbol_btc, tf, exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=exit_reason)
                             continue
+
                 if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
                     log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_btc} {tf}")
                     return
