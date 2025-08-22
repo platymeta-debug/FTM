@@ -10,10 +10,51 @@ import matplotlib.pyplot as plt
 import platform
 import os, sys, logging
 import discord
-from dotenv import load_dotenv
-load_dotenv("key.env")  # 같은 폴더의 key.env 읽기 (.env로 바꾸면 load_dotenv()만 써도 됨)
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
+
+# [ANCHOR: ENV_CHAIN_BEGIN]
+def load_env_chain(paths=("key.env", "key.advanced.env", "token.env")):
+    """
+    Load .env files in order; later files override earlier ones.
+    Each file is optional.
+    """
+    import os as _os
+    from pathlib import Path as _Path
+    for p in paths:
+        try:
+            fp = _Path(p)
+            if fp.exists():
+                with open(fp, "r", encoding="utf-8") as f:
+                    for raw in f:
+                        line = raw.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        k = k.strip(); v = v.strip()
+                        _os.environ[k] = v
+        except Exception as e:
+            print(f"[ENV] warn: {p}: {e}")
+
+def _boot_env_summary():
+    keys = [
+        "AUTO_TRADE","TRADE_MODE","EXCHANGE_ID","HEDGE_MODE",
+        "CAPITAL_SOURCE","CAPITAL_BASE","CAPITAL_INCLUDE_UPNL",
+        "DASH_LOCALE","DASHBOARD_CHANNEL_ID","TRADE_CHANNEL_ID",
+        "DASHBOARD_EQUITY_MODE","DASHBOARD_UPDATE_SEC",
+        "DASH_SHOW_FEES","UPNL_INCLUDE_FEES","FEE_SOURCE",
+        "FEE_TAKER_RATE","FEE_MAKER_RATE",
+        "TF_LEVERAGE","TF_MARGIN",
+    ]
+    vals = {k: os.getenv(k, "") for k in keys}
+    print(f"[BOOT_ENV_SUMMARY] {vals}")
+# [ANCHOR: ENV_CHAIN_END]
+
+# ENV chain: key.env → key.advanced.env → token.env
+load_env_chain()
+_boot_env_summary()
 
 # [ANCHOR: LOCKS_BEGIN]
 import asyncio
@@ -1418,6 +1459,8 @@ EXCHANGE_ID  = os.getenv("EXCHANGE_ID", "binance")  # 'binance' | 'binanceusdm'(
 SANDBOX      = os.getenv("SANDBOX", "1") == "1"   # True면 테스트넷/샌드박스 모드
 RISK_USDT    = float(os.getenv("RISK_USDT", "20"))  # 1회 주문에 사용할 USDT
 MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5"))  # 거래소 최소 체결가 대비 여유치
+POS_TF_STRICT   = os.getenv("POS_TF_STRICT","1")=="1"
+POS_TF_AUTOREPAIR = os.getenv("POS_TF_AUTOREPAIR","1")=="1"
 
 # 실행 상태(중복 주문 방지)
 EXEC_STATE = {}            # key: (symbol, tf) -> {'last_signal': 'BUY'/'SELL', ...}
@@ -4278,17 +4321,24 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
-    if tf not in IGNORE_OCCUPANCY_TFS and PAPER_POS_TF.get(tf):
-        log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
-        return
-
-    if _POS_LOCK:
-        async with _POS_LOCK:
-            PAPER_POS_TF[tf] = symbol
-            _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
-    else:
-        PAPER_POS_TF[tf] = symbol
-        _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+    occ = PAPER_POS_TF.get(tf)
+    if tf not in IGNORE_OCCUPANCY_TFS and occ:
+        has_real = _has_open_position(occ, tf, TRADE_MODE)
+        if POS_TF_STRICT:
+            if has_real:
+                log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
+                return
+        else:
+            log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
+            return
+        if POS_TF_AUTOREPAIR and not has_real:
+            try:
+                PAPER_POS_TF.pop(tf, None)
+                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                log(f"[OCCUPANCY] cleared stale tf={tf} (was {occ})")
+            except Exception:
+                pass
+    # NOTE: Do NOT pre-commit TF occupancy here anymore.
 
     # [ANCHOR: AVOID_OVERWRITE_OPEN_POS]  (REPLACED)
     existing_paper = (PAPER_POS or {}).get(key)
@@ -4641,6 +4691,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 "slippage_pct": slip
             })
             _save_json(PAPER_POS_FILE, PAPER_POS)
+            try:
+                # now that the position is persisted, mark TF occupancy
+                PAPER_POS_TF[tf] = symbol
+                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+            except Exception:
+                pass
     else:
         PAPER_POS[key] = {
             "side": side,
@@ -4673,6 +4729,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             "slippage_pct": slip
         })
         _save_json(PAPER_POS_FILE, PAPER_POS)
+        try:
+            # now that the position is persisted, mark TF occupancy
+            PAPER_POS_TF[tf] = symbol
+            _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+        except Exception:
+            pass
     # also write OPEN row for paper mode
     extra = ",".join([
           f"mode={'paper' if TRADE_MODE=='paper' else 'futures'}",
@@ -6168,6 +6230,20 @@ def _hydrate_from_disk():
                         PAPER_POS_TF[tf] = sym
                 except Exception:
                     continue
+        # prune stale TF occupancy (no matching PAPER_POS entry)
+        try:
+            valid_tfs = set()
+            for k in (PAPER_POS or {}).keys():
+                try:
+                    _, tfx = k.split("|", 1)
+                    valid_tfs.add(tfx)
+                except Exception:
+                    continue
+            for tfk in list(PAPER_POS_TF.keys()):
+                if tfk not in valid_tfs:
+                    PAPER_POS_TF.pop(tfk, None)
+        except Exception:
+            pass
         _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
     except Exception as e:
         log(f"[HYDRATE] warn: {e}")
@@ -7803,6 +7879,12 @@ async def _dash_render_text():
         lines.append(
             f"Day PnL: {float(st.get('realized_usdt',0.0)):+.2f} USDT ({float(st.get('realized_pct',0.0)):+.2f}%) | closes={int(st.get('closes',0))}"
         )
+
+    # [ANCHOR: DASH_RENDER_BEGIN]
+    if os.getenv("DASH_LOCALE","ko")=="ko":
+        lines.append(f"모드:{os.getenv('TRADE_MODE')} / 레버리지:{os.getenv('TF_LEVERAGE')} / 슬리피지:{os.getenv('SLIPPAGE_PCT')}%")
+    else:
+        lines.append(f"mode:{os.getenv('TRADE_MODE')} / lev:{os.getenv('TF_LEVERAGE')} / slippage:{os.getenv('SLIPPAGE_PCT')}%")
 
     # 합계 UPNL(수수료 옵션 포함)
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
@@ -10291,19 +10373,6 @@ if __name__ == "__main__":
     log(f"[BOOT] CAPITAL: restored={int(bool(CAPITAL_PERSIST))} base={CAPITAL_BASE:,.2f} now={capital_get():,.2f}")
     log(f"[BOOT] ALLOC_UPNL mode={ALLOC_UPNL_MODE}, use={ALLOC_USE_UPNL}, w+={ALLOC_UPNL_W_POS}, w-={ALLOC_UPNL_W_NEG}, alpha={ALLOC_UPNL_EMA_ALPHA}, clamp={ALLOC_UPNL_CLAMP_PCT}%")
 
-    # [ANCHOR: BOOT_ENV_SUMMARY]
-    try:
-        lines = [
-            f"OBS={os.getenv('GATEKEEPER_OBS_SEC','-')}",
-            f"COOLDOWN={os.getenv('POST_EXIT_COOLDOWN_SEC','-')}",
-            f"WAIT_TARGET={os.getenv('WAIT_TARGET_ENABLE','0')}/{os.getenv('TARGET_SCORE_BY_TF','-')}/{os.getenv('WAIT_TARGET_SEC','-')}/{os.getenv('TARGET_WAIT_MODE','-')}",
-            f"IGNORE_OCCUPANCY_TFS={os.getenv('IGNORE_OCCUPANCY_TFS','')}",
-            f"TRADE_MODE={os.getenv('TRADE_MODE','paper')}",
-            f"CAPITAL_BASE={CAPITAL_BASE:,.2f} (paper), ALERT_SHOW_CAPITAL={int(ALERT_SHOW_CAPITAL)}",
-        ]
-        log("[BOOT] ENV SUMMARY: " + ", ".join(lines))
-    except Exception as _e:
-        log(f"[BOOT] ENV SUMMARY warn: {_e}")
     import time
     while True:
         try:
