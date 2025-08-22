@@ -6180,6 +6180,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         # [ANCHOR: PAPER_FEES_FUNDING_BEGIN]
         ex = FUT_EXCHANGE if FUT_EXCHANGE else PUB_FUT_EXCHANGE
 
+
         side_up = 1 if str(side).upper() == "LONG" else -1
         gross_usdt = (float(exit_price) - float(entry)) * float(qty) * side_up
 
@@ -6209,6 +6210,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         else:
             fee_entry = 0.0
             fee_exit  = 0.0
+
 
         fees_usdt = float(fee_entry + fee_exit)
         if ESTIMATE_FUNDING_IN_PNL:
@@ -9590,6 +9592,7 @@ async def on_ready():
                                     pnl_usdt=info.get("net_usdt")
                                 )
                                 _reduced_this_cycle = True
+
                             continue
                 else:
                     pos = FUT_POS.get(symbol_eth)
@@ -9648,6 +9651,7 @@ async def on_ready():
                             info = await _paper_close(symbol_eth, tf, exec_px, exit_reason, side=side)
                             if info:
                                 await _notify_trade_exit(symbol_eth, tf, side=info['side'], entry_price=info['entry_price'], exit_price=exec_px, reason=exit_reason, mode='paper', pnl_pct=info.get('pnl_pct'), qty=info.get('qty'), pnl_usdt=info.get('net_usdt'))
+
                                 _reduced_this_cycle = True
                             continue
                 else:
@@ -9667,10 +9671,10 @@ async def on_ready():
                             exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_eth, tf, exit_price=exec_px, reason=exit_reason)
                             continue
-
                 if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
                     log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_eth} {tf}")
                     return
+
 
 
 
@@ -10102,10 +10106,10 @@ async def on_ready():
                             exec_px = _choose_exec_price(exit_reason, side, float(trig_px), _bar)
                             await futures_close_all(symbol_btc, tf, exit_price=exec_px, reason=exit_reason)
                             continue
-
                 if _reduced_this_cycle and os.getenv("PAPER_EXIT_REDUCEONLY","1") == "1":
                     log(f"[PAPER] reduce-only guard: skip any adds this cycle for {symbol_btc} {tf}")
                     return
+
 
 
 
