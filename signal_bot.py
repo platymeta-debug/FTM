@@ -4458,6 +4458,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 if TRADE_MODE == "paper":
                     add_eff = add_base
                     add_qty = (add_eff * lev_used) / float(last_price)
+                    _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+                    if ENFORCE_MARKET_RULES and _ex_guard:
+                        add_qty = _fut_amount_to_precision(_ex_guard, symbol, add_qty)
+                        if not _fut_min_notional_ok(_ex_guard, symbol, float(last_price), add_qty):
+                            if SCALE_LOG:
+                                logging.info(f"[PAPER_SCALE_SKIP] below min_notional {symbol} tf={tf} add_qty={add_qty}")
+                            add_eff = 0.0
+                            add_qty = 0.0
                     old_qty = float(existing_paper.get("qty") or 0.0)
                     old_entry = float(existing_paper.get("entry_price") or last_price)
                     new_qty = old_qty + add_qty
@@ -4653,13 +4661,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             idem_mark(symbol, tf, candle_ts)
             return
 
-
+    # Prefer live futures exchange for market limits; fallback to public futures markets on paper.
+    _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
     alloc = _preview_allocation_and_qty(
         symbol=symbol,
         tf=tf,
         signal=exec_signal,
         price=float(last_price),
-        ex=None
+        ex=_ex_guard
     )
     base_margin = alloc["base_margin"]
     eff_margin  = alloc["eff_margin"]
@@ -4673,15 +4682,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
 
-
-    market_symbol = symbol
-    if ENFORCE_MARKET_RULES:
-        qty = _amount_to_precision(GLOBAL_EXCHANGE, market_symbol, qty) if TICK_ENFORCE else qty
-        px  = _price_to_precision(GLOBAL_EXCHANGE, market_symbol, float(last_price)) if TICK_ENFORCE else float(last_price)
-        if not _min_notional_ok(GLOBAL_EXCHANGE, market_symbol, px, qty):
-            log(f"[RULES] skip: notional {px*qty:.4f} < min")
+    _ex_guard = _ex_guard if '_ex_guard' in locals() else (FUT_EXCHANGE or PUB_FUT_EXCHANGE)
+    if ENFORCE_MARKET_RULES and _ex_guard:
+        # futures-aware rounding + min_notional gate
+        qty = _fut_amount_to_precision(_ex_guard, symbol, qty)
+        if not _fut_min_notional_ok(_ex_guard, symbol, float(last_price), qty):
+            logging.warning(f"[PAPER_RULES] below min_notional: {symbol} {tf} qty={qty}")
             return
-        last_price = px
+        last_price = _price_to_precision(_ex_guard, symbol, float(last_price))
 
     side = "LONG" if exec_signal == "BUY" else "SHORT"
 
@@ -5973,8 +5981,9 @@ def _preview_allocation_and_qty(symbol: str, tf: str, signal: str, price: float,
     qty = 0.0
     try:
         if price and eff_margin and lev_used:
-            qty = (float(eff_margin) * float(lev_used)) / float(price)
+            qty = (float(eff_margin) * float(lev_used)) / max(float(price), 1e-9)
             if ex:
+                # precision/stepSize rounding applied when exchange provided
                 qty = _fut_amount_to_precision(ex, symbol, qty)
     except Exception:
         qty = 0.0
@@ -6287,6 +6296,12 @@ async def _paper_reduce(symbol: str, tf: str, side: str, reduce_qty: float, exit
         qty_old = float(pos.get("qty",0.0))
         if qty_old <= 0: return None
         reduce_qty = min(reduce_qty, qty_old)
+        _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
+        if ENFORCE_MARKET_RULES and _ex_guard:
+            reduce_qty = _fut_amount_to_precision(_ex_guard, symbol, reduce_qty)
+            reduce_qty = min(reduce_qty, qty_old)
+            if reduce_qty <= 0:
+                return None
         entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
         pnl_usdt = (exit_price - entry) * reduce_qty if side=="LONG" else (entry - exit_price) * reduce_qty
         qty_new = qty_old - reduce_qty
