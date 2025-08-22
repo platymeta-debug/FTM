@@ -1459,6 +1459,8 @@ EXCHANGE_ID  = os.getenv("EXCHANGE_ID", "binance")  # 'binance' | 'binanceusdm'(
 SANDBOX      = os.getenv("SANDBOX", "1") == "1"   # True면 테스트넷/샌드박스 모드
 RISK_USDT    = float(os.getenv("RISK_USDT", "20"))  # 1회 주문에 사용할 USDT
 MIN_NOTIONAL = float(os.getenv("MIN_NOTIONAL", "5"))  # 거래소 최소 체결가 대비 여유치
+POS_TF_STRICT   = os.getenv("POS_TF_STRICT","1")=="1"
+POS_TF_AUTOREPAIR = os.getenv("POS_TF_AUTOREPAIR","1")=="1"
 
 # 실행 상태(중복 주문 방지)
 EXEC_STATE = {}            # key: (symbol, tf) -> {'last_signal': 'BUY'/'SELL', ...}
@@ -4319,17 +4321,24 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
-    if tf not in IGNORE_OCCUPANCY_TFS and PAPER_POS_TF.get(tf):
-        log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
-        return
-
-    if _POS_LOCK:
-        async with _POS_LOCK:
-            PAPER_POS_TF[tf] = symbol
-            _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
-    else:
-        PAPER_POS_TF[tf] = symbol
-        _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+    occ = PAPER_POS_TF.get(tf)
+    if tf not in IGNORE_OCCUPANCY_TFS and occ:
+        has_real = _has_open_position(occ, tf, TRADE_MODE)
+        if POS_TF_STRICT:
+            if has_real:
+                log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
+                return
+        else:
+            log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
+            return
+        if POS_TF_AUTOREPAIR and not has_real:
+            try:
+                PAPER_POS_TF.pop(tf, None)
+                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                log(f"[OCCUPANCY] cleared stale tf={tf} (was {occ})")
+            except Exception:
+                pass
+    # NOTE: Do NOT pre-commit TF occupancy here anymore.
 
     # [ANCHOR: AVOID_OVERWRITE_OPEN_POS]  (REPLACED)
     existing_paper = (PAPER_POS or {}).get(key)
@@ -4682,6 +4691,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
                 "slippage_pct": slip
             })
             _save_json(PAPER_POS_FILE, PAPER_POS)
+            try:
+                # now that the position is persisted, mark TF occupancy
+                PAPER_POS_TF[tf] = symbol
+                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+            except Exception:
+                pass
     else:
         PAPER_POS[key] = {
             "side": side,
@@ -4714,6 +4729,12 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             "slippage_pct": slip
         })
         _save_json(PAPER_POS_FILE, PAPER_POS)
+        try:
+            # now that the position is persisted, mark TF occupancy
+            PAPER_POS_TF[tf] = symbol
+            _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+        except Exception:
+            pass
     # also write OPEN row for paper mode
     extra = ",".join([
           f"mode={'paper' if TRADE_MODE=='paper' else 'futures'}",
@@ -6209,6 +6230,20 @@ def _hydrate_from_disk():
                         PAPER_POS_TF[tf] = sym
                 except Exception:
                     continue
+        # prune stale TF occupancy (no matching PAPER_POS entry)
+        try:
+            valid_tfs = set()
+            for k in (PAPER_POS or {}).keys():
+                try:
+                    _, tfx = k.split("|", 1)
+                    valid_tfs.add(tfx)
+                except Exception:
+                    continue
+            for tfk in list(PAPER_POS_TF.keys()):
+                if tfk not in valid_tfs:
+                    PAPER_POS_TF.pop(tfk, None)
+        except Exception:
+            pass
         _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
     except Exception as e:
         log(f"[HYDRATE] warn: {e}")
