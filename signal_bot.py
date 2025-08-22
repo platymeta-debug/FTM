@@ -13,6 +13,17 @@ import discord
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
 
+# [ANCHOR: DEBUG_FLAG_BEGIN]
+def _env_on(k: str, default="0") -> bool:
+    """Return True if env var looks like on: 1/true/yes/on (case-insensitive)."""
+    import os as _os
+    v = _os.getenv(k, default)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+# Global debug flag (safe default)
+DEBUG = _env_on("DEBUG")
+# [ANCHOR: DEBUG_FLAG_END]
+
 # [ANCHOR: ENV_CHAIN_BEGIN]
 def load_env_chain(paths=("key.env", "key.advanced.env", "token.env")):
     """
@@ -388,7 +399,9 @@ async def _choose_exec_price(symbol: str, tf: str, reason: str, side: str, trig_
     _ex_guard = FUT_EXCHANGE or PUB_FUT_EXCHANGE
     final_px = _exec_price_model(_ex_guard, symbol, tf, side, "exit", snap, bar1m, ref_override=float(base_px))
 
-    if DEBUG or os.getenv("FILL_MODEL_DEBUG","0") == "1":
+
+    if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+
         try:
             log(f"[FILL_MODEL] EXIT {symbol} {tf} side={side} reason={reason} ref={os.getenv('EXIT_PRICE_SOURCE','mark')} slp={_resolve_slippage_pct(symbol, tf, 'exit')}")
         except Exception:
@@ -4395,7 +4408,9 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         log(f"⏭ {symbol} {tf}: skip reason=GATEKEEPER")
         return
 
-    if DEBUG or os.getenv("FILL_MODEL_DEBUG","0") == "1":
+
+    if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+
         try:
             log(f"[GK] mode={TRIGGER_MODE} px_src(entry)={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} px_src(exit)={os.getenv('EXIT_PRICE_SOURCE','mark')} clamp={os.getenv('BAR_BOUND_CLAMP','1')}")
         except Exception:
@@ -4754,7 +4769,8 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         exec_price = _price_to_precision(_ex_guard, symbol, float(exec_price))
 
 
-    if DEBUG or os.getenv("FILL_MODEL_DEBUG","0") == "1":
+    if _env_on("DEBUG") or _env_on("FILL_MODEL_DEBUG"):
+
         try:
             log(f"[FILL_MODEL] ENTRY {symbol} {tf} side={side} ref={os.getenv('ENTRY_EXEC_PRICE_SOURCE','chosen')} slp={_resolve_slippage_pct(symbol, tf, 'entry')}")
         except Exception:
@@ -6318,7 +6334,6 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         key = _pp_key(symbol, tf, use_side)
         pos = PAPER_POS.get(key)
         if not pos: return None
-
         eff_side = (pos.get("side") or use_side or "").upper()
 
         entry = float(pos.get("entry_price") or pos.get("entry") or 0.0)
@@ -6352,7 +6367,6 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
 
 
         side_up = 1 if str(eff_side).upper() == "LONG" else -1
-
         gross_usdt = (float(exit_price) - float(entry)) * float(qty) * side_up
 
         # --- funding estimation (optional) ---
@@ -6381,6 +6395,7 @@ async def _paper_close(symbol: str, tf: str, exit_price: float, exit_reason: str
         else:
             fee_entry = 0.0
             fee_exit  = 0.0
+
 
         fees_usdt = float(fee_entry + fee_exit)
         if ESTIMATE_FUNDING_IN_PNL:
@@ -9261,6 +9276,55 @@ async def generate_pnl_pdf():
 
 
 
+# [ANCHOR] OLDSTYLE_REPORT_BEGIN
+async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
+    # 데이터/지표
+    df = get_ohlcv(symbol, tf, limit=300)
+    df = add_indicators(df)
+
+    # 차트/리포트 산출물
+    chart_files        = save_chart_groups(df, symbol, tf)           # 4장
+    score_file         = plot_score_history(symbol, tf)
+    perf_file          = analyze_performance_for(symbol, tf)
+    performance_file   = generate_performance_stats(tf, symbol=symbol)
+
+    # 간단 시그널 텍스트(과거 스타일): 최근 신호/스코어/가격
+    closed_price = get_closed_price(df, 'close')
+    try:
+        sig, _, _, _, _, score, *_ = calculate_signal(df, tf, symbol)
+    except Exception:
+        sig, score = None, None
+    head = f"📈 {symbol} · {tf} · {sig}  (score {score if score is not None else '—'})\n종가: ${closed_price:,.2f}"
+
+    # 포지션 요약(페이퍼+실선물 통합)
+    pos_lines = []
+    try:
+        for p in get_open_positions_iter():
+            pos_lines.append(
+                f"• {p['symbol']} · {p['tf']} · {p['side']} ×{int(p['lev'])}  @ ${p['entry_price']:,.2f} / qty {p['qty']:.4f}"
+            )
+    except Exception:
+        pass
+    pos_block = ("— open positions —\n" + "\n".join(pos_lines)) if pos_lines else "— open positions —\n(없음)"
+
+    content = f"{head}\n{pos_block}"
+
+    # 첨부 파일 구성 (존재 파일만)
+    files_list = [*chart_files, score_file, perf_file, performance_file]
+    pdf_path = None
+    if os.getenv("PDF_REPORT_ENABLE", "1") == "1":
+        try:
+            pdf_path = await generate_pnl_pdf()
+            if pdf_path:
+                files_list.append(pdf_path)
+        except Exception as e:
+            log(f"[REPORT] PDF gen warn: {e}")
+
+    files = [discord.File(p) for p in files_list if p and os.path.exists(p)]
+    await channel.send(content=content, files=files, silent=True)
+# [ANCHOR] OLDSTYLE_REPORT_END
+
+
 # ⬇️ while True 루프 위에 따로 정의
 async def send_timed_reports():
     await client.wait_until_ready()
@@ -9281,306 +9345,24 @@ async def send_timed_reports():
             except Exception as e:
                 log(f"PNL PDF send warn: {e}")
 
-            # (이하 기존 ETH/BTC 루프 계속)
 
+            # [ANCHOR] SEND_TIMED_REPORTS_LOOP
+            # ===== 단일 리포트 채널로 모아 전송 =====
+            try:
+                report_ch_id = int(os.getenv("PNL_REPORT_CHANNEL_ID", "0"))
+                if report_ch_id:
+                    ch = client.get_channel(report_ch_id)
+                else:
+                    ch = None
+                if not ch:
+                    log("⏭ 리포트 채널(PNL_REPORT_CHANNEL_ID) 미설정 → 자동 리포트 건너뜀")
+                else:
+                    for symbol in ("ETH/USDT", "BTC/USDT"):
+                        for tf in ('15m', '1h', '4h', '1d'):
+                            await _send_report_oldstyle(client, ch, symbol, tf)
+            except Exception as e:
+                log(f"[AUTO_REPORT_WARN] {e}")
 
-            timeframes = ['15m', '1h', '4h', '1d']
-
-            # ===== ETH 루프 =====
-            for tf in timeframes:
-                try:
-                    ch_id = CHANNEL_IDS.get(tf)  # 또는 CHANNEL_BTC.get(tf)
-                    if not ch_id or ch_id == 0:
-                        log(f"⏭ 채널 ID 없음: ETH {tf} 건너뜀")
-                        continue
-                    channel = client.get_channel(ch_id)
-                    if channel is None:
-                        log(f"❌ 채널 객체 없음: ETH {tf} (ID: {ch_id})")
-                        continue
-
-                    symbol_eth = 'ETH/USDT'
-                    key2 = _key2(symbol_eth, tf)
-
-                    # === Closed-candle snapshot (ETH) ===
-                    # (use closed candle to avoid intra-candle spikes)
-                    # 아래 df는 직후에 get_ohlcv로 다시 채워지므로, prelude는 get_ohlcv 이후 위치로 옮겨질 수 있음.
-
-
-                    # 1) 데이터/지표 준비
-                    df = get_ohlcv(symbol_eth, tf, limit=300)
-                    df = add_indicators(df)  # 차트 함수가 지표 컬럼을 사용하므로 미리 계산
-
-                    chart_files   = save_chart_groups(df, symbol_eth, tf)   # 4장
-
-                    score_file     = plot_score_history(symbol_eth, tf)
-                    perf_file      = analyze_performance_for(symbol_eth, tf)
-                    performance_file = generate_performance_stats(tf, symbol=symbol_eth)
-
-                    # 📌 닫힌 캔들의 종가(게이팅·신호 결정에 사용)
-                    closed_price = get_closed_price(df, 'close')
-                    if closed_price is None:
-                        log("⏭️ 닫힌 캔들 종가 없음 → 스킵")
-                        continue
-
-                    # 📌 닫힌 캔들 기준 타임스탬프(초)
-                    last_ts = get_closed_ts(df)
-                    if not last_ts:
-                        log("⏭️ 닫힌 캔들 타임스탬프 계산 실패 → 스킵")
-                        continue
-
-
-                    # 3) 일봉 변동률 계산
-                    if _len(df) == 0:
-                        log(f"⏭️ {symbol_eth} {tf} 보고서 생략: 데이터 없음")
-                        continue
-
-                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
-                    live_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
-                    display_price = live_price if isinstance(live_price, (int, float)) else closed_price
-                    # [ANCHOR: daily_change_unify_eth_alt]
-                    daily_change_pct = calc_daily_change_pct(symbol_eth, display_price)
-
-
-                    
-                    # 📍 ETH 진입 정보 주입
-
-                    _ep = entry_data.get(key2)
-
-                    entry_price_local = _ep[0] if _ep else None
-                    entry_time_local  = _ep[1] if _ep else None
-
-
-                    # Ichimoku 이미지 준비 (없으면 None)
-                    ichimoku_file = save_ichimoku_chart(df, symbol_eth, tf)  # 실패 시 함수가 None 반환
-
-                    main_msg_pdf, summary_msg_pdf, _ = format_signal_message(
-                        tf, signal, closed_price, pnl, reasons, df,
-                        entry_time=entry_price_local and entry_time_local,
-                        entry_price=entry_price_local,
-                        score=score,
-                        weights=weights, weights_detail=weights_detail,
-                        prev_score_value=previous_score.get(tf),
-                        agree_long=agree_long, agree_short=agree_short,
-                        symbol=symbol_eth,
-                        daily_change_pct=daily_change_pct,
-                        score_history=score_history.get(tf),
-                        recent_scores=score_history.get(tf),
-
-                        live_price=display_price,
-
-                        show_risk=False
-                    )
-
-
-                    # --- 강도/MTF 상태 기록 & 메시지 보강(ETH) ---
-                    _record_signal(symbol_eth, tf, signal, score)
-
-                    sf = _strength_factor(signal, score)
-                    mf, all_align = _mtf_factor(symbol_eth, tf, signal)
-                    align_text, agree_cnt, oppose_cnt = _mtf_alignment_text(symbol_eth, tf, signal)
-                    strength_label = _strength_label(signal, score)
-
-                    addon = (
-                        f"\n• 강도: {strength_label} (×{sf:.2f})"
-                        f"\n• 상위TF: {align_text} (×{mf:.2f})"
-                    )
-                    # ETH의 이 경로는 short_msg를 안 쓰므로 메인/요약에만 반영
-                    main_msg_pdf = addon + "\n" + main_msg_pdf
-                    summary_msg_pdf = addon + "\n" + summary_msg_pdf
-
-
-                    snap = await get_price_snapshot(symbol_eth)  # ETH/USDT
-                    display_price = snap.get("chosen") or snap.get("mid") or snap.get("last") or closed_price
-
-
-                    pdf_path = generate_pdf_report(
-                        df=df, tf=tf, symbol=symbol_eth,
-                        signal=signal, price=display_price, score=score,
-                        reasons=reasons, weights=weights,
-                        agree_long=agree_long, agree_short=agree_short,
-                        now=datetime.now(),
-                        chart_imgs=chart_files, ichimoku_img=ichimoku_file,
-                        daily_change_pct=daily_change_pct,
-                        discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
-                        entry_price=entry_price_local, entry_time=entry_time_local
-                    )
-                    
-
-                    # 현재 버킷(BUY/NEUTRAL/SELL)
-                    curr_bucket = _score_bucket(score, CFG)
-                    price_eth_now   = curr_price_eth
-                    # 게이팅 판정
-                    ok_to_send, why = _should_notify(
-                        tf, score, closed_price, curr_bucket, last_ts,
-                        last_sent_ts_eth, last_sent_bucket_eth, last_sent_score_eth, last_sent_price_eth
-                    )
-
-                    if not ok_to_send:
-                        log(f"🔕 ETH {tf} 억제: {why}")
-                        # 계산값(이전 상태)만 업데이트하고 전송은 생략해도 됨 — 선택
-                        previous_bucket[tf] = curr_bucket
-                        previous_score[tf]  = score
-                        previous_price[tf]  = closed_price   # 📌 닫힌 캔들 종가로 저장
-                        last_candle_ts_eth[tf] = last_ts     # 📌 닫힌 캔들 ts로 저장
-                        continue
-
-                    # 6) 전송
-                    # 보고서 안내 문구
-                    content = f"📄 {datetime.now():%m월 %d일 %p %I시} {symbol_eth} {tf} 보고서입니다."
-                    files = [p for p in [*(chart_files or []), ichimoku_file, pdf_path, score_file, perf_file, performance_file] if p and os.path.exists(p)]       
-                    await channel.send(
-                        content=main_msg_pdf,
-                        files=[discord.File(p) for p in chart_files if p],
-                        silent=True
-                    )
-
-                except Exception as e:
-                    # 채널이 None일 수 있어 안전 가드
-                    try:
-                        await channel.send(f"❌ ETH PDF 생성 실패: {e}")
-                    except Exception:
-                        log(f"❌ ETH PDF 생성 실패(채널 전송 불가): {e}")
-                    
-                    # 📌 전송 성공 후 마지막 전송 상태 업데이트 (닫힌 기준)
-                    last_sent_ts_eth[tf]     = last_ts
-                    last_sent_bucket_eth[tf] = curr_bucket
-                    last_sent_score_eth[tf]  = score
-                    last_sent_price_eth[tf]  = closed_price
-
-
-            # ===== BTC 루프 (교체) =====
-            for tf in TIMEFRAMES_BTC:
-                try:
-                    # 0) 채널 확인
-                    channel = _get_channel_or_skip('BTC', tf)  # 없으면 로그 남기고 skip
-                    if channel is None:
-                        continue
-
-                    symbol_btc = 'BTC/USDT'
-
-                    # 1) 데이터/지표
-                    df = await safe_get_ohlcv(symbol_btc, tf, limit=300)
-                    df = await safe_add_indicators(df)
-
-                    # 닫힌 캔들 기준 타임스탬프/가격 (게이팅·리포팅 공용)
-                    c_ts = get_closed_ts(df)
-                    if not c_ts:
-                        log(f"⏭️ 닫힌 캔들 ts 없음: BTC {tf} → skip")
-                        continue
-                    c_c  = get_closed_price(df, 'close')
-                    if c_c is None:
-                        log(f"⏭️ 닫힌 캔들 종가 없음: BTC {tf} → skip")
-                        continue
-
-                    # 2) 신호 계산 (ETH와 동일 시그니처)
-                    signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = \
-                        calculate_signal(df, tf, symbol_btc)
-
-
-                    snap = await get_price_snapshot(symbol_btc)  # BTC/USDT
-                    live_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
-                    display_price = live_price if isinstance(live_price, (int, float)) else c_c
-                    # [ANCHOR: daily_change_unify_btc]
-                    daily_change_pct = calc_daily_change_pct(symbol_btc, display_price)
-
-
-                    # 4) 진입 정보 (없으면 None)
-                    _epb = entry_data.get((symbol_btc, tf))  # (entry_price, entry_time)
-                    entry_price_local = _epb[0] if _epb else None
-                    entry_time_local  = _epb[1] if _epb else None
-
-                    # 5) 이미지 준비 (각 함수가 내부적으로 plt.close 처리)
-                    ichimoku_file    = save_ichimoku_chart(df, symbol_btc, tf)
-                    chart_files      = save_chart_groups(df, symbol_btc, tf)           # 묶음 차트
-                    score_file       = plot_score_history(symbol_btc, tf)              # 점수 히스토리
-                    perf_file        = analyze_performance_for(symbol_btc, tf)         # 누적 성과 그래프
-                    performance_file = generate_performance_stats(tf, symbol=symbol_btc)
-
-                    # 6) 메시지 (요약/본문/짧은 알림)
-                    main_msg_pdf, summary_msg_pdf, short_msg = format_signal_message(
-                        tf=tf, signal=signal, price=c_c, pnl=None, strength=reasons, df=df,
-                        entry_time=entry_time_local, entry_price=entry_price_local,
-                        score=score, weights=weights, weights_detail=weights_detail,
-                        prev_score_value=previous_score_btc.get(tf),
-                        agree_long=agree_long, agree_short=agree_short,
-                        recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-                        daily_change_pct=daily_change_pct,
-                        symbol=symbol_btc,
-
-                        live_price=display_price,
-
-                        show_risk=False
-                    )
-
-                    display_price = sanitize_price_for_tf(symbol_btc, tf, c_c)
-
-                    # (선택) PDF 생성 — 파일 목록에 같이 첨부
-                    try:
-                        display_price = sanitize_price_for_tf(symbol_btc, tf, c_c)
-                        pdf_path = generate_pdf_report(
-                            df=df, tf=tf, symbol=symbol_btc,
-                            signal=signal, price=display_price, score=score,
-                            reasons=reasons, weights=weights,
-                            agree_long=agree_long, agree_short=agree_short,
-                            now=datetime.now(),
-                            chart_imgs=chart_files, ichimoku_img=ichimoku_file,
-                            daily_change_pct=daily_change_pct,
-                            discord_message=(main_msg_pdf + "\n\n" + summary_msg_pdf),
-                            entry_price=entry_price_local, entry_time=entry_time_local
-                        )
-                    except Exception as e:
-                        log(f"PDF 생성 경고: {e}")
-                        pdf_path = None
-
-                    # 7) 알림 억제(게이팅)
-                    curr_bucket = _score_bucket(score, CFG)
-                    trigger_mode = trigger_mode_for(tf)
-                    await handle_trigger(symbol_btc, tf, trigger_mode, signal, display_price, c_ts, entry_data)
-                    ok_to_send, why = _should_notify(
-                        tf, score, c_c, curr_bucket, c_ts,
-                        last_sent_ts_btc, last_sent_bucket_btc, last_sent_score_btc, last_sent_price_btc
-                    )
-                    if not ok_to_send:
-                        log(f"🔕 BTC {tf} 억제: {why}")
-                        previous_bucket_btc[tf] = curr_bucket
-                        previous_score_btc[tf]  = score
-                        previous_price_btc[tf]  = float(c_c)
-                        last_candle_ts_btc[tf]  = c_ts
-                        continue
-
-                    # 8) 디스코드 전송
-                    try:
-                        await channel.send(content=short_msg)
-                        files_to_send = [p for p in [*(chart_files or []), ichimoku_file, score_file, perf_file, performance_file, pdf_path] if p and os.path.exists(p)]
-                        await channel.send(
-                            content=main_msg_pdf,
-                            files=[discord.File(p) for p in files_to_send] if files_to_send else None,
-                            silent=True
-                        )
-                        if len(summary_msg_pdf) > 1900:
-                            summary_msg_pdf = summary_msg_pdf[:1900] + "\n...(이하 생략)"
-                        await channel.send(summary_msg_pdf, silent=True)
-                    except Exception as e:
-                        log(f"❌ BTC 전송 오류: {e}")
-
-                    # 9) 상태 업데이트(‘발송 성공’ 시점)
-                    hist = score_history_btc.setdefault(tf, deque(maxlen=4))
-                    if not hist or round(score, 1) != hist[-1]:
-                        hist.append(round(score, 1))
-
-                    previous_signal[(symbol_btc, tf)] = signal
-                    previous_score_btc[tf]  = score
-                    previous_bucket_btc[tf] = curr_bucket
-                    previous_price_btc[tf]  = float(c_c)
-                    last_candle_ts_btc[tf]  = c_ts
-
-                    last_sent_ts_btc[tf]     = c_ts
-                    last_sent_bucket_btc[tf] = curr_bucket
-                    last_sent_score_btc[tf]  = score
-                    last_sent_price_btc[tf]  = float(c_c)
-
-                except Exception as e:
-                    log(f"⚠️ BTC 루프 오류: {e}")
 
             await asyncio.sleep(90)  # 중복 방지
 
@@ -10928,125 +10710,27 @@ async def on_message(message):
     # ===== PDF 리포트 =====
     elif message.content.startswith("!리포트"):
         parts = message.content.split()
-        try:
-            symbol, tf = parse_symbol_tf(parts, default_symbol='ETH/USDT', default_tf='1h')
-        except ValueError as ve:
-            await message.channel.send(f"❌ {ve}")
-            return
 
-        if generate_pdf_report is None:
-            await message.channel.send("❌ PDF 모듈 임포트에 실패했습니다. (generate_pdf_report=None)")
-            return
+        # 사용법: !리포트 ETH 1d  |  !리포트 BTC 15m
+        if len(parts) >= 3:
+            sym_in = parts[1].upper()
+            tf     = parts[2].lower()
+            symbol = "ETH/USDT" if sym_in in ("ETH","ETH/USDT") else ("BTC/USDT" if sym_in in ("BTC","BTC/USDT") else sym_in)
+            await _send_report_oldstyle(client, message.channel, symbol, tf)
+        else:
+            # 인자 없으면 PnL PDF만(과거 동작 유지)
 
-        # [ANCHOR: REPORT_PRICE_SNAPSHOT_BEGIN]
-        # 리포트에서도 전 TF와 동일한 '현재가 스냅샷'을 사용
-        try:
-            snap = await get_price_snapshot(symbol)
-            report_price = snap.get("chosen") or snap.get("mid") or snap.get("last")
-        except Exception:
-            report_price = None
-        try_live = None
-        try_close = None
-        # 마지막 보루: 스냅샷 실패 시 실시간/종가로 대체
-        if not isinstance(report_price, (int, float)):
             try:
-                try_live = fetch_live_price(symbol)
-                report_price = try_live
-            except Exception:
-                try_live = None
-        if not isinstance(report_price, (int, float)):
-            # df가 있으면 마지막 종가로
-            try:
-                _df_tmp = get_ohlcv(symbol, tf, limit=2)
-                if _df_tmp is not None and len(_df_tmp) > 0:
-                    try_close = float(_df_tmp['close'].iloc[-1])
-                    report_price = try_close
-            except Exception:
-                pass
-        # [ANCHOR: REPORT_PRICE_SNAPSHOT_END]
-        log(f"[REPORT] {symbol} {tf} price(report/live/close)={report_price}/{try_live}/{try_close}")
-
-        df = get_ohlcv(symbol, tf, limit=300)
-        df = add_indicators(df)
-
-        # 분할 차트 생성 (PDF/첨부 둘 다 사용)
-        chart_files   = save_chart_groups(df, symbol, tf)
-        ichimoku_file = save_ichimoku_chart(df, symbol, tf)
-
-        df_1d = get_ohlcv(symbol, '1d', limit=300)
-        signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol)
-
-        # 일봉 변동률 계산
-
-        display_price = report_price
-        # [ANCHOR: daily_change_unify_eth_alt]
-        daily_change_pct = calc_daily_change_pct(symbol, display_price)
-
-
-
-        main_msg_pdf, summary_msg_pdf, _short_msg_pdf = format_signal_message(
-            tf=tf,
-            signal=signal,
-            price=price,
-            pnl=None,
-            strength=reasons,
-            df=df,
-            entry_time=None,
-            entry_price=None,
-            score=score,
-            weights=weights,
-            weights_detail=weights_detail,
-            prev_score_value=None,
-            agree_long=agree_long,
-            agree_short=agree_short,
-            daily_change_pct=daily_change_pct,
-            live_price=report_price,
-            show_risk=False
-        )
-        msg_for_pdf = f"{main_msg_pdf}\n\n{summary_msg_pdf}"
-
-        # 🟢 심볼·타임프레임 인자를 다른 함수에도 반영
-        score_file = plot_score_history(symbol, tf)
-        perf_file  = analyze_performance_for(symbol, tf)
-        performance_file = generate_performance_stats(tf, symbol=symbol)
-
-        display_price = sanitize_price_for_tf(symbol, tf, price)
-
-        pdf_path = generate_pdf_report(
-            df=df,
-            tf=tf,
-            symbol=symbol,
-            signal=signal,
-            price=report_price,
-            score=score,
-            reasons=reasons,
-            weights=weights,
-            agree_long=agree_long,
-            agree_short=agree_short,
-            now=datetime.now(),
-            chart_imgs=chart_files,                 # ✅ 분할차트 리스트
-            ichimoku_img=ichimoku_file,             # ✅ 이치모쿠
-            discord_message=msg_for_pdf,
-            daily_change_pct=daily_change_pct
-        )
-
-
-        # 심볼별 로그 저장
-
-        log_to_csv(symbol, tf, signal, report_price, rsi, macd, None, None, None, score, reasons, weights)
-
-        # 빈 메시지 가드 적용
-        # 보고서 안내 문구
-        content = f"📄 요청하신 {symbol} {tf} 보고서입니다."
-        files = [p for p in [*chart_files, ichimoku_file, pdf_path, score_file, perf_file, performance_file] if p and os.path.exists(p)]
-        await message.channel.send(content=content, files=[discord.File(p) for p in files] if files else None)
-
-
+                pdf = await generate_pnl_pdf()
+                if pdf:
+                    await message.channel.send(content="📊 선물 체결·PnL 요약 리포트", file=discord.File(pdf), silent=True)
+            except Exception as e:
+                await message.channel.send(f"리포트 생성 오류: {e}")
 
     # ===== 신호 이력 조회 =====
     elif message.content.startswith("!이력"):
         tf = parts[1] if len(parts) > 1 else "1h"
-        import csv, glob, os
+        import csv, glob
         rows = []
 
         # 1) 우선 통합 로그가 있으면 그걸 사용
