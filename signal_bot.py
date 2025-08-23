@@ -192,6 +192,9 @@ symbol_btc = 'BTC/USDT'
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
 
+# 최근 분석에 사용된 DF 캐시 (대시보드 폴백용)
+_LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+
 # [ANCHOR: PAUSE_GLOBALS]
 KST = timezone(timedelta(hours=9))
 PAUSE_UNTIL = {}  # (symbol, tf) -> epoch_ms; "__ALL__" -> epoch_ms
@@ -9454,11 +9457,13 @@ def _struct_shortline(symbol: str, tf: str) -> str:
         rows = _load_ohlcv(symbol, tf, limit=240)
         df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
         if (df_struct is None) and (last_df := _LAST_DF_CACHE.get((symbol, tf))):
+
             if len(last_df) >= env_int("SCE_MIN_ROWS", 60):
                 df_struct = last_df.copy()
         df = df_struct
         if df is None or len(df) < 60:
             return f"{symbol} {tf}: 준비중"
+
         ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
         if ent and ent.get("ctx"):
             ctx = ent["ctx"]
@@ -9766,6 +9771,27 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                      "Reg/Fib: 보라/청록 점/점선 밴드")
             ax.text(0.01, 0.02, guide, transform=ax.transAxes, va="bottom", ha="left", fontsize=9,
                     bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="gray", alpha=0.8))
+
+        # [PATCH C1-BEGIN]  << overlay legend inset >>
+        try:
+            if os.getenv("CHART_STRUCT_GUIDE_ON_IMG", "1") == "1":
+                guide_lines = [
+                    "구조 해석 가이드",
+                    "• 수평레벨: 레벨↔가격 거리(ATR배수) 작을수록 반대포지션 위험↑",
+                    "• 추세선: 선 아래 종가마감=하향 유지, 상향선 재진입=스카웃",
+                    "• 회귀채널: 상단=롱 익절/숏 관심, 하단=숏 익절/분할매수 관심",
+                    "• 피보채널: 0.382/0.618/1.0 접촉 시 반응/돌파 체크",
+                    "• 컨플루언스: 다중 레벨이 ATR×ε 내 겹치면 신뢰도↑",
+                ]
+                text = "\n".join(guide_lines)
+                ax.text(
+                    0.01, 0.02, text,
+                    transform=ax.transAxes, va="bottom", ha="left", fontsize=10,
+                    bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="gray", alpha=0.75)
+                )
+        except Exception as _e:
+            log(f"[STRUCT_LEGEND_ON_IMG_WARN] {type(_e).__name__}: {_e}")
+        # [PATCH C1-END]
 
         out = os.path.join(save_dir, f"struct_{symbol.replace('/','-')}_{tf}_{int(time.time())}.png")
         fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.98])
@@ -11307,9 +11333,11 @@ async def on_ready():
                 except Exception:
                     df_struct = None
 
+
                 # 폴백: 기존 분석에 사용된 df로 대체 (최소행수 만족 시)
                 if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
                     df_struct = df.copy()
+
 
                 struct_info = None
                 struct_img  = None
@@ -11844,6 +11872,7 @@ async def on_ready():
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
+
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
                     rows = _load_ohlcv(symbol_btc, tf, limit=400)
@@ -11851,8 +11880,10 @@ async def on_ready():
                 except Exception:
                     df_struct = None
 
+
                 if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
                     df_struct = df.copy()
+
 
                 struct_info = None
                 struct_img  = None
@@ -12028,6 +12059,7 @@ async def on_message(message):
                 df = (_LAST_DF_CACHE.get((symbol, tf)) if '_LAST_DF_CACHE' in globals() else None)
 
             # 2) 로컬 분석 df 폴백
+
             if (df is None or len(df) < env_int("SCE_MIN_ROWS", 60)) and '_LAST_DF_CACHE' in globals():
                 df = _LAST_DF_CACHE.get((symbol, tf))
 
@@ -12037,6 +12069,7 @@ async def on_message(message):
                 df = _sce_build_df_from_ohlcv(rows) if rows else None
 
             if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
+
                 await ch.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족(입력/네트워크 실패)")
                 return
 
