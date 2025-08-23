@@ -15,7 +15,7 @@ import discord
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
 from zoneinfo import ZoneInfo
-import datetime as dt
+
 
 # [ANCHOR: DEBUG_FLAG_BEGIN]
 def _env_on(k: str, default="0") -> bool:
@@ -9453,10 +9453,11 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
                     df2 = _df_fb
             except Exception as e:
                 log(f"[SCE_FALLBACK_WARN] {symbol} {tf} reload fail: {e}")
-        # 3) 최종 부족 시 안내 + 길이 로깅
-        if df2 is None or len(df2) < MIN_ROWS:
-            log(f"[SCE_SHORT] {symbol} {tf} rows={0 if df2 is None else len(df2)} < {MIN_ROWS}")
-            return "◼ 구조 컨텍스트\n- 데이터 부족"
+
+        # 3) 최종 부족 시 안내 + 길이 로깅 (표시는 생략)
+        if df2 is None or _len(df2) < MIN_ROWS:
+            log(f"[SCE_SHORT] {symbol} {tf} rows={0 if df2 is None else _len(df2)} < {MIN_ROWS}")
+            return ""
         if ctx is None:
             ctx = build_struct_context_basic(df2, tf)
 
@@ -9493,13 +9494,15 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
             lines.append(f"- 협곡: {cats['GAP'][0]}")
 
         return "\n".join(lines)
-    except Exception as e:
-        return f"◼ 구조 컨텍스트\n- 생성 실패: {type(e).__name__}"
 
+    except Exception:
+        # 실패 시에도 표시 생략
+        return ""
 # ==============================================================================
 
 def _render_struct_legend(ctx: dict, tf: str) -> str:
-    if os.getenv("STRUCT_LEGEND_ENABLE", "1") != "1":
+    if os.getenv("STRUCT_LEGEND_ENABLE", "0") != "1":
+
         return ""
     lines = [
         "",
@@ -9637,7 +9640,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
         score  = 0.0
         reasons, weights = [], {}
         agree_long = agree_short = 0
-        now = dt.datetime.now(tz=ZoneInfo(REPORT_PDF_TIMEZONE))
+        now = datetime.datetime.now(tz=ZoneInfo(REPORT_PDF_TIMEZONE))
         outdir = os.getenv("STRUCT_IMG_DIR", "./charts")
         os.makedirs(outdir, exist_ok=True)
         outfile = os.path.join(outdir, f"REPORT_{symbol.replace('/','-')}_{tf}_{now.strftime('%Y%m%d_%H%M')}.pdf")
@@ -9876,7 +9879,7 @@ async def _report_scheduler_loop(client):
 
     while True:
         try:
-            now = dt.datetime.now(tz=tz)
+            now = datetime.datetime.now(tz=tz)
             stamp = now.strftime("%Y-%m-%d %H:%M")
             hhmm  = now.strftime("%H:%M")
             if hhmm in times and stamp not in sent_mark:
@@ -9894,7 +9897,7 @@ async def _report_scheduler_loop(client):
                 sent_mark.add(stamp)
             # 오래된 마크 정리(24h)
             if len(sent_mark) > 64:
-                cutoff = (now - dt.timedelta(days=2)).strftime("%Y-%m-%d")
+                cutoff = (now - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
                 sent_mark = {m for m in sent_mark if m[:10] >= cutoff}
         except Exception as e:
             log(f"[REPORT_SCHED_WARN] {type(e).__name__}: {e}")
@@ -11096,7 +11099,6 @@ async def on_ready():
                 df_struct = None
                 struct_info = None
                 struct_img = None
-
                 # 캐시 조회(동일 캔들 재사용)
                 rows = _load_ohlcv(symbol_eth, tf, limit=400)
                 df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
@@ -11178,17 +11180,14 @@ async def on_ready():
                     show_risk=False
                 )
                 struct_block = None
-                # 구조 컨텍스트 섹션 프리펜드
+
+                # 상단(메인)에는 구조 블록 미삽입
                 try:
                     struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
-
-                    legend_block = _render_struct_legend(struct_info or {}, tf)
-                    main_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{main_msg_pdf}"
-
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_eth} {tf} main {type(_e).__name__}: {_e}")
 
-                # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
+                # 구조 컨텍스트는 요약 하단에만 append
                 try:
 
                     # 캐시에 ctx가 있으면 재사용
@@ -11200,7 +11199,9 @@ async def on_ready():
                     if struct_block is None:
                         struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
                     legend_block = _render_struct_legend(struct_info or {}, tf)
-                    summary_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{summary_msg_pdf}"
+                    # 하단 append, 내용이 있을 때만
+                    if struct_block and struct_block.strip():
+                        summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block}{('\n'+legend_block) if legend_block else ''}"
 
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_eth} {tf} summary {type(_e).__name__}: {_e}")
@@ -11625,7 +11626,6 @@ async def on_ready():
                       show_risk=False
                   )
 
-
                 chart_files = save_chart_groups(df, symbol_btc, tf)
                 df_struct = None
                 struct_info = None
@@ -11653,16 +11653,13 @@ async def on_ready():
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
 
                 struct_block = None
-                # 구조 컨텍스트 섹션 프리펜드
+
                 try:
                     struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
-                    legend_block = _render_struct_legend(struct_info or {}, tf)
-                    main_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{main_msg_pdf}"
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} main {type(_e).__name__}: {_e}")
 
-
-                # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
+                # 구조 컨텍스트는 요약 하단에만 append
                 try:
                     # 캐시에 ctx가 있으면 재사용
                     if struct_info is None and df_struct is not None:
@@ -11671,9 +11668,8 @@ async def on_ready():
                             struct_info = cache_ent.get("ctx")
                     if struct_block is None:
                         struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
-
-                    legend_block = _render_struct_legend(struct_info or {}, tf)
-                    summary_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{summary_msg_pdf}"
+                    if struct_block and struct_block.strip():
+                        summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block}"
 
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} summary {type(_e).__name__}: {_e}")
