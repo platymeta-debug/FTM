@@ -17,6 +17,7 @@ import asyncio  # ✅ 이 줄을 꼭 추가
 from zoneinfo import ZoneInfo
 import datetime as dt
 
+
 # [ANCHOR: DEBUG_FLAG_BEGIN]
 def _env_on(k: str, default="0") -> bool:
     """Return True if env var looks like on: 1/true/yes/on (case-insensitive)."""
@@ -6157,7 +6158,9 @@ async def _discord_send_chunked(channel, text: str, *, files=None, silent: bool 
         return ids
     except Exception as e:
         # 50035 등 폴백: 하드 컷
+
         # ✅ 첨부는 Part 1에만 붙이고, 이후 파트는 텍스트만 보냄
+
         if ("50035" in str(e)) or ("Must be 2000" in str(e)):
             try:
                 hard = text[:1900]
@@ -9385,6 +9388,7 @@ def _struct_shortline(symbol: str, tf: str) -> str:
     • 최근접 저항/지지 거리(ATR배수) + 구조 사유 1~2개 요약
     """
     try:
+
         # 캐시 우선
         rows = _load_ohlcv(symbol, tf, limit=240)
         df = _sce_build_df_from_ohlcv(rows) if rows else None
@@ -9396,6 +9400,7 @@ def _struct_shortline(symbol: str, tf: str) -> str:
         else:
             ctx = build_struct_context_basic(df, tf)
             _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, ent.get("img") if ent else None)
+
         near = ctx.get("nearest") or {}
         res, sup = near.get("res"), near.get("sup")
         bits = []
@@ -9450,6 +9455,7 @@ async def _dash_struct_block() -> list[str]:
     return out
 
 
+
 # === SCE text render for analysis messages ====================================
 def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
     """
@@ -9460,6 +9466,7 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
     - 컨플루언스/협곡
     """
     try:
+
         # --- 폴백/최소행수 파라미터 ---
         MIN_ROWS = int(os.getenv("SCE_MIN_ROWS", "60"))
         LIMIT    = int(os.getenv("SCE_FETCH_LIMIT", "400"))
@@ -9479,12 +9486,14 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
                     df2 = _df_fb
             except Exception as e:
                 log(f"[SCE_FALLBACK_WARN] {symbol} {tf} reload fail: {e}")
+
         # 3) 최종 부족 시 안내 + 길이 로깅 (표시는 생략)
         if df2 is None or _len(df2) < MIN_ROWS:
             log(f"[SCE_SHORT] {symbol} {tf} rows={0 if df2 is None else _len(df2)} < {MIN_ROWS}")
             return ""
         if ctx is None:
             ctx = build_struct_context_basic(df2, tf)
+
 
         lines = ["◼ 구조 컨텍스트"]
         near = (ctx.get("nearest") or {})
@@ -9518,6 +9527,7 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
             lines.append(f"- 협곡: {cats['GAP'][0]}")
 
         return "\n".join(lines)
+
     except Exception:
         # 실패 시에도 표시 생략
         return ""
@@ -9525,6 +9535,7 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
 
 def _render_struct_legend(ctx: dict, tf: str) -> str:
     if os.getenv("STRUCT_LEGEND_ENABLE", "0") != "1":
+
         return ""
     lines = [
         "",
@@ -9536,6 +9547,7 @@ def _render_struct_legend(ctx: dict, tf: str) -> str:
         "• 컨플루언스: 다중 레벨이 ATR×ε 내 겹치면 신뢰도↑",
     ]
     return "\n".join(lines)
+
 
 
 
@@ -9641,6 +9653,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
 # ==============================================================================
 
 
+
 async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
     """심볼/TF 한 쌍에 대한 PDF를 생성하고 첨부로 전송."""
     try:
@@ -9652,8 +9665,10 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
 
         # SCE 컨텍스트/오버레이
         struct_info = build_struct_context_basic(df, tf)
+
         async with RENDER_SEMA:
             struct_img  = await asyncio.to_thread(render_struct_overlay, symbol, tf, df, struct_info)
+
 
         # 기본 값들(필요 최소치만)
         signal = "REPORT"
@@ -9661,12 +9676,15 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
         score  = 0.0
         reasons, weights = [], {}
         agree_long = agree_short = 0
+
         now = dt.datetime.now(tz=ZoneInfo(REPORT_PDF_TIMEZONE))
+
         outdir = os.getenv("STRUCT_IMG_DIR", "./charts")
         os.makedirs(outdir, exist_ok=True)
         outfile = os.path.join(outdir, f"REPORT_{symbol.replace('/','-')}_{tf}_{now.strftime('%Y%m%d_%H%M')}.pdf")
 
         # PDF 생성
+
         async with RENDER_SEMA:
             pdf_path = await asyncio.to_thread(
                 generate_pdf_report,
@@ -9678,6 +9696,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 symbol=symbol, entry_price=None, entry_time=None,
                 struct_info=struct_info, struct_img=struct_img
             )
+
         # 전송
         if pdf_path and os.path.exists(pdf_path):
             cap = f"[PDF] {symbol} {tf} • {now.strftime('%Y-%m-%d %H:%M')} ({REPORT_PDF_TIMEZONE})"
@@ -9690,6 +9709,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
             await channel.send(content=f"[REPORT] {symbol} {tf}: 오류 {type(e).__name__}")
         except Exception:
             pass
+
 
 
 async def _dash_render_text():
@@ -9901,7 +9921,9 @@ async def _report_scheduler_loop(client):
 
     while True:
         try:
+
             now = dt.datetime.now(tz=tz)
+
             stamp = now.strftime("%Y-%m-%d %H:%M")
             hhmm  = now.strftime("%H:%M")
             if hhmm in times and stamp not in sent_mark:
@@ -9919,11 +9941,14 @@ async def _report_scheduler_loop(client):
                 sent_mark.add(stamp)
             # 오래된 마크 정리(24h)
             if len(sent_mark) > 64:
+
                 cutoff = (now - dt.timedelta(days=2)).strftime("%Y-%m-%d")
+
                 sent_mark = {m for m in sent_mark if m[:10] >= cutoff}
         except Exception as e:
             log(f"[REPORT_SCHED_WARN] {type(e).__name__}: {e}")
         await asyncio.sleep(20)
+
 
 
 async def _loop_jitter_watchdog():
@@ -9936,6 +9961,7 @@ async def _loop_jitter_watchdog():
         if drift > thr_ms:
             log(f"[LOOP_JITTER_WARN] drift={drift:.0f}ms")
         last = now
+
 
 
 async def _sync_open_state_on_ready():
@@ -10812,8 +10838,10 @@ async def on_ready():
     except Exception as e:
         log(f"[REPORT_SCHED_ERR] {e}")
 
+
     # 루프 지터 워치독 시작
     asyncio.create_task(_loop_jitter_watchdog())
+
 
     while True:
         try:
@@ -11133,8 +11161,10 @@ async def on_ready():
                     elif previous == 'SELL' and signal == 'BUY':
                         pnl = ((entry_price - price) / entry_price) * 100
 
+
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
+
                 df_struct = None
                 struct_info = None
                 struct_img = None
@@ -11151,6 +11181,7 @@ async def on_ready():
                     if struct_info is None and df_struct is not None:
                         struct_info = build_struct_context_basic(df_struct, tf)
                     if struct_img is None and df_struct is not None and struct_info is not None:
+
                         async with RENDER_SEMA:
                             struct_img = await asyncio.to_thread(render_struct_overlay, symbol_eth, tf, df_struct, struct_info)
                     # 캐시에 기록
@@ -11159,6 +11190,7 @@ async def on_ready():
                     if struct_img:
                         # 오버레이를 첫 번째 첨부로(가시성↑)
                         chart_files = [struct_img] + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
 
@@ -11218,6 +11250,7 @@ async def on_ready():
                     show_risk=False
                 )
                 struct_block = None
+
                 try:
                     struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
                     legend_block = _render_struct_legend(struct_info or {}, tf)
@@ -11230,15 +11263,18 @@ async def on_ready():
 
                 # 구조 컨텍스트는 요약 하단에 append
                 try:
+
                     # 캐시에 ctx가 있으면 재사용
                     if struct_info is None and df_struct is not None:
                         cache_ent = _struct_cache_get(symbol_eth, tf, _df_last_ts(df_struct))
                         if cache_ent:
                             struct_info = cache_ent.get("ctx")
+
                     struct_block_sum = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
                     legend_block = _render_struct_legend(struct_info or {}, tf)
                     if struct_block_sum and struct_block_sum.strip():
                         summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block_sum}{('\n'+legend_block) if legend_block else ''}"
+
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_eth} {tf} summary {type(_e).__name__}: {_e}")
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
@@ -11662,8 +11698,10 @@ async def on_ready():
                       show_risk=False
                   )
 
+
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
+
                 df_struct = None
                 struct_info = None
                 struct_img = None
@@ -11680,8 +11718,10 @@ async def on_ready():
                     if struct_info is None and df_struct is not None:
                         struct_info = build_struct_context_basic(df_struct, tf)
                     if struct_img is None and df_struct is not None and struct_info is not None:
+
                         async with RENDER_SEMA:
                             struct_img = await asyncio.to_thread(render_struct_overlay, symbol_btc, tf, df_struct, struct_info)
+
                     if df_struct is not None and struct_info is not None:
                         _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
                     if struct_img:
@@ -11701,22 +11741,26 @@ async def on_ready():
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} main {type(_e).__name__}: {_e}")
 
                 # 구조 컨텍스트는 요약 하단에 append
+
                 try:
                     # 캐시에 ctx가 있으면 재사용
                     if struct_info is None and df_struct is not None:
                         cache_ent = _struct_cache_get(symbol_btc, tf, _df_last_ts(df_struct))
                         if cache_ent:
                             struct_info = cache_ent.get("ctx")
+
                     struct_block_sum = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
                     legend_block = _render_struct_legend(struct_info or {}, tf)
                     if struct_block_sum and struct_block_sum.strip():
                         summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block_sum}{('\n'+legend_block) if legend_block else ''}"
+
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} summary {type(_e).__name__}: {_e}")
 
                 channel = _get_channel_or_skip('BTC', tf)
                 if channel is None:
                     continue
+
 
                 # 1) 짧은 알림(푸시용)
                 await channel.send(content=short_msg)
@@ -12191,6 +12235,7 @@ async def on_message(message):
         async with RENDER_SEMA:
             chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
 
+
         # [SCE] 수동 명령에도 구조 컨텍스트/오버레이 적용
         df_struct = None
         struct_info = None
@@ -12204,8 +12249,10 @@ async def on_message(message):
                 confluence_eps=float(os.getenv("STRUCT_EPS", "0.4")),
             )
             if os.getenv("STRUCT_OVERLAY_IMAGE", "1") == "1":
+
                 async with RENDER_SEMA:
                     struct_img = await asyncio.to_thread(render_struct_overlay, symbol, tf, df_struct, struct_info)
+
                 if struct_img:
                     chart_files = [struct_img] + list(chart_files)
         except Exception as _e:
@@ -12220,6 +12267,7 @@ async def on_message(message):
                 summary_msg_pdf = f"{summary_msg_pdf}\n\n{sb}"
         except Exception as _e:
             log(f"[STRUCT_CMD_SECT_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
+
 
         await _discord_send_chunked(
             message.channel,
