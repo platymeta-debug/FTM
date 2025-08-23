@@ -9344,6 +9344,7 @@ def _struct_shortline(symbol: str, tf: str) -> str:
     • 최근접 저항/지지 거리(ATR배수) + 구조 사유 1~2개 요약
     """
     try:
+
         # 캐시 우선
         rows = _load_ohlcv(symbol, tf, limit=240)
         df = _sce_build_df_from_ohlcv(rows) if rows else None
@@ -9355,6 +9356,7 @@ def _struct_shortline(symbol: str, tf: str) -> str:
         else:
             ctx = build_struct_context_basic(df, tf)
             _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, ent.get("img") if ent else None)
+
         near = ctx.get("nearest") or {}
         res, sup = near.get("res"), near.get("sup")
         bits = []
@@ -9407,6 +9409,7 @@ async def _dash_struct_block() -> list[str]:
     except Exception as e:
         out.append(f"(구조 요약 생성 실패: {type(e).__name__})")
     return out
+
 
 
 # === SCE text render for analysis messages ====================================
@@ -9564,6 +9567,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
         log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
         return None
 # ==============================================================================
+
 
 
 async def _dash_render_text():
@@ -10953,6 +10957,7 @@ async def on_ready():
                 df_struct = None
                 struct_info = None
                 struct_img = None
+
                 # 캐시 조회(동일 캔들 재사용)
                 rows = _load_ohlcv(symbol_eth, tf, limit=400)
                 df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
@@ -10970,6 +10975,7 @@ async def on_ready():
                     # 캐시에 기록
                     if df_struct is not None and struct_info is not None:
                         _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
+
                     if struct_img:
                         chart_files = list(chart_files) + [struct_img]
                 except Exception as _e:
@@ -11040,11 +11046,13 @@ async def on_ready():
 
                 # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
                 try:
+
                     # 캐시에 ctx가 있으면 재사용
                     if struct_info is None and df_struct is not None:
                         cache_ent = _struct_cache_get(symbol_eth, tf, _df_last_ts(df_struct))
                         if cache_ent:
                             struct_info = cache_ent.get("ctx")
+
                     if struct_block is None:
                         struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
                     summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
@@ -11471,6 +11479,8 @@ async def on_ready():
                       show_risk=False
                   )
 
+
+
                 chart_files = save_chart_groups(df, symbol_btc, tf)
                 df_struct = None
                 struct_info = None
@@ -11520,6 +11530,7 @@ async def on_ready():
                 channel = _get_channel_or_skip('BTC', tf)
                 if channel is None:
                     continue
+
 
                 # 1) 짧은 알림(푸시용)
                 await channel.send(content=short_msg)
