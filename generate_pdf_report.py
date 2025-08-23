@@ -275,7 +275,7 @@ def generate_pdf_report(
             elements += [Image(struct_img, width=16*cm, height=8*cm), Spacer(1, 0.4*cm)]
 
         # 구조 해석 가이드(표준 문구)
-        elements += _struct_legend_pdf()
+        elements += _struct_legend_pdf("STRUCT_PDF_SHOW_LEGEND")
 
     # 최근 신호
     elements.append(_para("◼ 최근 신호 이력", size=13, bold=True))
