@@ -9422,13 +9422,33 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
     - 컨플루언스/협곡
     """
     try:
+
+        # --- 폴백/최소행수 파라미터 ---
+        MIN_ROWS = int(os.getenv("SCE_MIN_ROWS", "60"))
+        LIMIT    = int(os.getenv("SCE_FETCH_LIMIT", "400"))
+        rows = None
+        # 1) 입력 df 우선 사용, 없으면 로더
         if df is None:
-            rows = _load_ohlcv(symbol, tf, limit=400)
-            if not rows or len(rows) < 60:
-                return "◼ 구조 컨텍스트\n- 데이터 부족"
-            df = _sce_build_df_from_ohlcv(rows)
+            rows = _load_ohlcv(symbol, tf, limit=LIMIT)
+            df2  = _sce_build_df_from_ohlcv(rows) if rows else None
+        else:
+            df2 = df
+        # 2) 폴백: 로더 부족 시 메인 분석 df를 강제 재사용
+        if df2 is None or len(df2) < MIN_ROWS:
+            try:
+                _rows_fb = _load_ohlcv(symbol, tf, limit=LIMIT)
+                _df_fb   = _sce_build_df_from_ohlcv(_rows_fb) if _rows_fb else None
+                if _df_fb is not None and len(_df_fb) >= MIN_ROWS:
+                    df2 = _df_fb
+            except Exception as e:
+                log(f"[SCE_FALLBACK_WARN] {symbol} {tf} reload fail: {e}")
+        # 3) 최종 부족 시 안내 + 길이 로깅
+        if df2 is None or len(df2) < MIN_ROWS:
+            log(f"[SCE_SHORT] {symbol} {tf} rows={0 if df2 is None else len(df2)} < {MIN_ROWS}")
+            return "◼ 구조 컨텍스트\n- 데이터 부족"
         if ctx is None:
-            ctx = build_struct_context_basic(df, tf)
+            ctx = build_struct_context_basic(df2, tf)
+
 
         lines = ["◼ 구조 컨텍스트"]
         near = (ctx.get("nearest") or {})
@@ -9464,7 +9484,24 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
         return "\n".join(lines)
     except Exception as e:
         return f"◼ 구조 컨텍스트\n- 생성 실패: {type(e).__name__}"
-# ============================================================================== 
+
+# ==============================================================================
+
+def _render_struct_legend(ctx: dict, tf: str) -> str:
+    if os.getenv("STRUCT_LEGEND_ENABLE", "1") != "1":
+        return ""
+    lines = [
+        "",
+        "🔎 **구조 해석 가이드**",
+        "• 수평레벨: 가격↔레벨 거리(ATR배수) 작을수록 반대포지션 위험↑",
+        "• 추세선: 선 아래 종가마감=하향 유지, 상향선 재진입=스카웃",
+        "• 회귀채널: 상단=롱 익절/숏 관심, 하단=숏 익절/분할매수 관심",
+        "• 피보채널: 0.382/0.618/1.0 평행선 접촉 시 반응/돌파 체크",
+        "• 컨플루언스: 다중 레벨이 ATR×ε 내 겹치면 신뢰도↑",
+    ]
+    return "\n".join(lines)
+
+
 
 
 # === Structure overlay renderer (matplotlib) ==================================
@@ -10977,7 +11014,9 @@ async def on_ready():
                         _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
 
                     if struct_img:
-                        chart_files = list(chart_files) + [struct_img]
+                        # 오버레이를 첫 번째 첨부로(가시성↑)
+                        chart_files = [struct_img] + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
 
@@ -11040,7 +11079,10 @@ async def on_ready():
                 # 구조 컨텍스트 섹션 프리펜드
                 try:
                     struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
-                    main_msg_pdf = f"{struct_block}\n\n{main_msg_pdf}"
+
+                    legend_block = _render_struct_legend(struct_info or {}, tf)
+                    main_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{main_msg_pdf}"
+
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_eth} {tf} main {type(_e).__name__}: {_e}")
 
@@ -11055,7 +11097,9 @@ async def on_ready():
 
                     if struct_block is None:
                         struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
-                    summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
+                    legend_block = _render_struct_legend(struct_info or {}, tf)
+                    summary_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{summary_msg_pdf}"
+
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_eth} {tf} summary {type(_e).__name__}: {_e}")
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
@@ -11480,7 +11524,6 @@ async def on_ready():
                   )
 
 
-
                 chart_files = save_chart_groups(df, symbol_btc, tf)
                 df_struct = None
                 struct_info = None
@@ -11502,7 +11545,8 @@ async def on_ready():
                     if df_struct is not None and struct_info is not None:
                         _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
                     if struct_img:
-                        chart_files = list(chart_files) + [struct_img]
+                        # 오버레이를 첫 번째 첨부로(가시성↑)
+                        chart_files = [struct_img] + list(chart_files)
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
 
@@ -11510,9 +11554,11 @@ async def on_ready():
                 # 구조 컨텍스트 섹션 프리펜드
                 try:
                     struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
-                    main_msg_pdf = f"{struct_block}\n\n{main_msg_pdf}"
+                    legend_block = _render_struct_legend(struct_info or {}, tf)
+                    main_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{main_msg_pdf}"
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} main {type(_e).__name__}: {_e}")
+
 
                 # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
                 try:
@@ -11523,7 +11569,10 @@ async def on_ready():
                             struct_info = cache_ent.get("ctx")
                     if struct_block is None:
                         struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
-                    summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
+
+                    legend_block = _render_struct_legend(struct_info or {}, tf)
+                    summary_msg_pdf = f"{struct_block}{('\n'+legend_block) if legend_block else ''}\n\n{summary_msg_pdf}"
+
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} summary {type(_e).__name__}: {_e}")
 
@@ -11992,16 +12041,20 @@ async def on_message(message):
         
 
         chart_files = save_chart_groups(df, symbol, tf)  # 분할 4장
-        await message.channel.send(
-            content=main_msg_pdf,
+        await _discord_send_chunked(
+            message.channel,
+            main_msg_pdf,
             files=[discord.File(p) for p in chart_files if p],
-            silent=True
+            silent=True,
+            header_prefix=f"{symbol.split('/')[0]}-{tf}-Analysis"
         )
 
-
-        if len(summary_msg_pdf) > 1900:
-            summary_msg_pdf = summary_msg_pdf[:1900] + "\n...(이하 생략)"
-        await message.channel.send(summary_msg_pdf, silent=True) # ← 조용히
+        await _discord_send_chunked(
+            message.channel,
+            summary_msg_pdf,
+            silent=True,
+            header_prefix=f"{symbol.split('/')[0]}-{tf}-Summary"
+        )
 
 
     # ===== PDF 리포트 =====
