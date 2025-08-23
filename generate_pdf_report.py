@@ -195,6 +195,22 @@ def _struct_snapshot_table(struct_info: dict|None):
         rows.append(["최근접지지", f"{float(sup[1]):.2f}", f"{float(sup[2]):.2f}", ""])
     return rows
 
+def _struct_legend_pdf(enable_env: str = "STRUCT_LEGEND_ENABLE") -> list:
+    """구조 해석 가이드(표준 문구). ENV로 on/off 가능."""
+    import os
+    if os.getenv(enable_env, "1") != "1":
+        return []
+    lines = [
+        "🔎 구조 해석 가이드",
+        "• 수평레벨: 가격↔레벨 거리(ATR배수)가 작을수록 반대포지션 위험↑",
+        "• 추세선: 하락선 위 종가마감=돌파, 상승선 아래 종가마감=이탈",
+        "• 회귀채널: 상단=롱 익절/숏 관심, 하단=숏 익절/분할매수 관심",
+        "• 피보채널: 0.382/0.618/1.0 접촉 시 반응·돌파 체크",
+        "• 컨플루언스: 다중 레벨이 ATR×ε 이내로 겹치면 신뢰도↑",
+    ]
+    p = _para("\n".join(lines), size=9, leading=12)
+    return [Spacer(1, 0.2*cm), p, Spacer(1, 0.4*cm)]
+
 # ===== PDF 생성 =====
 def generate_pdf_report(
     df, tf, signal, price, score, reasons, weights,
@@ -257,6 +273,9 @@ def generate_pdf_report(
             elements += [st, Spacer(1, 0.5*cm)]
         if struct_img and os.path.exists(struct_img):
             elements += [Image(struct_img, width=16*cm, height=8*cm), Spacer(1, 0.4*cm)]
+
+        # 구조 해석 가이드(표준 문구)
+        elements += _struct_legend_pdf()
 
     # 최근 신호
     elements.append(_para("◼ 최근 신호 이력", size=13, bold=True))
