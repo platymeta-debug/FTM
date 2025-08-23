@@ -9364,6 +9364,7 @@ async def _dash_struct_block() -> list[str]:
     return out
 
 
+
 # === SCE text render for analysis messages ====================================
 def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
     """
@@ -9519,6 +9520,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
         log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
         return None
 # ==============================================================================
+
 
 
 async def _dash_render_text():
