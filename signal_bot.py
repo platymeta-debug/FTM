@@ -4815,11 +4815,14 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             if scale_factor < 0.999:
                 eff_margin = float(eff_margin) * float(scale_factor)
                 qty        = (float(eff_margin) * float(lev_used or 1.0)) / max(price_ref, 1e-9)
+
                 EXEC_STATE[("coh_tags", symbol, tf)] = ",".join(reason_tags)
+
                 log(f"[COHERENCE] {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
     except Exception as e:
         log(f"[COHERENCE_WARN] {symbol} {tf} {e}")
 # [PATCH NEG/CCA GATE END — maybe_execute_trade]
+
     # [PATCH SAT APPLY BEGIN — maybe_execute_trade]
     try:
         side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
@@ -4841,6 +4844,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     except Exception as e:
         log(f"[STYLE_WARN] {symbol} {tf} {e}")
     # [PATCH SAT APPLY END — maybe_execute_trade]
+
     _pb_label   = alloc.get("pb_label")
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
@@ -6508,6 +6512,7 @@ def _best_opposite_score(symbol: str, side: str) -> float:
     return float(best)
 # [PATCH NEG/CCA HELPERS END]
 
+
 # [PATCH SAT HELPERS BEGIN]
 def _ind(symbol:str, tf:str, key:str, default:float=0.0) -> float:
     """지표 캐시 EXEC_STATE에서 안전하게 값 로드."""
@@ -6654,6 +6659,7 @@ def _style_sl_tp(symbol:str, tf:str, side:str, entry_price:float, ref_price:floa
         "atr_mult": float(prm["atr_mult"]),
     }
 # [PATCH SAT HELPERS END]
+
 # repair hi/lo baselines on boot (applies to all TFs)
 try:
     for key, pos in (PAPER_POS or {}).items():
@@ -8620,11 +8626,14 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
 
             if scale_factor < 0.999:
                 eff_margin = float(eff_margin) * float(scale_factor)
+
                 EXEC_STATE[("coh_tags", symbol, tf)] = ",".join(reason_tags)
+
                 log(f"[COHERENCE] FUT {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
     except Exception as e:
         log(f"[COHERENCE_WARN] FUT {symbol} {tf} {e}")
 # [PATCH NEG/CCA GATE END — maybe_execute_futures_trade]
+
     # [PATCH SAT APPLY BEGIN — maybe_execute_futures_trade]
     try:
         side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
