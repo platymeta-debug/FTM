@@ -2480,6 +2480,139 @@ def add_indicators(df):
 # - agree_long/agree_short: 상위TF 정렬은 close 값 기준(닫힌 캔들)
 # ======================================================================
 
+# === [SCE] Structure Context Engine — A) 수평레벨 ================================
+def _sce_atr(df, n):
+    try:
+        if 'ATR14' in df.columns and n == 14:
+            v = float(df['ATR14'].iloc[-1])
+            if pd.notna(v):
+                return max(1e-8, v)
+        tr = np.maximum(df['high'] - df['low'],
+                        np.maximum((df['high'] - df['close'].shift()).abs(),
+                                   (df['low'] - df['close'].shift()).abs()))
+        return max(1e-8, tr.rolling(n).mean().iloc[-1])
+    except Exception:
+        return 1.0
+
+
+def _sce_pivots(df, left=2, right=2):
+    """Fractal pivots: return (high_pivots, low_pivots) where each pivot=(idx, price)."""
+    hp, lp = [], []
+    highs = df['high'].values
+    lows  = df['low'].values
+    n = len(df)
+    for i in range(left, n-right):
+        hi_seg = highs[i-left:i+right+1]
+        lo_seg = lows[i-left:i+right+1]
+        if np.argmax(hi_seg) == left:  # local max
+            hp.append((i, highs[i]))
+        if np.argmin(lo_seg) == left:  # local min
+            lp.append((i, lows[i]))
+    return hp, lp
+
+
+def _sce_horizontal_levels(df, tf, atr_len, max_levels=6):
+    """ATH/ATL + 최근 피벗H/L(각 3개까지)으로 수평 레벨 구성."""
+    levels = []
+    try:
+        price = float(df['close'].iloc[-1])
+        ath = float(df['high'].max()); atl = float(df['low'].min())
+        levels.append(('ATH', ath)); levels.append(('ATL', atl))
+        hp, lp = _sce_pivots(df, left=2, right=2)
+        for t, piv in [('PH', hp), ('PL', lp)]:
+            for idx, pr in piv[-3:]:
+                levels.append((t, float(pr)))
+        # 0.1 ATR 이내 중복 레벨 제거
+        uniq, used = [], []
+        tol = _sce_atr(df, atr_len) * 0.1
+        for t, lv in levels:
+            if any(abs(lv-u) <= tol for u in used):
+                continue
+            uniq.append((t, lv)); used.append(lv)
+        levels = uniq[-max_levels:]
+    except Exception:
+        pass
+    return levels
+
+
+def _sce_best_trendlines(df):
+    """최근 피벗 2점으로 상승/하락 추세선 산출. 반환 {'up':(i1,p1,i2,p2), 'down':(...)}"""
+    hp, lp = _sce_pivots(df, left=2, right=2)
+    up   = lp[-2:] if len(lp) >= 2 else None
+    down = hp[-2:] if len(hp) >= 2 else None
+    tl = {}
+    tl['up']   = (up[0][0], up[0][1], up[1][0], up[1][1])   if up   and len(up)==2   else None
+    tl['down'] = (down[0][0], down[0][1], down[1][0], down[1][1]) if down and len(down)==2 else None
+    return tl
+
+
+def _sce_value_on_line(tl, x):
+    (i1, p1, i2, p2) = tl
+    if i2 == i1: return p2
+    m = (p2 - p1) / (i2 - i1); b = p1 - m * i1
+    return m * x + b
+
+
+def build_struct_context_basic(df, tf, atr_len=None,
+                               near_thr_atr=None, max_levels=None):
+    """PART A: 수평 레벨 근접도 계산. reasons=[(reason, score, key)]."""
+    n = len(df)
+    atr_len     = int(cfg_get("STRUCT_ATR_LEN", "14")) if atr_len is None else atr_len
+    near_thr_atr= float(cfg_get("STRUCT_NEAR_THR_ATR", "0.8")) if near_thr_atr is None else near_thr_atr
+    max_levels  = int(cfg_get("STRUCT_MAX_LEVELS", "6")) if max_levels is None else max_levels
+
+    if n < max(50, atr_len+10):
+        return {"reasons": [], "levels": [], "nearest": None}
+
+    price = float(df['close'].iloc[-1])
+    atr   = _sce_atr(df, atr_len)
+    levels = _sce_horizontal_levels(df, tf, atr_len, max_levels=max_levels)
+
+    # 근접도(ATR 배수) 계산
+    near_sup = None; near_res = None
+    for typ, lv in levels:
+        d_atr = abs(price - lv)/max(1e-8, atr)
+        if lv <= price:
+            if (near_sup is None) or (d_atr < near_sup[2]): near_sup = (typ, lv, d_atr)
+        else:
+            if (near_res is None) or (d_atr < near_res[2]): near_res = (typ, lv, d_atr)
+
+    reasons = []
+    if near_res and near_res[2] <= near_thr_atr:
+        reasons.append((f"구조: 상단 저항({near_res[0]} {near_res[1]:.2f})까지 {near_res[2]:.2f}×ATR", -1.0, 'STRUCT_NEAR'))
+    if near_sup and near_sup[2] <= near_thr_atr:
+        reasons.append((f"구조: 하단 지지({near_sup[0]} {near_sup[1]:.2f})까지 {near_sup[2]:.2f}×ATR", +1.0, 'STRUCT_NEAR'))
+
+    # [B] Trendline proximity & break/이탈
+    break_close_atr = float(cfg_get("STRUCT_BREAK_CLOSE_ATR","0.2"))
+    tls    = _sce_best_trendlines(df)
+    last_x = len(df)-1
+    price  = float(df['close'].iloc[-1])
+    atr    = _sce_atr(df, atr_len)
+
+    for dirn in ('up','down'):
+        if not tls.get(dirn):
+            continue
+        val   = _sce_value_on_line(tls[dirn], last_x)
+        d_atr = abs(price - val)/max(1e-8, atr)
+
+        if d_atr <= near_thr_atr:
+            reasons.append((f"추세선({dirn}) 접근: 선가 {val:.2f}, 거리 {d_atr:.2f}×ATR", 0.5, f"TREND_{dirn.upper()}"))
+
+        # 종가 기준 돌파/이탈 컨펌 + ATR 버퍼
+        if dirn == 'down' and price > val + break_close_atr*atr:
+            reasons.append((f"하락추세선 종가 돌파(+{break_close_atr}×ATR 버퍼) — 리테스트 대기", 1.0, "TREND_BREAK"))
+        if dirn == 'up' and price < val - break_close_atr*atr:
+            reasons.append((f"상승추세선 종가 하향 이탈(−{break_close_atr}×ATR 버퍼)", -1.0, "TREND_BREAK"))
+
+    return {
+        "reasons": reasons,
+        "levels": levels,
+        "nearest": {"res": near_res, "sup": near_sup},
+        "atr": atr,
+    }
+
+
 def calculate_signal(df, tf, symbol):
 
     # 데이터 길이 체크
@@ -2540,6 +2673,23 @@ def calculate_signal(df, tf, symbol):
     senkou_a = df['senkou_span_a'].iloc[-1]
     senkou_b = df['senkou_span_b'].iloc[-1]
     chikou = df['chikou_span'].iloc[-1]
+
+    # === [SCE:A] 구조 컨텍스트(수평 레벨) 반영 ===
+    try:
+        if STRUCT_ENABLE:
+            sce = build_struct_context_basic(
+                df, tf,
+                atr_len=STRUCT_ATR_LEN,
+                near_thr_atr=STRUCT_NEAR_THR_ATR,
+                max_levels=STRUCT_MAX_LEVELS,
+            )
+            for reason, sc, key in sce.get("reasons", []):
+                strength.append(reason)
+                score += sc
+                weights[key] = weights.get(key, 0) + sc
+                weights_detail[key] = (weights[key], reason)
+    except Exception as _e:
+        log(f"[SCE_ERR:A] {symbol} {tf} {type(_e).__name__}: {_e}")
 
     past_price = df['close'].iloc[-26] if len(df) >= 27 else close_for_calc
 
@@ -5974,6 +6124,13 @@ REGIME_LOOKBACK     = int(float(cfg_get("REGIME_LOOKBACK", "180")))
 REGIME_TREND_R2_MIN = float(cfg_get("REGIME_TREND_R2_MIN", "0.30"))
 REGIME_ADX_MIN      = float(cfg_get("REGIME_ADX_MIN", "20"))
 STRUCT_ZIGZAG_PCT   = float(cfg_get("STRUCT_ZIGZAG_PCT", "3.0"))
+# --- SCE (A/B) params ---
+STRUCT_ENABLE          = (cfg_get("STRUCT_ENABLE", "1") == "1")
+STRUCT_ATR_LEN         = int(float(cfg_get("STRUCT_ATR_LEN", "14")))
+STRUCT_NEAR_THR_ATR    = float(cfg_get("STRUCT_NEAR_THR_ATR", "0.8"))
+STRUCT_MAX_LEVELS      = int(float(cfg_get("STRUCT_MAX_LEVELS", "6")))
+# (B 단계에서 사용)
+STRUCT_BREAK_CLOSE_ATR = float(cfg_get("STRUCT_BREAK_CLOSE_ATR", "0.2"))
 CHANNEL_BANDS_STD   = float(cfg_get("CHANNEL_BANDS_STD", "1.5"))
 AVWAP_ANCHORS       = cfg_get("AVWAP_ANCHORS", "SWING_HI,SWING_LO,LAST_BREAKOUT")
 CTX_ALPHA           = float(cfg_get("CTX_ALPHA", "0.35"))
