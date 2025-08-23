@@ -8281,6 +8281,21 @@ def _fmt_usd(x):
     except Exception:
         return str(x)
 
+# --- symbol/timeframe normalizer ---
+def _normalize_symbol(s: str) -> str:
+    if not s: return "ETH/USDT"
+    t = s.replace("-", "").replace("_", "").replace("perp","" ).lower()
+    if t in ("eth","ethusdt","usdteth"): return "ETH/USDT"
+    if t in ("btc","btcusdt","usdtbtc"): return "BTC/USDT"
+    # 이미 슬래시 포함 등은 대문자로 통일
+    return s.upper()
+
+def _normalize_tf(tf: str) -> str:
+    if not tf: return "1h"
+    t = tf.lower().strip()
+    table = {"15":"15m","15m":"15m","1":"1h","1h":"1h","4":"4h","4h":"4h","1d":"1d","d":"1d","day":"1d"}
+    return table.get(t, t)
+
 def _fmt_qty(q):
     try:
         # 과도하게 긴 소수 방지 (유효자리 6)
@@ -9400,7 +9415,9 @@ def _struct_shortline(symbol: str, tf: str) -> str:
                 df_struct = last_df.copy()
         df = df_struct
         if df is None or len(df) < 60:
-            return f"{symbol.split('/')[0]}-{tf}: 구조 정보 없음"
+
+            return f"{symbol} {tf}: 준비중"
+
         ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
         if ent and ent.get("ctx"):
             ctx = ent["ctx"]
@@ -9456,7 +9473,8 @@ async def _dash_struct_block() -> list[str]:
         for s in symbols:
             tf = "1h"
             sec = _cooldown_remain_sec(s, tf)
-            out.append(f" - {s.split('/')[0]}-{tf}: 남은 {sec}s")
+            if sec > 0:
+                out.append(f" - {s.split('/')[0]}-{tf}: 남은 {sec}s")
     except Exception as e:
         out.append(f"(구조 요약 생성 실패: {type(e).__name__})")
     return out
@@ -11894,13 +11912,36 @@ async def on_message(message):
     # --- PDF 리포트 온디맨드 ---
     if content.lower().startswith(("!report","!리포트")):
         try:
-            # 구문: !report ETH/USDT 1h  (인자 없으면 기본 ETH 1h)
             toks = content.split()
-            sym = toks[1] if len(toks) >= 2 else "ETH/USDT"
-            tf  = toks[2] if len(toks) >= 3 else "1h"
-            await _make_and_send_pdf_report(sym, tf, message.channel)
+            sym_raw = toks[1] if len(toks) >= 2 else "ETH/USDT"
+            tf_raw  = toks[2] if len(toks) >= 3 else "1h"
+            symbol  = _normalize_symbol(sym_raw)
+            tf      = _normalize_tf(tf_raw)
+
+            ch = message.channel
+            # 1) 캐시 우선
+            ent = STRUCT_CACHE.get((symbol, tf))
+            df  = None
+            if ent and ent.get("ctx") and ent.get("ts"):
+                # ctx 전용일 수 있으므로, 최근 df를 보조 캐시에서 탐색
+                df = (_LAST_DF_CACHE.get((symbol, tf)) if '_LAST_DF_CACHE' in globals() else None)
+
+            # 2) 로컬 분석 df 폴백
+            if (df is None or len(df) < int(os.getenv("SCE_MIN_ROWS","60"))) and '_LAST_DF_CACHE' in globals():
+                df = _LAST_DF_CACHE.get((symbol, tf))
+
+            # 3) 네트워크(워커 스레드) 최후 시도
+            if df is None or len(df) < int(os.getenv("SCE_MIN_ROWS","60")):
+                rows = await asyncio.to_thread(_load_ohlcv, symbol, tf, 400)
+                df = _sce_build_df_from_ohlcv(rows) if rows else None
+
+            if df is None or len(df) < int(os.getenv("SCE_MIN_ROWS","60")):
+                await ch.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족(입력/네트워크 실패)")
+                return
+
+            await _make_and_send_pdf_report(symbol, tf, ch)  # 내부에서 PDF/오버레이 생성
         except Exception as e:
-            await message.channel.send(content=f"[REPORT] 사용법: !report SYMBOL TF  예) !report ETH/USDT 1h  (오류: {type(e).__name__})")
+            await message.channel.send(content=f"[REPORT] 사용법: !report SYMBOL TF  예) !report ETH 15m  (오류: {type(e).__name__})")
         return
 
     # [ANCHOR: CMD_SET_GET_SAVEENV]
