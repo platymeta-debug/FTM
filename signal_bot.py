@@ -4417,20 +4417,36 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         except Exception:
             pass
 
-    occ = PAPER_POS_TF.get(tf)
+    # --- TF occupancy check (paper vs futures) ---
+    occ = FUT_POS_TF.get(tf) if TRADE_MODE == "futures" else PAPER_POS_TF.get(tf)
+    # Safety: also consider cross-cache occupancy (in case of stale state)
+    occ = occ or PAPER_POS_TF.get(tf) or FUT_POS_TF.get(tf)
+    has_real = False
     if tf not in IGNORE_OCCUPANCY_TFS and occ:
-        has_real = _has_open_position(occ, tf, TRADE_MODE)
-        if POS_TF_STRICT:
-            if has_real:
-                log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
-                return
-        else:
+        try:
+            has_real = _has_open_position(occ, tf, TRADE_MODE)
+        except Exception:
+            has_real = False
+
+        # Disallow different symbol on the same TF when ALLOW_BOTH_PER_TF=0
+        if (not ALLOW_BOTH_PER_TF) and (str(occ) != str(symbol)):
+            log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED(other={occ})")
+            return
+
+        # Strict: if any real open pos exists on this TF → skip re-entry
+        if POS_TF_STRICT and has_real:
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
+
+        # Autorepair: clear stale occupancy if no real pos remains
         if POS_TF_AUTOREPAIR and not has_real:
             try:
-                PAPER_POS_TF.pop(tf, None)
-                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                if TRADE_MODE == "futures":
+                    if FUT_POS_TF.get(tf):
+                        FUT_POS_TF.pop(tf, None); _save_json(OPEN_TF_FILE, FUT_POS_TF)
+                else:
+                    if PAPER_POS_TF.get(tf):
+                        PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
                 log(f"[OCCUPANCY] cleared stale tf={tf} (was {occ})")
             except Exception:
                 pass
