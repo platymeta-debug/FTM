@@ -238,6 +238,9 @@ def get_last_price(symbol: str, default_price: float = 0.0) -> float:
 #                           structure_bias, channel_z, avwap_dist, hhhl_tag, summary}
 CTX_STATE: dict[str, dict] = {}
 
+# 구조 컨텍스트/오버레이 캐시: key=(symbol, tf) -> {"ctx": dict, "img": str|None, "ts": int, "mtime": int}
+STRUCT_CACHE: dict = {}
+
 # 상위TF 구조 알림/상태 저장
 STRUCT_ALERT_STATE: dict = {}
 
@@ -1797,6 +1800,7 @@ except Exception as e:
     generate_pdf_report = None
     log(f"[PDF] generate_pdf_report 임포트 실패: {e}")
 # -----------------------------------
+# [REPORT_CALL_SCAN_BEGIN]
 
 
 # === 전역 상태 저장용 ===
@@ -2593,6 +2597,41 @@ def _sce_value_on_line(tl, x):
 
 def _sce_build_df_from_ohlcv(rows):
     return pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+
+
+def _df_last_ts(df) -> int:
+    try:
+        return int(df['ts'].iloc[-1])
+    except Exception:
+        return int(time.time()*1000)
+
+
+def _struct_cache_key(symbol: str, tf: str) -> tuple[str,str]:
+    return (symbol, tf)
+
+
+def _struct_cache_get(symbol: str, tf: str, ts: int):
+    if not (os.getenv("STRUCT_CACHE_ENABLE","1") in ("1","true","on")):
+        return None
+    ent = STRUCT_CACHE.get(_struct_cache_key(symbol, tf))
+    if not ent:
+        return None
+    # 동일 캔들(같은 ts)만 재사용
+    if int(ent.get("ts", -1)) != int(ts):
+        return None
+    # TTL 체크(선택)
+    ttl = int(float(os.getenv("STRUCT_CACHE_TTL_SEC","7200")))
+    if ttl > 0 and (time.time() - ent.get("mtime", 0)) > ttl:
+        return None
+    return ent
+
+
+def _struct_cache_put(symbol: str, tf: str, ts: int, ctx: dict|None, img_path: str|None):
+    if not (os.getenv("STRUCT_CACHE_ENABLE","1") in ("1","true","on")):
+        return
+    STRUCT_CACHE[_struct_cache_key(symbol, tf)] = {
+        "ctx": ctx, "img": img_path, "ts": int(ts), "mtime": time.time()
+    }
 
 def _mtf_struct_guard(symbol: str, tf: str, side_signal: str):
     """
@@ -9305,11 +9344,19 @@ def _struct_shortline(symbol: str, tf: str) -> str:
     • 최근접 저항/지지 거리(ATR배수) + 구조 사유 1~2개 요약
     """
     try:
+
+        # 캐시 우선
         rows = _load_ohlcv(symbol, tf, limit=240)
-        if not rows or len(rows) < 60:
+        df = _sce_build_df_from_ohlcv(rows) if rows else None
+        if df is None or len(df) < 60:
             return f"{symbol} {tf}: 데이터 부족"
-        df = _sce_build_df_from_ohlcv(rows)
-        ctx = build_struct_context_basic(df, tf)
+        ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
+        if ent and ent.get("ctx"):
+            ctx = ent["ctx"]
+        else:
+            ctx = build_struct_context_basic(df, tf)
+            _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, ent.get("img") if ent else None)
+
         near = ctx.get("nearest") or {}
         res, sup = near.get("res"), near.get("sup")
         bits = []
@@ -10910,12 +10957,25 @@ async def on_ready():
                 df_struct = None
                 struct_info = None
                 struct_img = None
-                # 구조 오버레이 이미지 생성 및 첨부
+
+                # 캐시 조회(동일 캔들 재사용)
+                rows = _load_ohlcv(symbol_eth, tf, limit=400)
+                df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                last_ts = _df_last_ts(df_struct) if df_struct is not None else -1
+                cache_ent = _struct_cache_get(symbol_eth, tf, last_ts)
+                struct_info = cache_ent.get("ctx") if cache_ent else None
+                struct_img  = cache_ent.get("img") if cache_ent else None
+
+                # 구조 오버레이 이미지 생성 및 첨부 (캐시 미스시에만 렌더)
                 try:
-                    rows = _load_ohlcv(symbol_eth, tf, limit=400)
-                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
-                    struct_info = build_struct_context_basic(df_struct, tf) if df_struct is not None else None
-                    struct_img = render_struct_overlay(symbol_eth, tf, df_struct, struct_info)
+                    if struct_info is None and df_struct is not None:
+                        struct_info = build_struct_context_basic(df_struct, tf)
+                    if struct_img is None and df_struct is not None and struct_info is not None:
+                        struct_img = render_struct_overlay(symbol_eth, tf, df_struct, struct_info)
+                    # 캐시에 기록
+                    if df_struct is not None and struct_info is not None:
+                        _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
+
                     if struct_img:
                         chart_files = list(chart_files) + [struct_img]
                 except Exception as _e:
@@ -10986,6 +11046,13 @@ async def on_ready():
 
                 # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
                 try:
+
+                    # 캐시에 ctx가 있으면 재사용
+                    if struct_info is None and df_struct is not None:
+                        cache_ent = _struct_cache_get(symbol_eth, tf, _df_last_ts(df_struct))
+                        if cache_ent:
+                            struct_info = cache_ent.get("ctx")
+
                     if struct_block is None:
                         struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
                     summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
@@ -11411,6 +11478,34 @@ async def on_ready():
                       live_price=display_price,  # reuse ticker for consistent short/long pricing
                       show_risk=False
                   )
+
+
+
+                chart_files = save_chart_groups(df, symbol_btc, tf)
+                df_struct = None
+                struct_info = None
+                struct_img = None
+                # 캐시 조회(동일 캔들 재사용)
+                rows = _load_ohlcv(symbol_btc, tf, limit=400)
+                df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                last_ts = _df_last_ts(df_struct) if df_struct is not None else -1
+                cache_ent = _struct_cache_get(symbol_btc, tf, last_ts)
+                struct_info = cache_ent.get("ctx") if cache_ent else None
+                struct_img  = cache_ent.get("img") if cache_ent else None
+
+                # 구조 오버레이 이미지 생성 및 첨부 (캐시 미스시에만 렌더)
+                try:
+                    if struct_info is None and df_struct is not None:
+                        struct_info = build_struct_context_basic(df_struct, tf)
+                    if struct_img is None and df_struct is not None and struct_info is not None:
+                        struct_img = render_struct_overlay(symbol_btc, tf, df_struct, struct_info)
+                    if df_struct is not None and struct_info is not None:
+                        _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
+                    if struct_img:
+                        chart_files = list(chart_files) + [struct_img]
+                except Exception as _e:
+                    log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
+
                 struct_block = None
                 # 구조 컨텍스트 섹션 프리펜드
                 try:
@@ -11421,31 +11516,22 @@ async def on_ready():
 
                 # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
                 try:
+                    # 캐시에 ctx가 있으면 재사용
+                    if struct_info is None and df_struct is not None:
+                        cache_ent = _struct_cache_get(symbol_btc, tf, _df_last_ts(df_struct))
+                        if cache_ent:
+                            struct_info = cache_ent.get("ctx")
                     if struct_block is None:
                         struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
                     summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} summary {type(_e).__name__}: {_e}")
 
-
                 channel = _get_channel_or_skip('BTC', tf)
                 if channel is None:
                     continue
 
-                chart_files = save_chart_groups(df, symbol_btc, tf)
-                df_struct = None
-                struct_info = None
-                struct_img = None
-                # 구조 오버레이 이미지 생성 및 첨부
-                try:
-                    rows = _load_ohlcv(symbol_btc, tf, limit=400)
-                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
-                    struct_info = build_struct_context_basic(df_struct, tf) if df_struct is not None else None
-                    struct_img = render_struct_overlay(symbol_btc, tf, df_struct, struct_info)
-                    if struct_img:
-                        chart_files = list(chart_files) + [struct_img]
-                except Exception as _e:
-                    log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
+
                 # 1) 짧은 알림(푸시용)
                 await channel.send(content=short_msg)
 
