@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # ★ 비대화형 백엔드 (파일 저장 전용)
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import platform
 import os, sys, logging
 import discord
@@ -236,6 +237,9 @@ def get_last_price(symbol: str, default_price: float = 0.0) -> float:
 # Context cache: symbol -> {ts, regime, regime_strength, r2, adx, ma_slope,
 #                           structure_bias, channel_z, avwap_dist, hhhl_tag, summary}
 CTX_STATE: dict[str, dict] = {}
+
+# 구조 컨텍스트/오버레이 캐시: key=(symbol, tf) -> {"ctx": dict, "img": str|None, "ts": int, "mtime": int}
+STRUCT_CACHE: dict = {}
 
 # 상위TF 구조 알림/상태 저장
 STRUCT_ALERT_STATE: dict = {}
@@ -1796,6 +1800,7 @@ except Exception as e:
     generate_pdf_report = None
     log(f"[PDF] generate_pdf_report 임포트 실패: {e}")
 # -----------------------------------
+# [REPORT_CALL_SCAN_BEGIN]
 
 
 # === 전역 상태 저장용 ===
@@ -2592,6 +2597,41 @@ def _sce_value_on_line(tl, x):
 
 def _sce_build_df_from_ohlcv(rows):
     return pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+
+
+def _df_last_ts(df) -> int:
+    try:
+        return int(df['ts'].iloc[-1])
+    except Exception:
+        return int(time.time()*1000)
+
+
+def _struct_cache_key(symbol: str, tf: str) -> tuple[str,str]:
+    return (symbol, tf)
+
+
+def _struct_cache_get(symbol: str, tf: str, ts: int):
+    if not (os.getenv("STRUCT_CACHE_ENABLE","1") in ("1","true","on")):
+        return None
+    ent = STRUCT_CACHE.get(_struct_cache_key(symbol, tf))
+    if not ent:
+        return None
+    # 동일 캔들(같은 ts)만 재사용
+    if int(ent.get("ts", -1)) != int(ts):
+        return None
+    # TTL 체크(선택)
+    ttl = int(float(os.getenv("STRUCT_CACHE_TTL_SEC","7200")))
+    if ttl > 0 and (time.time() - ent.get("mtime", 0)) > ttl:
+        return None
+    return ent
+
+
+def _struct_cache_put(symbol: str, tf: str, ts: int, ctx: dict|None, img_path: str|None):
+    if not (os.getenv("STRUCT_CACHE_ENABLE","1") in ("1","true","on")):
+        return
+    STRUCT_CACHE[_struct_cache_key(symbol, tf)] = {
+        "ctx": ctx, "img": img_path, "ts": int(ts), "mtime": time.time()
+    }
 
 def _mtf_struct_guard(symbol: str, tf: str, side_signal: str):
     """
@@ -6055,6 +6095,111 @@ async def _send_long_text_or_file(ch, text: str, fname: str):
         i += CONFIG_CHUNK_LEN
 
 
+# === Discord chunked sender (2,000자 제한 대응) ================================
+def _split_text_chunks(text: str, limit: int = 1900) -> list[str]:
+    """문단/헤더 우선으로 자르고, 넘치면 줄단위로 보수 분할."""
+    if not isinstance(text, str):
+        text = str(text)
+    if len(text) <= limit:
+        return [text]
+    paras = re.split(r"(\n{2,})", text)  # 문단 경계 유지
+    chunks, cur = [], ""
+    for seg in paras:
+        if not seg:
+            continue
+        if len(cur) + len(seg) <= limit:
+            cur += seg
+        else:
+            if cur:
+                chunks.append(cur)
+            if len(seg) <= limit:
+                cur = seg
+            else:
+                # 매우 긴 문단 → 줄 단위 분해
+                lines = seg.splitlines(True)
+                cur = ""
+                for ln in lines:
+                    if len(cur) + len(ln) > limit:
+                        if cur:
+                            chunks.append(cur)
+                        cur = ln
+                    else:
+                        cur += ln
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+
+async def _discord_send_chunked(channel, text: str, *, files=None, silent: bool = True, header_prefix: str = "Part"):
+    """
+    새 메시지 전송 전용. 첫 파트에만 파일 첨부.
+    반환: [message_id, ...]
+    """
+    try:
+        parts = _split_text_chunks(text, 1900)
+        ids = []
+        total = len(parts)
+        for i, body in enumerate(parts, 1):
+            head = (f"[{header_prefix} {i}/{total}]\n" if total > 1 else "")
+            if i == 1 and files:
+                m = await channel.send(content=head + body, files=files, silent=silent)
+            else:
+                m = await channel.send(content=head + body, silent=silent)
+            ids.append(m.id)
+        return ids
+    except Exception as e:
+        # 50035 등 폴백: 하드 컷
+        if ("50035" in str(e)) or ("Must be 2000" in str(e)):
+            try:
+                hard = text[:1900]
+                m = await channel.send(content=hard, silent=silent)
+                return [m.id]
+            except Exception:
+                pass
+        raise
+
+
+async def _discord_edit_chunked(msg, channel, text: str, *, tag_key: str = "DASH", header_prefix: str = "Part"):
+    """
+    기존 '첫 메시지'를 edit하고 나머지 파트는 삭제 후 재전송.
+    파트 ID는 CTX_STATE['_chunks'][tag_key]에 저장.
+    """
+    parts = _split_text_chunks(text, 1900)
+    total = len(parts)
+    first = f"[{header_prefix} 1/{total}]\n{parts[0]}" if total > 1 else parts[0]
+    try:
+        await msg.edit(content=first)
+    except Exception as e:
+        if ("50035" in str(e)) or ("Must be 2000" in str(e)):
+            # 더 강하게 잘라 다시 시도
+            await msg.edit(content=(first[:1900]))
+        else:
+            raise
+
+    # 이전 꼬리 파트 삭제
+    try:
+        chunks_map = CTX_STATE.setdefault("_chunks", {})
+        old = chunks_map.get(tag_key, [])
+        for mid in old[1:]:
+            try:
+                m = await channel.fetch_message(int(mid))
+                await m.delete()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 새 꼬리 파트 전송
+    new_ids = [int(msg.id)]
+    for i, body in enumerate(parts[1:], 2):
+        head = f"[{header_prefix} {i}/{total}]\n"
+        m = await channel.send(content=head + body, silent=True)
+        new_ids.append(int(m.id))
+    CTX_STATE.setdefault("_chunks", {})[tag_key] = new_ids
+    return new_ids
+# ==============================================================================
+
+
 def _ema_update(x: float, alpha: float) -> float:
     global _UPNL_EMA_VAL
     if alpha <= 0:
@@ -9183,6 +9328,244 @@ def get_open_positions_iter():
         pass
     return out
 
+def _cooldown_remain_sec(symbol: str, tf: str) -> int:
+    try:
+        last = (STRUCT_ALERT_STATE or {}).get((symbol, tf, "ALERT_TEXT"), {}).get("ts", 0)
+        if last <= 0:
+            return 0
+        remain = (MTF_ALERT_COOLDOWN_SEC * 1000 - max(0, _now_ms() - last)) // 1000
+        return max(0, int(remain))
+    except Exception:
+        return 0
+
+
+def _struct_shortline(symbol: str, tf: str) -> str:
+    """
+    • 최근접 저항/지지 거리(ATR배수) + 구조 사유 1~2개 요약
+    """
+    try:
+        # 캐시 우선
+        rows = _load_ohlcv(symbol, tf, limit=240)
+        df = _sce_build_df_from_ohlcv(rows) if rows else None
+        if df is None or len(df) < 60:
+            return f"{symbol} {tf}: 데이터 부족"
+        ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
+        if ent and ent.get("ctx"):
+            ctx = ent["ctx"]
+        else:
+            ctx = build_struct_context_basic(df, tf)
+            _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, ent.get("img") if ent else None)
+        near = ctx.get("nearest") or {}
+        res, sup = near.get("res"), near.get("sup")
+        bits = []
+        if res: bits.append(f"저항 {res[2]:.2f}×ATR")
+        if sup: bits.append(f"지지 {sup[2]:.2f}×ATR")
+
+        # 구조 사유(추세선/채널/컨플루언스) 2개만
+        rsn = []
+        for (txt, sc, key) in ctx.get("reasons", []):
+            if key.startswith(("TREND","CHAN","STRUCT_CONFLUENCE","STRUCT_GAP")):
+                rsn.append(txt)
+            if len(rsn) >= 2:
+                break
+        if rsn:
+            bits.append(" / ".join(rsn))
+        return f"{symbol.split('/')[0]}-{tf}: " + (" · ".join(bits) if bits else "구조 정보 없음")
+    except Exception as e:
+        return f"{symbol} {tf}: 구조 요약 실패({type(e).__name__})"
+
+
+async def _dash_struct_block() -> list[str]:
+    """
+    대시보드 상단 고정 블록:
+    ◼ 구조 컨텍스트 / ◼ MTF 게이트 / ◼ 알림 쿨다운
+    """
+    out = []
+    try:
+        symbols = ("ETH/USDT","BTC/USDT")
+        tfs     = ("1h",)  # 요구사항: 1h 기준 요약 (필요시 15m/4h/1d 추가 가능)
+        # 1) 구조 컨텍스트
+        out.append("◼ 구조 컨텍스트")
+        for s in symbols:
+            for tf in tfs:
+                out.append(" - " + _struct_shortline(s, tf))
+        # 2) MTF 게이트 (1h→상위 TF)
+        out.append("◼ MTF 게이트")
+        for s in symbols:
+            tf = "1h"
+            try:
+                buy = _mtf_struct_guard(s, tf, "BUY"); sell = _mtf_struct_guard(s, tf, "SELL")
+                out.append(f" - {s.split('/')[0]}-{tf}: BUY={buy.get('action','?')} / SELL={sell.get('action','?')}  ({buy.get('reason') or sell.get('reason') or '—'})")
+            except Exception:
+                out.append(f" - {s.split('/')[0]}-{tf}: 게이트 계산 실패")
+        # 3) 알림 쿨다운
+        out.append("◼ 알림 쿨다운")
+        for s in symbols:
+            tf = "1h"
+            sec = _cooldown_remain_sec(s, tf)
+            out.append(f" - {s.split('/')[0]}-{tf}: 남은 {sec}s")
+    except Exception as e:
+        out.append(f"(구조 요약 생성 실패: {type(e).__name__})")
+    return out
+
+
+# === SCE text render for analysis messages ====================================
+def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
+    """
+    분석 알림 본문 공통 섹션:
+    - 최근접 저항/지지: 값 / 거리(ATR배수)
+    - 추세선: up/down 근접/돌파
+    - 회귀/피보 채널: 상/하단 접근/이탈
+    - 컨플루언스/협곡
+    """
+    try:
+        if df is None:
+            rows = _load_ohlcv(symbol, tf, limit=400)
+            if not rows or len(rows) < 60:
+                return "◼ 구조 컨텍스트\n- 데이터 부족"
+            df = _sce_build_df_from_ohlcv(rows)
+        if ctx is None:
+            ctx = build_struct_context_basic(df, tf)
+
+        lines = ["◼ 구조 컨텍스트"]
+        near = (ctx.get("nearest") or {})
+        res, sup = near.get("res"), near.get("sup")
+        if res or sup:
+            rtxt = f"{res[1]:.2f} ({res[2]:.2f}×ATR)" if res else "-"
+            stxt = f"{sup[1]:.2f} ({sup[2]:.2f}×ATR)" if sup else "-"
+            lines.append(f"- 최근접 저항/지지: {rtxt} / {stxt}")
+        else:
+            lines.append("- 최근접 저항/지지: -")
+
+        # 이유 요약: TREND, CHAN, CONFLUENCE/GAP 카테고리별 최대 1~2줄
+        cats = {"TREND": [], "CHAN": [], "CONF": [], "GAP": []}
+        for (text, sc, key) in ctx.get("reasons", []):
+            if key.startswith("TREND"):
+                cats["TREND"].append(text)
+            elif key.startswith("CHAN"):
+                cats["CHAN"].append(text)
+            elif key.startswith("STRUCT_CONFLUENCE"):
+                cats["CONF"].append(text)
+            elif key.startswith("STRUCT_GAP"):
+                cats["GAP"].append(text)
+
+        if cats["TREND"]:
+            lines.append(f"- 추세선: {cats['TREND'][0]}")
+        if cats["CHAN"]:
+            lines.append(f"- 채널: {cats['CHAN'][0]}")
+        if cats["CONF"]:
+            lines.append(f"- 컨플루언스: {cats['CONF'][0]}")
+        if cats["GAP"]:
+            lines.append(f"- 협곡: {cats['GAP'][0]}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"◼ 구조 컨텍스트\n- 생성 실패: {type(e).__name__}"
+# ============================================================================== 
+
+
+# === Structure overlay renderer (matplotlib) ==================================
+def render_struct_overlay(symbol: str, tf: str, df, struct_info,
+                          save_dir: str = "./charts", width: int = 1600, height: int = 900) -> str | None:
+    """
+    캔들 + 수평 레벨 + 추세선(최근 피벗 2점) + 회귀 채널 + 피보 채널을 그려 저장.
+    반환: 파일 경로 (실패 시 None)
+    """
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        if df is None or len(df) < 60 or struct_info is None:
+            return None
+
+        # 좌표 준비
+        x = np.arange(len(df))
+        o,h,l,c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+
+        # Figure
+        dpi = 100
+        fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
+        ax = fig.add_subplot(111)
+        ax.set_title(f"{symbol} • {tf} • Structure Overlay", loc="left")
+
+        # 캔들 (간단 구현)
+        barw = 0.6
+        for i in range(len(df)):
+            color = "#2ca02c" if c[i] >= o[i] else "#d62728"
+            ax.vlines(i, l[i], h[i], linewidth=1, color=color, alpha=0.8)
+            rb = Rectangle((i - barw/2, min(o[i], c[i])),
+                           barw, abs(c[i]-o[i]),
+                           facecolor=color, edgecolor=color, alpha=0.6)
+            ax.add_patch(rb)
+
+        last_x = len(df)-1
+        price  = float(c[-1])
+        atr    = struct_info.get("atr", 0.0) or 0.0
+
+        # 수평 레벨
+        ne = struct_info.get("nearest") or {}
+        res = ne.get("res"); sup = ne.get("sup")
+        for (t, v) in struct_info.get("levels", [])[:10]:
+            lw = 1.2; ls = "--"; col = "#888888"
+            if t == "ATH": col = "#c21807"; lw = 1.8
+            if t == "ATL": col = "#1565c0"; lw = 1.8
+            if res and v == float(res[1]): lw = 2.4; col = "#c21807"; ls="-"
+            if sup and v == float(sup[1]): lw = 2.4; col = "#1565c0"; ls="-"
+            ax.hlines(v, 0, last_x, colors=col, linestyles=ls, linewidth=lw, alpha=0.9)
+
+        # 추세선
+        try:
+            tls = _sce_best_trendlines(df)
+            for dirn in ("up","down"):
+                tl = tls.get(dirn)
+                if not tl: continue
+                y1 = _sce_value_on_line(tl, 0)
+                y2 = _sce_value_on_line(tl, last_x)
+                ls = "--"; col = "#2e7d32" if dirn=="up" else "#b71c1c"
+                ax.plot([0,last_x],[y1,y2], ls=ls, lw=1.8, color=col, alpha=0.9, label=f"{dirn} TL")
+        except Exception:
+            pass
+
+        # 회귀 채널
+        try:
+            reg = _sce_linreg_channel(df)
+            if reg:
+                ax.plot([0,last_x],[reg["upper"]]*2, lw=1.4, color="#6a1b9a", ls="-", alpha=0.9, label="Reg ↑")
+                ax.plot([0,last_x],[reg["lower"]]*2, lw=1.4, color="#6a1b9a", ls="--", alpha=0.9, label="Reg ↓")
+        except Exception:
+            pass
+
+        # 피보 채널
+        try:
+            fib = _sce_fib_channel(df)
+            if fib:
+                ups, downs = fib["ups"], fib["downs"]
+                for v in ups:
+                    ax.plot([0,last_x],[v]*2, lw=1.0, color="#f39c12", ls="-", alpha=0.8)
+                for v in downs:
+                    ax.plot([0,last_x],[v]*2, lw=1.0, color="#f39c12", ls="--", alpha=0.8)
+        except Exception:
+            pass
+
+        ax.set_xlim(-1, last_x+1)
+        ypad = (np.nanmax(h[-120:]) - np.nanmin(l[-120:])) * 0.05 if len(df)>120 else (np.nanmax(h) - np.nanmin(l)) * 0.05
+        ax.set_ylim(np.nanmin(l[-120:]) - ypad, np.nanmax(h[-120:]) + ypad)
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+
+        out = os.path.join(save_dir, f"struct_{symbol.replace('/','-')}_{tf}_{int(time.time())}.png")
+        fig.tight_layout()
+        fig.savefig(out)
+        plt.close(fig)
+        return out
+    except Exception as e:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
+        return None
+# ==============================================================================
+
+
 async def _dash_render_text():
 
     st = _daily_state_load() or {}  # ← Nonesafe
@@ -9256,6 +9639,13 @@ async def _dash_render_text():
             lev_line = os.getenv("TF_LEVERAGE", "")
         lines.append(f"mode:{os.getenv('TRADE_MODE')} / lev:{lev_line} / slippage:{os.getenv('SLIPPAGE_PCT')}%")
 
+    # ◼ SCE/MTF 고정 섹션 추가
+    try:
+        blk = await _dash_struct_block()
+        if blk:
+            lines += blk + [""]
+    except Exception as _e:
+        log(f"[DASH_STRUCT_BLOCK_WARN] {_e}")
 
     # 합계 UPNL(수수료 옵션 포함)
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
@@ -9338,7 +9728,8 @@ async def _dash_loop(client):
                 log(f"[DASH:TRACE] render_ok types st={type(st).__name__}, totals={type(totals).__name__}")
             if msg:
                 try:
-                    await msg.edit(content=txt)
+                    # 기존 단일 edit → 멀티파트 edit
+                    await _discord_edit_chunked(msg, msg.channel, txt, tag_key="DASH", header_prefix="Dashboard")
                 except Exception as e:
 
                     if "Unknown Message" in str(e) or "Not Found" in str(e):
@@ -10559,6 +10950,30 @@ async def on_ready():
                         pnl = ((entry_price - price) / entry_price) * 100
 
                 chart_files = save_chart_groups(df, symbol_eth, tf)
+                df_struct = None
+                struct_info = None
+                struct_img = None
+                # 캐시 조회(동일 캔들 재사용)
+                rows = _load_ohlcv(symbol_eth, tf, limit=400)
+                df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                last_ts = _df_last_ts(df_struct) if df_struct is not None else -1
+                cache_ent = _struct_cache_get(symbol_eth, tf, last_ts)
+                struct_info = cache_ent.get("ctx") if cache_ent else None
+                struct_img  = cache_ent.get("img") if cache_ent else None
+
+                # 구조 오버레이 이미지 생성 및 첨부 (캐시 미스시에만 렌더)
+                try:
+                    if struct_info is None and df_struct is not None:
+                        struct_info = build_struct_context_basic(df_struct, tf)
+                    if struct_img is None and df_struct is not None and struct_info is not None:
+                        struct_img = render_struct_overlay(symbol_eth, tf, df_struct, struct_info)
+                    # 캐시에 기록
+                    if df_struct is not None and struct_info is not None:
+                        _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
+                    if struct_img:
+                        chart_files = list(chart_files) + [struct_img]
+                except Exception as _e:
+                    log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
 
                 # ✅ entry_data가 없을 경우 None으로 초기화
                 if entry_data.get(key2):
@@ -10615,6 +11030,26 @@ async def on_ready():
 
                     show_risk=False
                 )
+                struct_block = None
+                # 구조 컨텍스트 섹션 프리펜드
+                try:
+                    struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
+                    main_msg_pdf = f"{struct_block}\n\n{main_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_eth} {tf} main {type(_e).__name__}: {_e}")
+
+                # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
+                try:
+                    # 캐시에 ctx가 있으면 재사용
+                    if struct_info is None and df_struct is not None:
+                        cache_ent = _struct_cache_get(symbol_eth, tf, _df_last_ts(df_struct))
+                        if cache_ent:
+                            struct_info = cache_ent.get("ctx")
+                    if struct_block is None:
+                        struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
+                    summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_eth} {tf} summary {type(_e).__name__}: {_e}")
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
                 candle_ts = None
                 if len(df) >= 2 and 'timestamp' in df:
@@ -10633,11 +11068,14 @@ async def on_ready():
                 # 1) 짧은 알림(푸시용) — 첫 전송에서만
                 await channel.send(content=short_msg)
 
+                symbol_short = symbol_eth.split('/')[0]
                 # 2) 분석 메시지 — 푸시에는 안 뜸
-                await channel.send(
-                    content=main_msg_pdf,
+                await _discord_send_chunked(
+                    channel,
+                    main_msg_pdf,
                     files=[discord.File(p) for p in chart_files if p],
-                    silent=True
+                    silent=True,
+                    header_prefix=f"{symbol_short}-{tf}-Analysis"
                 )
 
                 # 점수기록: 실제 발송시에만(중복 방지)
@@ -10649,9 +11087,12 @@ async def on_ready():
 
 
                 # 3) 종합해석 메시지 — 길면 잘라서 전송
-                if len(summary_msg_pdf) > 1900:            # ← summary_msg → summary_msg_pdf
-                    summary_msg_pdf = summary_msg_pdf[:1900] + "\n...(이하 생략)"
-                await channel.send(summary_msg_pdf, silent=True)
+                await _discord_send_chunked(
+                    channel,
+                    summary_msg_pdf,
+                    silent=True,
+                    header_prefix=f"{symbol_short}-{tf}-Summary"
+                )
 
                 # NEUTRAL 상태 저장
                 # 발송 후 상태 업데이트 보강
@@ -11026,30 +11467,80 @@ async def on_ready():
                     entry_time=_entry_time,
                     entry_price=_entry_price,
                     recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-                    live_price=display_price,  # reuse ticker for consistent short/long pricing
-                    show_risk=False
-                )
+                      live_price=display_price,  # reuse ticker for consistent short/long pricing
+                      show_risk=False
+                  )
 
+                chart_files = save_chart_groups(df, symbol_btc, tf)
+                df_struct = None
+                struct_info = None
+                struct_img = None
+                # 캐시 조회(동일 캔들 재사용)
+                rows = _load_ohlcv(symbol_btc, tf, limit=400)
+                df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                last_ts = _df_last_ts(df_struct) if df_struct is not None else -1
+                cache_ent = _struct_cache_get(symbol_btc, tf, last_ts)
+                struct_info = cache_ent.get("ctx") if cache_ent else None
+                struct_img  = cache_ent.get("img") if cache_ent else None
+
+                # 구조 오버레이 이미지 생성 및 첨부 (캐시 미스시에만 렌더)
+                try:
+                    if struct_info is None and df_struct is not None:
+                        struct_info = build_struct_context_basic(df_struct, tf)
+                    if struct_img is None and df_struct is not None and struct_info is not None:
+                        struct_img = render_struct_overlay(symbol_btc, tf, df_struct, struct_info)
+                    if df_struct is not None and struct_info is not None:
+                        _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
+                    if struct_img:
+                        chart_files = list(chart_files) + [struct_img]
+                except Exception as _e:
+                    log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
+
+                struct_block = None
+                # 구조 컨텍스트 섹션 프리펜드
+                try:
+                    struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
+                    main_msg_pdf = f"{struct_block}\n\n{main_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_btc} {tf} main {type(_e).__name__}: {_e}")
+
+                # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
+                try:
+                    # 캐시에 ctx가 있으면 재사용
+                    if struct_info is None and df_struct is not None:
+                        cache_ent = _struct_cache_get(symbol_btc, tf, _df_last_ts(df_struct))
+                        if cache_ent:
+                            struct_info = cache_ent.get("ctx")
+                    if struct_block is None:
+                        struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
+                    summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_btc} {tf} summary {type(_e).__name__}: {_e}")
 
                 channel = _get_channel_or_skip('BTC', tf)
                 if channel is None:
                     continue
 
-                chart_files = save_chart_groups(df, symbol_btc, tf)
                 # 1) 짧은 알림(푸시용)
                 await channel.send(content=short_msg)
 
+                symbol_short = symbol_btc.split('/')[0]
                 # 2) 분석 메시지
-                await channel.send(
-                    content=main_msg_pdf,
+                await _discord_send_chunked(
+                    channel,
+                    main_msg_pdf,
                     files=[discord.File(p) for p in chart_files if p],
-                    silent=True
+                    silent=True,
+                    header_prefix=f"{symbol_short}-{tf}-Analysis"
                 )
 
                 # 3) 종합해석 메시지
-                if len(summary_msg_pdf) > 1900:
-                    summary_msg_pdf = summary_msg_pdf[:1900] + "\n...(이하 생략)"
-                await channel.send(summary_msg_pdf, silent=True)
+                await _discord_send_chunked(
+                    channel,
+                    summary_msg_pdf,
+                    silent=True,
+                    header_prefix=f"{symbol_short}-{tf}-Summary"
+                )
 
                 # 점수기록: 실제 발송시에만
                 hist = score_history_btc.setdefault(tf, deque(maxlen=4))
