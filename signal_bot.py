@@ -7,6 +7,7 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # ★ 비대화형 백엔드 (파일 저장 전용)
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import platform
 import os, sys, logging
 import discord
@@ -9363,6 +9364,165 @@ async def _dash_struct_block() -> list[str]:
     return out
 
 
+
+# === SCE text render for analysis messages ====================================
+def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
+    """
+    분석 알림 본문 공통 섹션:
+    - 최근접 저항/지지: 값 / 거리(ATR배수)
+    - 추세선: up/down 근접/돌파
+    - 회귀/피보 채널: 상/하단 접근/이탈
+    - 컨플루언스/협곡
+    """
+    try:
+        if df is None:
+            rows = _load_ohlcv(symbol, tf, limit=400)
+            if not rows or len(rows) < 60:
+                return "◼ 구조 컨텍스트\n- 데이터 부족"
+            df = _sce_build_df_from_ohlcv(rows)
+        if ctx is None:
+            ctx = build_struct_context_basic(df, tf)
+
+        lines = ["◼ 구조 컨텍스트"]
+        near = (ctx.get("nearest") or {})
+        res, sup = near.get("res"), near.get("sup")
+        if res or sup:
+            rtxt = f"{res[1]:.2f} ({res[2]:.2f}×ATR)" if res else "-"
+            stxt = f"{sup[1]:.2f} ({sup[2]:.2f}×ATR)" if sup else "-"
+            lines.append(f"- 최근접 저항/지지: {rtxt} / {stxt}")
+        else:
+            lines.append("- 최근접 저항/지지: -")
+
+        # 이유 요약: TREND, CHAN, CONFLUENCE/GAP 카테고리별 최대 1~2줄
+        cats = {"TREND": [], "CHAN": [], "CONF": [], "GAP": []}
+        for (text, sc, key) in ctx.get("reasons", []):
+            if key.startswith("TREND"):
+                cats["TREND"].append(text)
+            elif key.startswith("CHAN"):
+                cats["CHAN"].append(text)
+            elif key.startswith("STRUCT_CONFLUENCE"):
+                cats["CONF"].append(text)
+            elif key.startswith("STRUCT_GAP"):
+                cats["GAP"].append(text)
+
+        if cats["TREND"]:
+            lines.append(f"- 추세선: {cats['TREND'][0]}")
+        if cats["CHAN"]:
+            lines.append(f"- 채널: {cats['CHAN'][0]}")
+        if cats["CONF"]:
+            lines.append(f"- 컨플루언스: {cats['CONF'][0]}")
+        if cats["GAP"]:
+            lines.append(f"- 협곡: {cats['GAP'][0]}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"◼ 구조 컨텍스트\n- 생성 실패: {type(e).__name__}"
+# ============================================================================== 
+
+
+# === Structure overlay renderer (matplotlib) ==================================
+def render_struct_overlay(symbol: str, tf: str, df, struct_info,
+                          save_dir: str = "./charts", width: int = 1600, height: int = 900) -> str | None:
+    """
+    캔들 + 수평 레벨 + 추세선(최근 피벗 2점) + 회귀 채널 + 피보 채널을 그려 저장.
+    반환: 파일 경로 (실패 시 None)
+    """
+    try:
+        os.makedirs(save_dir, exist_ok=True)
+        if df is None or len(df) < 60 or struct_info is None:
+            return None
+
+        # 좌표 준비
+        x = np.arange(len(df))
+        o,h,l,c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+
+        # Figure
+        dpi = 100
+        fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
+        ax = fig.add_subplot(111)
+        ax.set_title(f"{symbol} • {tf} • Structure Overlay", loc="left")
+
+        # 캔들 (간단 구현)
+        barw = 0.6
+        for i in range(len(df)):
+            color = "#2ca02c" if c[i] >= o[i] else "#d62728"
+            ax.vlines(i, l[i], h[i], linewidth=1, color=color, alpha=0.8)
+            rb = Rectangle((i - barw/2, min(o[i], c[i])),
+                           barw, abs(c[i]-o[i]),
+                           facecolor=color, edgecolor=color, alpha=0.6)
+            ax.add_patch(rb)
+
+        last_x = len(df)-1
+        price  = float(c[-1])
+        atr    = struct_info.get("atr", 0.0) or 0.0
+
+        # 수평 레벨
+        ne = struct_info.get("nearest") or {}
+        res = ne.get("res"); sup = ne.get("sup")
+        for (t, v) in struct_info.get("levels", [])[:10]:
+            lw = 1.2; ls = "--"; col = "#888888"
+            if t == "ATH": col = "#c21807"; lw = 1.8
+            if t == "ATL": col = "#1565c0"; lw = 1.8
+            if res and v == float(res[1]): lw = 2.4; col = "#c21807"; ls="-"
+            if sup and v == float(sup[1]): lw = 2.4; col = "#1565c0"; ls="-"
+            ax.hlines(v, 0, last_x, colors=col, linestyles=ls, linewidth=lw, alpha=0.9)
+
+        # 추세선
+        try:
+            tls = _sce_best_trendlines(df)
+            for dirn in ("up","down"):
+                tl = tls.get(dirn)
+                if not tl: continue
+                y1 = _sce_value_on_line(tl, 0)
+                y2 = _sce_value_on_line(tl, last_x)
+                ls = "--"; col = "#2e7d32" if dirn=="up" else "#b71c1c"
+                ax.plot([0,last_x],[y1,y2], ls=ls, lw=1.8, color=col, alpha=0.9, label=f"{dirn} TL")
+        except Exception:
+            pass
+
+        # 회귀 채널
+        try:
+            reg = _sce_linreg_channel(df)
+            if reg:
+                ax.plot([0,last_x],[reg["upper"]]*2, lw=1.4, color="#6a1b9a", ls="-", alpha=0.9, label="Reg ↑")
+                ax.plot([0,last_x],[reg["lower"]]*2, lw=1.4, color="#6a1b9a", ls="--", alpha=0.9, label="Reg ↓")
+        except Exception:
+            pass
+
+        # 피보 채널
+        try:
+            fib = _sce_fib_channel(df)
+            if fib:
+                ups, downs = fib["ups"], fib["downs"]
+                for v in ups:
+                    ax.plot([0,last_x],[v]*2, lw=1.0, color="#f39c12", ls="-", alpha=0.8)
+                for v in downs:
+                    ax.plot([0,last_x],[v]*2, lw=1.0, color="#f39c12", ls="--", alpha=0.8)
+        except Exception:
+            pass
+
+        ax.set_xlim(-1, last_x+1)
+        ypad = (np.nanmax(h[-120:]) - np.nanmin(l[-120:])) * 0.05 if len(df)>120 else (np.nanmax(h) - np.nanmin(l)) * 0.05
+        ax.set_ylim(np.nanmin(l[-120:]) - ypad, np.nanmax(h[-120:]) + ypad)
+        ax.grid(True, alpha=0.2)
+        ax.legend(loc="upper right", fontsize=8)
+
+        out = os.path.join(save_dir, f"struct_{symbol.replace('/','-')}_{tf}_{int(time.time())}.png")
+        fig.tight_layout()
+        fig.savefig(out)
+        plt.close(fig)
+        return out
+    except Exception as e:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+        log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
+        return None
+# ==============================================================================
+
+
+
 async def _dash_render_text():
 
     st = _daily_state_load() or {}  # ← Nonesafe
@@ -10747,6 +10907,19 @@ async def on_ready():
                         pnl = ((entry_price - price) / entry_price) * 100
 
                 chart_files = save_chart_groups(df, symbol_eth, tf)
+                df_struct = None
+                struct_info = None
+                struct_img = None
+                # 구조 오버레이 이미지 생성 및 첨부
+                try:
+                    rows = _load_ohlcv(symbol_eth, tf, limit=400)
+                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                    struct_info = build_struct_context_basic(df_struct, tf) if df_struct is not None else None
+                    struct_img = render_struct_overlay(symbol_eth, tf, df_struct, struct_info)
+                    if struct_img:
+                        chart_files = list(chart_files) + [struct_img]
+                except Exception as _e:
+                    log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
 
                 # ✅ entry_data가 없을 경우 None으로 초기화
                 if entry_data.get(key2):
@@ -10803,6 +10976,21 @@ async def on_ready():
 
                     show_risk=False
                 )
+                struct_block = None
+                # 구조 컨텍스트 섹션 프리펜드
+                try:
+                    struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
+                    main_msg_pdf = f"{struct_block}\n\n{main_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_eth} {tf} main {type(_e).__name__}: {_e}")
+
+                # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
+                try:
+                    if struct_block is None:
+                        struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
+                    summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_eth} {tf} summary {type(_e).__name__}: {_e}")
                 # 닫힌 캔들만 사용 (iloc[-2]가 닫힌 봉)
                 candle_ts = None
                 if len(df) >= 2 and 'timestamp' in df:
@@ -11220,9 +11408,24 @@ async def on_ready():
                     entry_time=_entry_time,
                     entry_price=_entry_price,
                     recent_scores=list(score_history_btc.setdefault(tf, deque(maxlen=4))),
-                    live_price=display_price,  # reuse ticker for consistent short/long pricing
-                    show_risk=False
-                )
+                      live_price=display_price,  # reuse ticker for consistent short/long pricing
+                      show_risk=False
+                  )
+                struct_block = None
+                # 구조 컨텍스트 섹션 프리펜드
+                try:
+                    struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
+                    main_msg_pdf = f"{struct_block}\n\n{main_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_btc} {tf} main {type(_e).__name__}: {_e}")
+
+                # 구조 컨텍스트 섹션 프리펜드(요약에도 동일 적용)
+                try:
+                    if struct_block is None:
+                        struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
+                    summary_msg_pdf = f"{struct_block}\n\n{summary_msg_pdf}"
+                except Exception as _e:
+                    log(f"[SCE_SECT_WARN] {symbol_btc} {tf} summary {type(_e).__name__}: {_e}")
 
 
                 channel = _get_channel_or_skip('BTC', tf)
@@ -11230,6 +11433,19 @@ async def on_ready():
                     continue
 
                 chart_files = save_chart_groups(df, symbol_btc, tf)
+                df_struct = None
+                struct_info = None
+                struct_img = None
+                # 구조 오버레이 이미지 생성 및 첨부
+                try:
+                    rows = _load_ohlcv(symbol_btc, tf, limit=400)
+                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                    struct_info = build_struct_context_basic(df_struct, tf) if df_struct is not None else None
+                    struct_img = render_struct_overlay(symbol_btc, tf, df_struct, struct_info)
+                    if struct_img:
+                        chart_files = list(chart_files) + [struct_img]
+                except Exception as _e:
+                    log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 # 1) 짧은 알림(푸시용)
                 await channel.send(content=short_msg)
 
