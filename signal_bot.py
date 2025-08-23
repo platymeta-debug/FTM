@@ -9622,6 +9622,28 @@ def _render_struct_legend(ctx: dict, tf: str) -> str:
 
 
 
+# === STRUCT VIEW HELPERS ======================================================
+def _tf_view_lookback(tf: str) -> int:
+    m = {
+        "15m": env_int("STRUCT_VIEW_LOOKBACK_15m", 260),
+        "1h":  env_int("STRUCT_VIEW_LOOKBACK_1h", 280),
+        "4h":  env_int("STRUCT_VIEW_LOOKBACK_4h", 300),
+        "1d":  env_int("STRUCT_VIEW_LOOKBACK_1d", 320),
+    }
+    return m.get(tf, env_int("STRUCT_VIEW_LOOKBACK_DEFAULT", 280))
+
+
+def _atr_fast(df):
+    try:
+        h, l, c = df["high"].values, df["low"].values, df["close"].values
+        prev = np.r_[c[0], c[:-1]]
+        tr = np.maximum.reduce([h - l, np.abs(h - prev), np.abs(l - prev)])
+        n = min(len(tr), 14)
+        return float(pd.Series(tr).rolling(n).mean().iloc[-1])
+    except Exception:
+        return float(df["close"].std()) if "close" in df else 1.0
+# ============================================================================
+
 # === Structure overlay renderer (matplotlib) ==================================
 def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                           save_dir: str = "./charts", width: int = 1600, height: int = 900) -> str | None:
@@ -9654,60 +9676,101 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                            facecolor=color, edgecolor=color, alpha=0.6)
             ax.add_patch(rb)
 
-        last_x = len(df)-1
-        price  = float(c[-1])
-        atr    = struct_info.get("atr", 0.0) or 0.0
+        # ====== VIEW BOUNDS (x/y) ======
+        N = len(df)
+        lookback = _tf_view_lookback(tf)
+        left  = max(0, N - lookback)
+        right = N - 1
 
-        # 수평 레벨
-        ne = struct_info.get("nearest") or {}
-        res = ne.get("res"); sup = ne.get("sup")
-        for (t, v) in struct_info.get("levels", [])[:10]:
-            lw = 1.2; ls = "--"; col = "#888888"
-            if t == "ATH": col = "#c21807"; lw = 1.8
-            if t == "ATL": col = "#1565c0"; lw = 1.8
-            if res and v == float(res[1]): lw = 2.4; col = "#c21807"; ls="-"
-            if sup and v == float(sup[1]): lw = 2.4; col = "#1565c0"; ls="-"
-            ax.hlines(v, 0, last_x, colors=col, linestyles=ls, linewidth=lw, alpha=0.9)
+        pad_bars = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
+        x_min = max(0, left - pad_bars)
+        x_max = right + pad_bars
 
-        # 추세선
+        view_slice = df.iloc[left:right+1]
+        y_min = float(view_slice["low"].min())
+        y_max = float(view_slice["high"].max())
         try:
-            tls = _sce_best_trendlines(df)
-            for dirn in ("up","down"):
-                tl = tls.get(dirn)
-                if not tl: continue
-                y1 = _sce_value_on_line(tl, 0)
-                y2 = _sce_value_on_line(tl, last_x)
-                ls = "--"; col = "#2e7d32" if dirn=="up" else "#b71c1c"
-                ax.plot([0,last_x],[y1,y2], ls=ls, lw=1.8, color=col, alpha=0.9, label=f"{dirn} TL")
+            lv = []
+            if struct_info:
+                near = struct_info.get("levels") or []    # [(type, price, ...)] 라고 가정
+                for it in near:
+                    if isinstance(it, (list, tuple)) and len(it) >= 2:
+                        lv.append(float(it[1]))
+            if len(lv):
+                y_min = min(y_min, min(lv))
+                y_max = max(y_max, max(lv))
         except Exception:
             pass
 
-        # 회귀 채널
-        try:
-            reg = _sce_linreg_channel(df)
-            if reg:
-                ax.plot([0,last_x],[reg["upper"]]*2, lw=1.4, color="#6a1b9a", ls="-", alpha=0.9, label="Reg ↑")
-                ax.plot([0,last_x],[reg["lower"]]*2, lw=1.4, color="#6a1b9a", ls="--", alpha=0.9, label="Reg ↓")
-        except Exception:
-            pass
+        atr = _atr_fast(view_slice)
+        y_pad = max((y_max - y_min) * 0.08, atr * env_float("STRUCT_VIEW_Y_PAD_ATR", 0.6))
+        ax = plt.gca()
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(y_min - y_pad, y_max + y_pad)
+        ax.margins(x=0.0, y=0.0)   # autoscale 여지 제거
+        ax.autoscale(False)
 
-        # 피보 채널
+        # ====== LINE LABELS (무슨 선인지 바로 보이게) ======
         try:
-            fib = _sce_fib_channel(df)
-            if fib:
-                ups, downs = fib["ups"], fib["downs"]
-                for v in ups:
-                    ax.plot([0,last_x],[v]*2, lw=1.0, color="#f39c12", ls="-", alpha=0.8)
-                for v in downs:
-                    ax.plot([0,last_x],[v]*2, lw=1.0, color="#f39c12", ls="--", alpha=0.8)
-        except Exception:
-            pass
+            # 최근접 저항/지지 라벨(오른쪽 끝에 붙이기)
+            if struct_info and struct_info.get("nearest"):
+                res = struct_info["nearest"].get("res")
+                sup = struct_info["nearest"].get("sup")
+                if res:
+                    level, dist_atr = float(res[1]), float(res[2])
+                    ax.hlines(level, x_min, x_max, color="#d62728", lw=2, zorder=2)  # R
+                    ax.text(x_max, level, f"R {level:.2f} ({dist_atr:.2f}×ATR)",
+                            ha="right", va="bottom",
+                            fontsize=9, color="#d62728",
+                            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#d62728", alpha=0.8))
+                if sup:
+                    level, dist_atr = float(sup[1]), float(sup[2])
+                    ax.hlines(level, x_min, x_max, color="#1f77b4", lw=2, zorder=2)  # S
+                    ax.text(x_max, level, f"S {level:.2f} ({dist_atr:.2f}×ATR)",
+                            ha="right", va="top",
+                            fontsize=9, color="#1f77b4",
+                            bbox=dict(boxstyle="round,pad=0.25", fc="white", ec="#1f77b4", alpha=0.8))
+            # 추세선 라벨(상승=green, 하락=red)
+            if struct_info and struct_info.get("trend_lines"):
+                for tl in struct_info["trend_lines"]:  # {"dir":"up/down","p1":(i,price),"p2":(...)}
+                    d = tl.get("dir","")
+                    c = "#2ca02c" if d=="up" else "#ff7f0e"
+                    (x1,y1) = tl.get("p1", (left, view_slice["close"].iloc[0]))
+                    (x2,y2) = tl.get("p2", (right, view_slice["close"].iloc[-1]))
+                    x1, x2 = max(x_min, min(x1, x_max)), max(x_min, min(x2, x_max))
+                    ax.plot([x1,x2],[y1,y2], ls="--", lw=1.8, color=c, zorder=2, label=f"{'상승' if d=='up' else '하락'} TL")
+            # 회귀/피보 채널 라벨
+            if struct_info and struct_info.get("channels"):
+                for ch in struct_info["channels"]:  # {"type":"reg/fib","y":float,"top":float,"bot":float}
+                    typ = ch.get("type","")
+                    if typ=="reg":
+                        ax.hlines([ch.get("top"), ch.get("bot")], x_min, x_max, colors="#9467bd", linestyles=":", lw=1.5, zorder=1)
+                        ax.text(x_max, ch.get("top"), "Reg ↑", ha="right", va="bottom", fontsize=8, color="#9467bd")
+                        ax.text(x_max, ch.get("bot"), "Reg ↓", ha="right", va="top",    fontsize=8, color="#9467bd")
+                    elif typ=="fib":
+                        for lv in ch.get("levels", []):  # [(ratio, price), ...]
+                            r, p = lv
+                            ax.hlines(p, x_min, x_max, colors="#17becf", linestyles="--", lw=1.2, zorder=1)
+                            ax.text(x_max, p, f"Fib {r}", ha="right", va="center", fontsize=8, color="#17becf")
+            # 범례(추세선 구분만 간단히)
+            try:
+                leg = ax.legend(loc="upper right", fontsize=9, frameon=True)
+                leg.get_frame().set_alpha(0.85)
+            except Exception:
+                pass
+        except Exception as _e:
+            log(f"[STRUCT_LABEL_WARN] {type(_e).__name__}: {_e}")
 
-        ax.set_xlim(-1, last_x+1)
-        ypad = (np.nanmax(h[-120:]) - np.nanmin(l[-120:])) * 0.05 if len(df)>120 else (np.nanmax(h) - np.nanmin(l)) * 0.05
-        ax.set_ylim(np.nanmin(l[-120:]) - ypad, np.nanmax(h[-120:]) + ypad)
         ax.grid(True, alpha=0.2)
-        ax.legend(loc="upper right", fontsize=8)
+
+        # ====== INSET GUIDE (간단 해설 박스) ======
+        if os.getenv("CHART_STRUCT_GUIDE_ON_IMG","1") == "1":
+            guide = ("구조 해석 가이드\n"
+                     "R/S: 빨강=저항, 파랑=지지 (괄호=ATR배수 거리)\n"
+                     "TL: 녹색=상승, 주황=하락 (점선)\n"
+                     "Reg/Fib: 보라/청록 점/점선 밴드")
+            ax.text(0.01, 0.02, guide, transform=ax.transAxes, va="bottom", ha="left", fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="gray", alpha=0.8))
 
         # [PATCH C1-BEGIN]  << overlay legend inset >>
         try:
@@ -9731,8 +9794,8 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
         # [PATCH C1-END]
 
         out = os.path.join(save_dir, f"struct_{symbol.replace('/','-')}_{tf}_{int(time.time())}.png")
-        fig.tight_layout()
-        fig.savefig(out)
+        fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.98])
+        fig.savefig(out, dpi=140, bbox_inches="tight", pad_inches=0.1)
         plt.close(fig)
         return out
     except Exception as e:
@@ -11270,11 +11333,11 @@ async def on_ready():
                 except Exception:
                     df_struct = None
 
+
                 # 폴백: 기존 분석에 사용된 df로 대체 (최소행수 만족 시)
-
                 if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
-
                     df_struct = df.copy()
+
 
                 struct_info = None
                 struct_img  = None
@@ -11819,8 +11882,8 @@ async def on_ready():
 
 
                 if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
-
                     df_struct = df.copy()
+
 
                 struct_info = None
                 struct_img  = None
