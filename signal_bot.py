@@ -192,6 +192,9 @@ symbol_btc = 'BTC/USDT'
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
 
+# 최근 분석에 사용된 DF 캐시 (대시보드 폴백용)
+_LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+
 # [ANCHOR: PAUSE_GLOBALS]
 KST = timezone(timedelta(hours=9))
 PAUSE_UNTIL = {}  # (symbol, tf) -> epoch_ms; "__ALL__" -> epoch_ms
@@ -9480,7 +9483,9 @@ def _get_cooldown_sec(symbol: str, tf: str) -> int:
 
 def _struct_shortline(symbol: str, tf: str) -> str:
     try:
+
         ent = STRUCT_CACHE.get((symbol, tf))
+
         if ent and ent.get("ctx"):
             ctx = ent["ctx"]
             near = (ctx.get("nearest") or {})
@@ -9564,7 +9569,9 @@ async def _dash_struct_block():
                 cd_lines.append(f" - {s.split('/')[0]}-{tf}: 남은 {sec}s")
     if cd_lines:
         out.append("◼ 알림 쿨다운")
+
         out += cd_lines
+
 
     return out
 
@@ -9814,6 +9821,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                      "Reg/Fib: 보라/청록 점/점선 밴드")
             ax.text(0.01, 0.02, guide, transform=ax.transAxes, va="bottom", ha="left", fontsize=9,
                     bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="gray", alpha=0.8))
+
 
         out = os.path.join(save_dir, f"struct_{symbol.replace('/','-')}_{tf}_{int(time.time())}.png")
         fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.98])
@@ -11355,9 +11363,11 @@ async def on_ready():
                 except Exception:
                     df_struct = None
 
+
                 # 폴백: 기존 분석에 사용된 df로 대체 (최소행수 만족 시)
                 if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
                     df_struct = df.copy()
+
 
                 struct_info = None
                 struct_img  = None
@@ -11892,6 +11902,7 @@ async def on_ready():
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
+
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
                     rows = _load_ohlcv(symbol_btc, tf, limit=400)
@@ -11899,8 +11910,10 @@ async def on_ready():
                 except Exception:
                     df_struct = None
 
+
                 if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
                     df_struct = df.copy()
+
 
                 struct_info = None
                 struct_img  = None
@@ -12076,6 +12089,7 @@ async def on_message(message):
                 df = (_LAST_DF_CACHE.get((symbol, tf)) if '_LAST_DF_CACHE' in globals() else None)
 
             # 2) 로컬 분석 df 폴백
+
             if (df is None or len(df) < env_int("SCE_MIN_ROWS", 60)) and '_LAST_DF_CACHE' in globals():
                 df = _LAST_DF_CACHE.get((symbol, tf))
 
@@ -12085,6 +12099,7 @@ async def on_message(message):
                 df = _sce_build_df_from_ohlcv(rows) if rows else None
 
             if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
+
                 await ch.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족(입력/네트워크 실패)")
                 return
 
