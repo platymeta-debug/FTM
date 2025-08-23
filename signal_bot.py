@@ -2589,6 +2589,7 @@ def _sce_value_on_line(tl, x):
     m = (p2 - p1) / (i2 - i1); b = p1 - m * i1
     return m * x + b
 
+
 def _sce_build_df_from_ohlcv(rows):
     return pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
 
@@ -2658,6 +2659,7 @@ def _mtf_struct_guard(symbol: str, tf: str, side_signal: str):
     except Exception as e:
         log(f"[MTF_GUARD_WARN] {symbol} {tf} {e}")
         return {"action":"NONE", "reason":""}
+
 
 
 def build_struct_context_basic(df, tf, atr_len=None,
@@ -5021,6 +5023,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
 # [PATCH NEG/CCA GATE BEGIN — maybe_execute_trade]
     try:
+
         # ── MTF 구조 게이트 적용 ──────────────────────────────────────────────
         try:
             mtf_dec = _mtf_struct_guard(symbol, tf, exec_signal)
@@ -5030,6 +5033,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         except Exception as _e:
             log(f"[MTF-GATE-WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
         # ─────────────────────────────────────────────────────────────────────
+
         # 토글/임계치 (env는 사용자가 설정)
         coh_on      = str(cfg_get("COHERENCE_MODE", "on")).lower() in ("1","on","true","yes")
         if coh_on:
@@ -5077,6 +5081,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             if cca_weaken:
                 scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
 
+
             # 상위TF 근접으로 스카웃만 허용된 경우
             try:
                 mtf_dec = _mtf_struct_guard(symbol, tf, exec_signal)
@@ -5086,15 +5091,19 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             except Exception:
                 pass
 
+
             # 스케일/스카웃 반영
             if scale_factor < 0.999:
                 eff_margin = float(eff_margin) * float(scale_factor)
                 qty        = (float(eff_margin) * float(lev_used or 1.0)) / max(price_ref, 1e-9)
+
                 EXEC_STATE[("coh_tags", symbol, tf)] = ",".join(reason_tags)
+
                 log(f"[COHERENCE] {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
     except Exception as e:
         log(f"[COHERENCE_WARN] {symbol} {tf} {e}")
 # [PATCH NEG/CCA GATE END — maybe_execute_trade]
+
     # [PATCH SAT APPLY BEGIN — maybe_execute_trade]
     try:
         side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
@@ -5116,6 +5125,7 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     except Exception as e:
         log(f"[STYLE_WARN] {symbol} {tf} {e}")
     # [PATCH SAT APPLY END — maybe_execute_trade]
+
     _pb_label   = alloc.get("pb_label")
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
@@ -6252,6 +6262,7 @@ STRUCT_NEAR_THR_ATR    = float(cfg_get("STRUCT_NEAR_THR_ATR", "0.8"))
 STRUCT_MAX_LEVELS      = int(float(cfg_get("STRUCT_MAX_LEVELS", "6")))
 # (B 단계에서 사용)
 STRUCT_BREAK_CLOSE_ATR = float(cfg_get("STRUCT_BREAK_CLOSE_ATR", "0.2"))
+
 # --- SCE (E) MTF gate/bias ---
 MTF_STRUCT_BIAS        = (cfg_get("MTF_STRUCT_BIAS", "on").lower() in ("1","on","true","yes"))
 MTF_STRUCT_MAP_STR     = cfg_get("MTF_STRUCT_MAP", "15m:1h,4h;1h:4h,1d;4h:1d")
@@ -6261,6 +6272,7 @@ MTF_BLOCK_NEAR         = (cfg_get("MTF_BLOCK_NEAR", "0") == "1")  # true면 근�
 MTF_ALERT_ENABLE       = (cfg_get("MTF_ALERT_ENABLE", "1") == "1")
 MTF_ALERT_COOLDOWN_SEC = int(float(cfg_get("MTF_ALERT_COOLDOWN_SEC", "1800")))
 MTF_ALERT_PREWARN_ATR  = float(cfg_get("MTF_ALERT_PREWARN_ATR", "0.6"))  # 사전경고 임계(ATR배수)
+
 CHANNEL_BANDS_STD   = float(cfg_get("CHANNEL_BANDS_STD", "1.5"))
 AVWAP_ANCHORS       = cfg_get("AVWAP_ANCHORS", "SWING_HI,SWING_LO,LAST_BREAKOUT")
 CTX_ALPHA           = float(cfg_get("CTX_ALPHA", "0.35"))
@@ -6799,6 +6811,7 @@ def _best_opposite_score(symbol: str, side: str) -> float:
     return float(best)
 # [PATCH NEG/CCA HELPERS END]
 
+
 # [PATCH SAT HELPERS BEGIN]
 def _ind(symbol:str, tf:str, key:str, default:float=0.0) -> float:
     """지표 캐시 EXEC_STATE에서 안전하게 값 로드."""
@@ -6945,6 +6958,7 @@ def _style_sl_tp(symbol:str, tf:str, side:str, entry_price:float, ref_price:floa
         "atr_mult": float(prm["atr_mult"]),
     }
 # [PATCH SAT HELPERS END]
+
 # repair hi/lo baselines on boot (applies to all TFs)
 try:
     for key, pos in (PAPER_POS or {}).items():
@@ -8909,6 +8923,7 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             if cca_weaken:
                 scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
 
+
             # 상위TF 근접으로 스카웃만 허용된 경우
             try:
                 mtf_dec = _mtf_struct_guard(symbol, tf, exec_signal)
@@ -8921,10 +8936,12 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             if scale_factor < 0.999:
                 eff_margin = float(eff_margin) * float(scale_factor)
                 EXEC_STATE[("coh_tags", symbol, tf)] = ",".join(reason_tags)
+
                 log(f"[COHERENCE] FUT {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
     except Exception as e:
         log(f"[COHERENCE_WARN] FUT {symbol} {tf} {e}")
 # [PATCH NEG/CCA GATE END — maybe_execute_futures_trade]
+
     # [PATCH SAT APPLY BEGIN — maybe_execute_futures_trade]
     try:
         side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
