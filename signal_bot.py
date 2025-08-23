@@ -149,6 +149,9 @@ symbol_btc = 'BTC/USDT'
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
 
+# 최근 분석에 사용된 DF 캐시 (대시보드 폴백용)
+_LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+
 # [ANCHOR: PAUSE_GLOBALS]
 KST = timezone(timedelta(hours=9))
 PAUSE_UNTIL = {}  # (symbol, tf) -> epoch_ms; "__ALL__" -> epoch_ms
@@ -9415,7 +9418,9 @@ def _struct_shortline(symbol: str, tf: str) -> str:
                 df_struct = last_df.copy()
         df = df_struct
         if df is None or len(df) < 60:
+
             return f"{symbol} {tf}: 준비중"
+
         ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
         if ent and ent.get("ctx"):
             ctx = ent["ctx"]
@@ -11213,6 +11218,7 @@ async def on_ready():
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
+
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
                 # 기존: rows = _load_ohlcv(...) → df_struct 만들고 실패 시 None → 이미지 미첨부
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
@@ -11758,6 +11764,7 @@ async def on_ready():
 
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
+
 
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
