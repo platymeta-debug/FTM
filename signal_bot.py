@@ -216,6 +216,7 @@ EXIT_RESOLUTION = cfg_get("EXIT_RESOLUTION", "1m").lower()  # must be "1m"
 EXIT_EVAL_MODE  = cfg_get("EXIT_EVAL_MODE", "TOUCH").upper()  # TOUCH | CLOSE (on 1m)
 # Which price feed to read before clamping. 'mark' is not allowed to trigger directly (we clamp anyway).
 EXIT_PRICE_SOURCE = cfg_get("EXIT_PRICE_SOURCE", "last").lower()  # last | index | mark(→forced last)
+TRIGGER_PRICE_SOURCE = cfg_get("STOP_TRIGGER_PRICE", os.getenv("EXIT_PRICE_SOURCE", "mark")).lower()
 # 1m outlier spike guard (fraction, e.g., 0.03=3% vs 1m open/close); 0 disables
 
 OUTLIER_MAX_1M = float(cfg_get("OUTLIER_MAX_1M", "0.03"))
@@ -2479,6 +2480,139 @@ def add_indicators(df):
 # - agree_long/agree_short: 상위TF 정렬은 close 값 기준(닫힌 캔들)
 # ======================================================================
 
+# === [SCE] Structure Context Engine — A) 수평레벨 ================================
+def _sce_atr(df, n):
+    try:
+        if 'ATR14' in df.columns and n == 14:
+            v = float(df['ATR14'].iloc[-1])
+            if pd.notna(v):
+                return max(1e-8, v)
+        tr = np.maximum(df['high'] - df['low'],
+                        np.maximum((df['high'] - df['close'].shift()).abs(),
+                                   (df['low'] - df['close'].shift()).abs()))
+        return max(1e-8, tr.rolling(n).mean().iloc[-1])
+    except Exception:
+        return 1.0
+
+
+def _sce_pivots(df, left=2, right=2):
+    """Fractal pivots: return (high_pivots, low_pivots) where each pivot=(idx, price)."""
+    hp, lp = [], []
+    highs = df['high'].values
+    lows  = df['low'].values
+    n = len(df)
+    for i in range(left, n-right):
+        hi_seg = highs[i-left:i+right+1]
+        lo_seg = lows[i-left:i+right+1]
+        if np.argmax(hi_seg) == left:  # local max
+            hp.append((i, highs[i]))
+        if np.argmin(lo_seg) == left:  # local min
+            lp.append((i, lows[i]))
+    return hp, lp
+
+
+def _sce_horizontal_levels(df, tf, atr_len, max_levels=6):
+    """ATH/ATL + 최근 피벗H/L(각 3개까지)으로 수평 레벨 구성."""
+    levels = []
+    try:
+        price = float(df['close'].iloc[-1])
+        ath = float(df['high'].max()); atl = float(df['low'].min())
+        levels.append(('ATH', ath)); levels.append(('ATL', atl))
+        hp, lp = _sce_pivots(df, left=2, right=2)
+        for t, piv in [('PH', hp), ('PL', lp)]:
+            for idx, pr in piv[-3:]:
+                levels.append((t, float(pr)))
+        # 0.1 ATR 이내 중복 레벨 제거
+        uniq, used = [], []
+        tol = _sce_atr(df, atr_len) * 0.1
+        for t, lv in levels:
+            if any(abs(lv-u) <= tol for u in used):
+                continue
+            uniq.append((t, lv)); used.append(lv)
+        levels = uniq[-max_levels:]
+    except Exception:
+        pass
+    return levels
+
+
+def _sce_best_trendlines(df):
+    """최근 피벗 2점으로 상승/하락 추세선 산출. 반환 {'up':(i1,p1,i2,p2), 'down':(...)}"""
+    hp, lp = _sce_pivots(df, left=2, right=2)
+    up   = lp[-2:] if len(lp) >= 2 else None
+    down = hp[-2:] if len(hp) >= 2 else None
+    tl = {}
+    tl['up']   = (up[0][0], up[0][1], up[1][0], up[1][1])   if up   and len(up)==2   else None
+    tl['down'] = (down[0][0], down[0][1], down[1][0], down[1][1]) if down and len(down)==2 else None
+    return tl
+
+
+def _sce_value_on_line(tl, x):
+    (i1, p1, i2, p2) = tl
+    if i2 == i1: return p2
+    m = (p2 - p1) / (i2 - i1); b = p1 - m * i1
+    return m * x + b
+
+
+def build_struct_context_basic(df, tf, atr_len=None,
+                               near_thr_atr=None, max_levels=None):
+    """PART A: 수평 레벨 근접도 계산. reasons=[(reason, score, key)]."""
+    n = len(df)
+    atr_len     = int(cfg_get("STRUCT_ATR_LEN", "14")) if atr_len is None else atr_len
+    near_thr_atr= float(cfg_get("STRUCT_NEAR_THR_ATR", "0.8")) if near_thr_atr is None else near_thr_atr
+    max_levels  = int(cfg_get("STRUCT_MAX_LEVELS", "6")) if max_levels is None else max_levels
+
+    if n < max(50, atr_len+10):
+        return {"reasons": [], "levels": [], "nearest": None}
+
+    price = float(df['close'].iloc[-1])
+    atr   = _sce_atr(df, atr_len)
+    levels = _sce_horizontal_levels(df, tf, atr_len, max_levels=max_levels)
+
+    # 근접도(ATR 배수) 계산
+    near_sup = None; near_res = None
+    for typ, lv in levels:
+        d_atr = abs(price - lv)/max(1e-8, atr)
+        if lv <= price:
+            if (near_sup is None) or (d_atr < near_sup[2]): near_sup = (typ, lv, d_atr)
+        else:
+            if (near_res is None) or (d_atr < near_res[2]): near_res = (typ, lv, d_atr)
+
+    reasons = []
+    if near_res and near_res[2] <= near_thr_atr:
+        reasons.append((f"구조: 상단 저항({near_res[0]} {near_res[1]:.2f})까지 {near_res[2]:.2f}×ATR", -1.0, 'STRUCT_NEAR'))
+    if near_sup and near_sup[2] <= near_thr_atr:
+        reasons.append((f"구조: 하단 지지({near_sup[0]} {near_sup[1]:.2f})까지 {near_sup[2]:.2f}×ATR", +1.0, 'STRUCT_NEAR'))
+
+    # [B] Trendline proximity & break/이탈
+    break_close_atr = float(cfg_get("STRUCT_BREAK_CLOSE_ATR","0.2"))
+    tls    = _sce_best_trendlines(df)
+    last_x = len(df)-1
+    price  = float(df['close'].iloc[-1])
+    atr    = _sce_atr(df, atr_len)
+
+    for dirn in ('up','down'):
+        if not tls.get(dirn):
+            continue
+        val   = _sce_value_on_line(tls[dirn], last_x)
+        d_atr = abs(price - val)/max(1e-8, atr)
+
+        if d_atr <= near_thr_atr:
+            reasons.append((f"추세선({dirn}) 접근: 선가 {val:.2f}, 거리 {d_atr:.2f}×ATR", 0.5, f"TREND_{dirn.upper()}"))
+
+        # 종가 기준 돌파/이탈 컨펌 + ATR 버퍼
+        if dirn == 'down' and price > val + break_close_atr*atr:
+            reasons.append((f"하락추세선 종가 돌파(+{break_close_atr}×ATR 버퍼) — 리테스트 대기", 1.0, "TREND_BREAK"))
+        if dirn == 'up' and price < val - break_close_atr*atr:
+            reasons.append((f"상승추세선 종가 하향 이탈(−{break_close_atr}×ATR 버퍼)", -1.0, "TREND_BREAK"))
+
+    return {
+        "reasons": reasons,
+        "levels": levels,
+        "nearest": {"res": near_res, "sup": near_sup},
+        "atr": atr,
+    }
+
+
 def calculate_signal(df, tf, symbol):
 
     # 데이터 길이 체크
@@ -2539,6 +2673,23 @@ def calculate_signal(df, tf, symbol):
     senkou_a = df['senkou_span_a'].iloc[-1]
     senkou_b = df['senkou_span_b'].iloc[-1]
     chikou = df['chikou_span'].iloc[-1]
+
+    # === [SCE:A] 구조 컨텍스트(수평 레벨) 반영 ===
+    try:
+        if STRUCT_ENABLE:
+            sce = build_struct_context_basic(
+                df, tf,
+                atr_len=STRUCT_ATR_LEN,
+                near_thr_atr=STRUCT_NEAR_THR_ATR,
+                max_levels=STRUCT_MAX_LEVELS,
+            )
+            for reason, sc, key in sce.get("reasons", []):
+                strength.append(reason)
+                score += sc
+                weights[key] = weights.get(key, 0) + sc
+                weights_detail[key] = (weights[key], reason)
+    except Exception as _e:
+        log(f"[SCE_ERR:A] {symbol} {tf} {type(_e).__name__}: {_e}")
 
     past_price = df['close'].iloc[-26] if len(df) >= 27 else close_for_calc
 
@@ -4416,20 +4567,36 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         except Exception:
             pass
 
-    occ = PAPER_POS_TF.get(tf)
+    # --- TF occupancy check (paper vs futures) ---
+    occ = FUT_POS_TF.get(tf) if TRADE_MODE == "futures" else PAPER_POS_TF.get(tf)
+    # Safety: also consider cross-cache occupancy (in case of stale state)
+    occ = occ or PAPER_POS_TF.get(tf) or FUT_POS_TF.get(tf)
+    has_real = False
     if tf not in IGNORE_OCCUPANCY_TFS and occ:
-        has_real = _has_open_position(occ, tf, TRADE_MODE)
-        if POS_TF_STRICT:
-            if has_real:
-                log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
-                return
-        else:
+        try:
+            has_real = _has_open_position(occ, tf, TRADE_MODE)
+        except Exception:
+            has_real = False
+
+        # Disallow different symbol on the same TF when ALLOW_BOTH_PER_TF=0
+        if (not ALLOW_BOTH_PER_TF) and (str(occ) != str(symbol)):
+            log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED(other={occ})")
+            return
+
+        # Strict: if any real open pos exists on this TF → skip re-entry
+        if POS_TF_STRICT and has_real:
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
+
+        # Autorepair: clear stale occupancy if no real pos remains
         if POS_TF_AUTOREPAIR and not has_real:
             try:
-                PAPER_POS_TF.pop(tf, None)
-                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                if TRADE_MODE == "futures":
+                    if FUT_POS_TF.get(tf):
+                        FUT_POS_TF.pop(tf, None); _save_json(OPEN_TF_FILE, FUT_POS_TF)
+                else:
+                    if PAPER_POS_TF.get(tf):
+                        PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
                 log(f"[OCCUPANCY] cleared stale tf={tf} (was {occ})")
             except Exception:
                 pass
@@ -4744,6 +4911,86 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     sl_pct      = alloc.get("sl_pct")
     tr_pct      = alloc.get("tr_pct")
     lev         = alloc.get("lev_used")
+
+# [PATCH NEG/CCA GATE BEGIN — maybe_execute_trade]
+    try:
+        # 토글/임계치 (env는 사용자가 설정)
+        coh_on      = str(cfg_get("COHERENCE_MODE", "on")).lower() in ("1","on","true","yes")
+        if coh_on:
+            ner_min   = float(cfg_get("NER_MIN",   "0.25"))
+            ner_tgt   = float(cfg_get("NER_TARGET","0.35"))
+            plr_max   = float(cfg_get("PLR_MAX",   "0.80"))
+            scout_pct = float(cfg_get("SCOUT_ALLOC_PCT", "0.15"))
+            edge_dlt  = float(cfg_get("EDGE_SWITCH_DELTA", "0.12"))
+
+            side_str   = "LONG" if exec_signal == "BUY" else "SHORT"
+            price_ref  = float(last_price)
+            L, S       = _symbol_exposure(symbol, price_ref)
+
+            # 후보 notional (eff_margin*lev 또는 qty*price)
+            cand_notional = (float(eff_margin or 0.0) * float(lev_used or 0.0))
+            if (cand_notional <= 0.0) and qty and price_ref > 0:
+                cand_notional = float(qty) * price_ref
+
+            # CCA: 점수우위 검증 (반대사이드가 강하면 스카웃)
+            new_score = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+            opp_best  = _best_opposite_score(symbol, side_str)
+            cca_weaken = (opp_best > 0.0) and ((new_score - opp_best) < edge_dlt)
+
+            # NEG: NER/PLR 예측
+            ner_next, plr_next = _ner_plr(L, S, side_str, cand_notional)
+
+            scale_factor = 1.0
+            reason_tags  = []
+
+            # PLR 상한 위반 → 스카웃
+            if plr_next > plr_max:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append(f"PLR>{plr_max:.2f}")
+
+            # lighter side 진입 시 NER>=ner_min 유지 위한 x 상한 적용
+            heavier = "LONG" if L >= S else "SHORT"
+            if side_str != heavier:
+                x_max = _x_max_for_ner_min(L, S, side_str, ner_min)
+                if x_max <= 0:
+                    scale_factor = min(scale_factor, scout_pct); reason_tags.append("NER_CAP0")
+                elif cand_notional > x_max:
+                    scale_factor = min(scale_factor, max(0.0, x_max / max(cand_notional, 1e-9)))
+                    reason_tags.append("NER_SCALE")
+
+            # 점수우위 부족 시 스카웃
+            if cca_weaken:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
+
+            # 스케일/스카웃 반영
+            if scale_factor < 0.999:
+                eff_margin = float(eff_margin) * float(scale_factor)
+                qty        = (float(eff_margin) * float(lev_used or 1.0)) / max(price_ref, 1e-9)
+                EXEC_STATE[("coh_tags", symbol, tf)] = ",".join(reason_tags)
+                log(f"[COHERENCE] {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
+    except Exception as e:
+        log(f"[COHERENCE_WARN] {symbol} {tf} {e}")
+# [PATCH NEG/CCA GATE END — maybe_execute_trade]
+    # [PATCH SAT APPLY BEGIN — maybe_execute_trade]
+    try:
+        side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
+        entry_ref = float(last_price)
+        sat = _style_sl_tp(symbol, tf, side_str, entry_ref, entry_ref)
+        if sat.get("sl_price") is not None:
+            sl_price = sat["sl_price"]
+            sl_pct = abs((entry_ref - sat["sl_price"]) / entry_ref * 100.0)
+        if sat.get("tp_price") is not None:
+            tp_price = sat["tp_price"]
+            tp_pct = abs((sat["tp_price"] - entry_ref) / entry_ref * 100.0)
+        tr_pct = sat.get("trail_pct", 0.0)
+        EXEC_STATE[("style", symbol, tf)]  = sat.get("style")
+        EXEC_STATE[("regime", symbol, tf)] = sat.get("regime")
+        EXEC_STATE[("sl_mode", symbol, tf)] = sat.get("mode")
+        EXEC_STATE[("rr", symbol, tf)] = sat.get("rr")
+        EXEC_STATE[("atr_mult", symbol, tf)] = sat.get("atr_mult")
+        log(f"[STYLE] {symbol} {tf} {side_str} style={sat.get('style')} regime={sat.get('regime')} mode={sat.get('mode')} rr={sat.get('rr')}")
+    except Exception as e:
+        log(f"[STYLE_WARN] {symbol} {tf} {e}")
+    # [PATCH SAT APPLY END — maybe_execute_trade]
     _pb_label   = alloc.get("pb_label")
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
@@ -5159,13 +5406,20 @@ async def safe_price_hint(symbol:str):
             return _sanitize_exit_price(symbol, last)
         return _sanitize_exit_price(symbol, 0.0)
 
-    # 후보 가격 선택
-    cand = None
-    for k in PRICE_FALLBACK_ORDER:
-        v = snap.get(k)
+    # 트리거 소스 우선(존재하면 cand 고정)
+    pref = (TRIGGER_PRICE_SOURCE or "").strip().lower()
+    if pref and (pref in snap) and (snap.get(pref) is not None):
+        cand = float(snap.get(pref))
+    else:
+        cand = None
 
-        if v is not None:
-            cand = float(v); break
+    # 후보 가격 선택
+    if cand is None:
+        for k in PRICE_FALLBACK_ORDER:
+            v = snap.get(k)
+
+            if v is not None:
+                cand = float(v); break
 
     # mark 직접사용 제한 → last 있으면 last로 클램프
 
@@ -5866,6 +6120,13 @@ REGIME_LOOKBACK     = int(float(cfg_get("REGIME_LOOKBACK", "180")))
 REGIME_TREND_R2_MIN = float(cfg_get("REGIME_TREND_R2_MIN", "0.30"))
 REGIME_ADX_MIN      = float(cfg_get("REGIME_ADX_MIN", "20"))
 STRUCT_ZIGZAG_PCT   = float(cfg_get("STRUCT_ZIGZAG_PCT", "3.0"))
+# --- SCE (A/B) params ---
+STRUCT_ENABLE          = (cfg_get("STRUCT_ENABLE", "1") == "1")
+STRUCT_ATR_LEN         = int(float(cfg_get("STRUCT_ATR_LEN", "14")))
+STRUCT_NEAR_THR_ATR    = float(cfg_get("STRUCT_NEAR_THR_ATR", "0.8"))
+STRUCT_MAX_LEVELS      = int(float(cfg_get("STRUCT_MAX_LEVELS", "6")))
+# (B 단계에서 사용)
+STRUCT_BREAK_CLOSE_ATR = float(cfg_get("STRUCT_BREAK_CLOSE_ATR", "0.2"))
 CHANNEL_BANDS_STD   = float(cfg_get("CHANNEL_BANDS_STD", "1.5"))
 AVWAP_ANCHORS       = cfg_get("AVWAP_ANCHORS", "SWING_HI,SWING_LO,LAST_BREAKOUT")
 CTX_ALPHA           = float(cfg_get("CTX_ALPHA", "0.35"))
@@ -6297,6 +6558,259 @@ PAPER_POS = _load_json(PAPER_POS_FILE, {})   # key: f"{symbol}|{tf}" -> {side, e
 FUT_POS    = _load_json(OPEN_POS_FILE, {})         # symbol -> {'side','qty','entry'}
 FUT_POS_TF = _load_json(OPEN_TF_FILE, {})          # tf -> "BTC/USDT" 또는 "ETH/USDT"
 
+# [PATCH NEG/CCA HELPERS BEGIN]
+def _symbol_exposure(symbol: str, ref_price: float) -> tuple[float, float]:
+    """
+    현재 심볼의 총 Long/Short 노치오날 합계를 계산 (paper+futures).
+    반환: (L_notional, S_notional)
+    """
+    L = S = 0.0
+    try:
+        # PAPER
+        for k, pos in (PAPER_POS or {}).items():
+            if not isinstance(k, str) or not k.startswith(f"{symbol}|"):
+                continue
+            side = str(pos.get("side") or "").upper()
+            qty  = float(pos.get("qty") or 0.0)
+            lev  = float(pos.get("lev") or 0.0)
+            eff  = float(pos.get("eff_margin") or 0.0)
+            notional = (qty * ref_price) if (qty and ref_price) else (eff * lev)
+            if side == "LONG": L += max(0.0, notional)
+            elif side == "SHORT": S += max(0.0, notional)
+    except Exception:
+        pass
+    try:
+        # FUTURES (단일 심볼 키)
+        fp = (FUT_POS or {}).get(symbol) or {}
+        fside = str(fp.get("side") or "").upper()
+        fqty  = abs(float(fp.get("qty") or 0.0))
+        fnot  = fqty * ref_price if ref_price else 0.0
+        if fside == "LONG": L += max(0.0, fnot)
+        elif fside == "SHORT": S += max(0.0, fnot)
+    except Exception:
+        pass
+    return float(L), float(S)
+
+def _ner_plr(L: float, S: float, side: str, x: float) -> tuple[float, float]:
+    """
+    현재 L,S에 후보 포지션 notional(x)을 더했을 때의 (NER, PLR) 계산.
+    NER = |L'-S'|/(L'+S'),  PLR = min/max
+    """
+    Ln = L + (x if side == "LONG" else 0.0)
+    Sn = S + (x if side == "SHORT" else 0.0)
+    tot = Ln + Sn
+    if tot <= 0:
+        return 1.0, 0.0
+    net = abs(Ln - Sn)
+    ner = net / tot
+    mx  = max(Ln, Sn)
+    mn  = min(Ln, Sn)
+    plr = (mn / mx) if mx > 0 else 0.0
+    return float(ner), float(plr)
+
+def _x_max_for_ner_min(L: float, S: float, side: str, t: float) -> float:
+    """
+    '가벼운 쪽(lighter side)'으로 진입할 때 NER>=t를 유지하기 위한 최대 notional x 상한.
+    무제한/해당없음이면 큰 값 반환(=제한 없음), 불가능하면 0 반환.
+    """
+    t = float(t)
+    if t >= 1.0:
+        return 0.0
+    # heavier 판단
+    heavier = "LONG" if L >= S else "SHORT"
+    if side == heavier:
+        return float("inf")  # 무제한 (추가해도 NER 상승/유지)
+    # lighter로 진입 → x 상한 공식
+    if side == "LONG" and S >= L:
+        # NER = (S - L - x)/(S + L + x) >= t  → x <= ((1-t)S - (1+t)L)/(1+t)
+        num = (1.0 - t) * S - (1.0 + t) * L
+        den = (1.0 + t)
+        return max(0.0, num / den)
+    if side == "SHORT" and L >= S:
+        # NER = (L - S - x)/(L + S + x) >= t  → x <= ((1-t)L - (1+t)S)/(1+t)
+        num = (1.0 - t) * L - (1.0 + t) * S
+        den = (1.0 + t)
+        return max(0.0, num / den)
+    return 0.0
+
+def _best_opposite_score(symbol: str, side: str) -> float:
+    """
+    열린 '반대 사이드' 포지션들의 score(절대값) 중 최댓값 반환.
+    EXEC_STATE[('score', symbol, tf)] 사용.
+    """
+    best = 0.0
+    try:
+        # PAPER
+        for k, pos in (PAPER_POS or {}).items():
+            if not isinstance(k, str) or not k.startswith(f"{symbol}|"):
+                continue
+            tf   = k.split("|", 1)[1]
+            pside = str(pos.get("side") or "").upper()
+            if (pside == "LONG" and side == "SHORT") or (pside == "SHORT" and side == "LONG"):
+                sc = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+                if sc > best: best = sc
+    except Exception:
+        pass
+    try:
+        # FUTURES (열린 TF는 FUT_POS_TF에서 역추적)
+        fp = (FUT_POS or {}).get(symbol) or {}
+        fside = str(fp.get("side") or "").upper()
+        if (fside == "LONG" and side == "SHORT") or (fside == "SHORT" and side == "LONG"):
+            for tf, sym in (FUT_POS_TF or {}).items():
+                if sym == symbol:
+                    sc = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+                    if sc > best: best = sc
+    except Exception:
+        pass
+    return float(best)
+# [PATCH NEG/CCA HELPERS END]
+
+# [PATCH SAT HELPERS BEGIN]
+def _ind(symbol:str, tf:str, key:str, default:float=0.0) -> float:
+    """지표 캐시 EXEC_STATE에서 안전하게 값 로드."""
+    try:
+        return float(EXEC_STATE.get((key, symbol, tf)) or default)
+    except Exception:
+        return float(default)
+
+def _detect_regime(symbol:str, tf:str) -> str:
+    """
+    단순 레짐 분류:
+      - trend: EMA 정렬+ADX↑
+      - meanrev: RSI z-score/BB%b 과매수·과매도
+      - vol_hi: ATR% 상위 퍼센타일
+      - neutral: 그 외
+    """
+    adx  = _ind(symbol, tf, 'adx', 0.0)
+    ema_fast = _ind(symbol, tf, 'ema_fast', 0.0)
+    ema_slow = _ind(symbol, tf, 'ema_slow', 0.0)
+    rsiz = _ind(symbol, tf, 'rsi_z', 0.0)
+    bbp  = _ind(symbol, tf, 'bb_percent', 0.5)
+    atrp = _ind(symbol, tf, 'atr_pct', 0.0)  # ATR/price * 100
+    adx_thr  = float(cfg_get("REGIME_ADX_THR", "20"))
+    rsiz_thr = float(cfg_get("REGIME_RSIZ_THR", "1.0"))
+    bb_hi    = float(cfg_get("REGIME_BBP_HI", "0.90"))
+    bb_lo    = float(cfg_get("REGIME_BBP_LO", "0.10"))
+    atr_hi   = float(cfg_get("REGIME_ATRP_HI", "1.2"))
+    trend_ok = (ema_fast > ema_slow and adx >= adx_thr) or (ema_fast < ema_slow and adx >= adx_thr)
+    mean_ok  = abs(rsiz) >= rsiz_thr or (bbp >= bb_hi or bbp <= bb_lo)
+    vol_ok   = atrp >= atr_hi
+    if vol_ok and not trend_ok:
+        return "vol_hi"
+    if trend_ok and not mean_ok:
+        return "trend"
+    if mean_ok and not trend_ok:
+        return "meanrev"
+    return "neutral"
+
+def _select_style(symbol:str, tf:str, fallback:str="intraday") -> str:
+    """스타일 자동선택: STYLE_AUTO_ENABLE=on 이면 레짐에 따라 덮어쓰기."""
+    base_map = str(cfg_get("STYLE_BY_TF", "15m:scalp,1h:intraday,4h:swing,1d:position"))
+    style = fallback
+    for pair in base_map.split(","):
+        if ":" in pair:
+            k,v = pair.split(":",1)
+            if k.strip()==tf:
+                style = v.strip(); break
+    if str(cfg_get("STYLE_AUTO_ENABLE","1")).lower() in ("1","on","true","yes"):
+        regime = _detect_regime(symbol, tf)
+        rules  = str(cfg_get("REGIME_RULES", "trend:swing|position;meanrev:intraday|scalp;vol_hi:scalp;neutral:intraday"))
+        for r in rules.split(";"):
+            if ":" not in r: continue
+            rk, rv = r.split(":",1)
+            if rk.strip()==regime:
+                style = rv.split("|")[0].strip()
+                break
+    return style
+
+def _style_params(style:str) -> dict:
+    """스타일별 파라미터 읽기."""
+    atr_len = int(float(cfg_get("ATR_LEN","14")))
+    atr_mult_str = str(cfg_get("ATR_MULT","scalp:0.8,intraday:1.2,swing:2.0,position:2.5"))
+    rr_str       = str(cfg_get("RR_BY_STYLE","scalp:1.5,intraday:2.0,swing:3.0,position:3.5"))
+    trail_str    = str(cfg_get("TP_TRAIL_PCT","scalp:0.25,intraday:0.5,swing:0.8,position:1.0"))
+    slpct_str    = str(cfg_get("STYLE_SL_PCT","scalp:0.35,intraday:0.7,swing:1.2,position:1.8"))
+    tppct_str    = str(cfg_get("STYLE_TP_PCT","scalp:0.55,intraday:1.4,swing:3.6,position:6.0"))
+    def pick(smap, key, default):
+        for p in smap.split(","):
+            if ":" in p:
+                k,v = p.split(":",1)
+                if k.strip()==key:
+                    return float(v)
+        return float(default)
+    return {
+        "atr_len": atr_len,
+        "atr_mult": pick(atr_mult_str, style, 1.0),
+        "rr": pick(rr_str, style, 2.0),
+        "trail_pct": pick(trail_str, style, 0.5),
+        "sl_pct": pick(slpct_str, style, 0.7),
+        "tp_pct": pick(tppct_str, style, 1.4),
+        "buffer_atr": float(cfg_get("STRUCT_BUFFER_ATR","0.3")),
+        "mode_order": [m.strip() for m in str(cfg_get("SL_MODE_ORDER","structure,atr,percent")).split(",") if m.strip()],
+    }
+
+def _style_sl_tp(symbol:str, tf:str, side:str, entry_price:float, ref_price:float) -> dict:
+    """
+    스타일·레짐 기반 SL/TP/Trail 계산.
+    반환: dict(sl_price, tp_price, trail_pct, style, regime, mode, rr, atr_mult)
+    """
+    style  = _select_style(symbol, tf)
+    regime = _detect_regime(symbol, tf)
+    P  = float(entry_price or ref_price or 0.0)
+    if P <= 0:
+        return {"style":style,"regime":regime,"mode":"none","rr":0,"atr_mult":0,"trail_pct":0}
+    prc = float(ref_price or entry_price or P)
+    prm = _style_params(style)
+    atr = _ind(symbol, tf, f"atr{int(prm['atr_len'])}", 0.0)
+    mode_used = None
+    sl = tp = None
+    for mode in prm["mode_order"]:
+        mode = mode.lower()
+        if mode=="structure":
+            swing_hi = _ind(symbol, tf, "swing_high", 0.0)
+            swing_lo = _ind(symbol, tf, "swing_low", 0.0)
+            if swing_hi>0 and swing_lo>0 and atr>0:
+                if side.upper()=="LONG":
+                    sl = max(0.0, swing_lo - (atr * prm["buffer_atr"]))
+                    tp = P + (P - sl) * prm["rr"]
+                else:
+                    sl = min(1e18, swing_hi + (atr * prm["buffer_atr"]))
+                    tp = P - (sl - P) * prm["rr"]
+                mode_used = "structure"
+                break
+        elif mode=="atr" and atr>0:
+            sl_dist = atr * prm["atr_mult"]
+            if side.upper()=="LONG":
+                sl = max(0.0, P - sl_dist)
+                tp = P + sl_dist * prm["rr"]
+            else:
+                sl = min(1e18, P + sl_dist)
+                tp = P - sl_dist * prm["rr"]
+            mode_used = "atr"
+            break
+        elif mode=="percent":
+            sl_pct = prm["sl_pct"] / 100.0
+            tp_pct = prm["tp_pct"] / 100.0
+            if side.upper()=="LONG":
+                sl = max(0.0, P * (1.0 - sl_pct))
+                tp = P * (1.0 + tp_pct)
+            else:
+                sl = P * (1.0 + sl_pct)
+                tp = P * (1.0 - tp_pct)
+            mode_used = "percent"
+            break
+    trail_pct = prm["trail_pct"]
+    return {
+        "sl_price": float(sl) if sl else None,
+        "tp_price": float(tp) if tp else None,
+        "trail_pct": float(trail_pct),
+        "style": style,
+        "regime": regime,
+        "mode": mode_used or "none",
+        "rr": float(prm["rr"]),
+        "atr_mult": float(prm["atr_mult"]),
+    }
+# [PATCH SAT HELPERS END]
 # repair hi/lo baselines on boot (applies to all TFs)
 try:
     for key, pos in (PAPER_POS or {}).items():
@@ -6904,8 +7418,8 @@ EXCHANGE_ID  = os.getenv("EXCHANGE_ID", "binanceusdm")
 SANDBOX      = os.getenv("SANDBOX", "1") == "1"
 
 FUT_MGN_USDT = float(os.getenv("FUT_MGN_USDT", "10"))    # 1회 진입 증거금(USDT)
-FUT_LEVERAGE = int(os.getenv("LEVERAGE", "3"))
-FUT_MARGIN   = os.getenv("MARGIN_TYPE", "ISOLATED").upper()  # ISOLATED|CROSS
+FUT_LEVERAGE = int(os.getenv("FUT_LEVERAGE", os.getenv("LEVERAGE", "3")))
+FUT_MARGIN   = os.getenv("FUT_MARGIN", os.getenv("MARGIN_TYPE", "ISOLATED")).upper()  # ISOLATED|CROSS
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.25"))  # 허용 슬리피지(%)
 
 # TF별 TP/SL 퍼센트는 기존 설정을 그대로 사용:
@@ -7111,28 +7625,36 @@ async def _market(ex, symbol, side, amount, reduceOnly=False):
         pass
     return await _post(ex.create_order, symbol, 'market', side, amount, None, params)
 
-async def _stop_market(ex, symbol, side, stop_price, closePosition=True, positionSide=None):
-    params = {'stopPrice': float(stop_price), 'closePosition': bool(closePosition), 'reduceOnly': True}
+async def _stop_market(ex, symbol, side, stop_price, closePosition=True, positionSide=None, params=None):
+    params = dict(params or {})
+    params.update({'stopPrice': float(stop_price), 'closePosition': bool(closePosition)})
+    if str(cfg_get("STOP_TRIGGER_PRICE","mark")).lower() in ("mark","mark_price","markprice"):
+        params["workingType"] = "MARK_PRICE"
+    if HEDGE_MODE:
+        params["positionSide"] = ("LONG" if side.upper()=="LONG" else "SHORT")
+    params["reduceOnly"] = True
     try:
         import uuid, time
         if getattr(ex, 'id', '') in ('binanceusdm', 'binance'):
             params['newClientOrderId'] = f"sb-sl-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
     except Exception:
         pass
-    if HEDGE_MODE and positionSide:
-        params['positionSide'] = positionSide  # 'LONG' or 'SHORT'
     return await _post(ex.create_order, symbol, 'STOP_MARKET', side, None, None, params)
 
-async def _tp_market(ex, symbol, side, stop_price, closePosition=True, positionSide=None):
-    params = {'stopPrice': float(stop_price), 'closePosition': bool(closePosition), 'reduceOnly': True}
+async def _tp_market(ex, symbol, side, stop_price, closePosition=True, positionSide=None, params=None):
+    params = dict(params or {})
+    params.update({'stopPrice': float(stop_price), 'closePosition': bool(closePosition)})
+    if str(cfg_get("STOP_TRIGGER_PRICE","mark")).lower() in ("mark","mark_price","markprice"):
+        params["workingType"] = "MARK_PRICE"
+    if HEDGE_MODE:
+        params["positionSide"] = ("LONG" if side.upper()=="LONG" else "SHORT")
+    params["reduceOnly"] = True
     try:
         import uuid, time
         if getattr(ex, 'id', '') in ('binanceusdm', 'binance'):
             params['newClientOrderId'] = f"sb-tp-{int(time.time()*1000)}-{uuid.uuid4().hex[:6]}"
     except Exception:
         pass
-    if HEDGE_MODE and positionSide:
-        params['positionSide'] = positionSide
     return await _post(ex.create_order, symbol, 'TAKE_PROFIT_MARKET', side, None, None, params)
 
 # [ANCHOR: FUT_SCALE_HELPERS_BEGIN]
@@ -7182,6 +7704,25 @@ async def _cancel_symbol_conditional_orders(symbol:str):
 async def _fut_rearm_brackets(symbol:str, tf:str, last_price:float, side:str):
     """After scaling, cancel old TP/SL/Trail (if any) and re-arm with updated size/avg."""
     if not SCALE_REALLOCATE_BRACKETS: return
+    # [PATCH PROTECT RE-ARM GUARD BEGIN]
+    try:
+        key = ("rearm_ts", symbol, tf)
+        min_sec_map = str(cfg_get("PROTECT_REARM_MIN_SEC","15m:60,1h:180,4h:600,1d:1800"))
+        min_sec = 60
+        for p in min_sec_map.split(","):
+            if ":" in p:
+                k,v = p.split(":",1)
+                if k.strip()==tf:
+                    min_sec = int(float(v)); break
+        last_ts = int(EXEC_STATE.get(key) or 0)
+        now_ts  = int(time.time())
+        if last_ts and (now_ts - last_ts) < min_sec:
+            log(f"[PROTECT] skip re-arm tf={tf} remain={min_sec-(now_ts-last_ts)}s")
+            return
+        EXEC_STATE[key] = now_ts
+    except Exception:
+        pass
+    # [PATCH PROTECT RE-ARM GUARD END]
     try:
         await _cancel_symbol_conditional_orders(symbol)
     except Exception as e:
@@ -7475,8 +8016,23 @@ def _format_entry_message(symbol:str, tf:str, side:str, mode:str, price:float, l
         tp_txt = f"+{_pct_label(tp_pct)}" if tp_pct is not None else ""
         sl_txt = f"-{_pct_label(sl_pct)}" if sl_pct is not None else ""
         line5 = f"• 리스크: TP ${tp:,.2f} {tp_txt} / SL ${sl:,.2f} {sl_txt} / 트레일 {float(trail_pct):.2f}%"
+        try:
+            st  = EXEC_STATE.get(("style", symbol, tf)) or "-"
+            rg  = EXEC_STATE.get(("regime", symbol, tf)) or "-"
+            sm  = EXEC_STATE.get(("sl_mode", symbol, tf)) or "-"
+            rr  = EXEC_STATE.get(("rr", symbol, tf)) or 0
+            am  = EXEC_STATE.get(("atr_mult", symbol, tf)) or 0
+            wkt = ("MARK" if str(cfg_get("STOP_TRIGGER_PRICE","mark")).lower() in ("mark","mark_price","markprice") else "LAST")
+            coh = EXEC_STATE.get(("coh_tags", symbol, tf)) or ""
+            line_style = f"• Style: {st} / Regime: {rg} / SLmode: {sm} / RR {rr} / ATR×{am} / trigger {wkt} {('· '+coh) if coh else ''}"
+        except Exception:
+            line_style = None
         line6 = f"• 수수료(진입/추정청산): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
-        return "\n".join([line1, line2, line3, line4, line5, line6])
+        lines = [line1, line2, line3, line4, line5]
+        if line_style:
+            lines.append(line_style)
+        lines.append(line6)
+        return "\n".join(lines)
     else:
         score_seg = (f" / score {float(strength_score):.2f}" if strength_score is not None else "")
         line1 = f"🟢 ENTRY | {symbol} · {tf} · {side} ×{lev:g}"
@@ -7488,8 +8044,23 @@ def _format_entry_message(symbol:str, tf:str, side:str, mode:str, price:float, l
         tp_txt = f"+{_pct_label(tp_pct)}" if tp_pct is not None else ""
         sl_txt = f"-{_pct_label(sl_pct)}" if sl_pct is not None else ""
         line5 = f"• Risk: TP ${tp:,.2f} {tp_txt} / SL ${sl:,.2f} {sl_txt} / Trail {float(trail_pct):.2f}%"
+        try:
+            st  = EXEC_STATE.get(("style", symbol, tf)) or "-"
+            rg  = EXEC_STATE.get(("regime", symbol, tf)) or "-"
+            sm  = EXEC_STATE.get(("sl_mode", symbol, tf)) or "-"
+            rr  = EXEC_STATE.get(("rr", symbol, tf)) or 0
+            am  = EXEC_STATE.get(("atr_mult", symbol, tf)) or 0
+            wkt = ("MARK" if str(cfg_get("STOP_TRIGGER_PRICE","mark")).lower() in ("mark","mark_price","markprice") else "LAST")
+            coh = EXEC_STATE.get(("coh_tags", symbol, tf)) or ""
+            line_style = f"• Style: {st} / Regime: {rg} / SLmode: {sm} / RR {rr} / ATR×{am} / trigger {wkt} {('· '+coh) if coh else ''}"
+        except Exception:
+            line_style = None
         line6 = f"• Fees (entry/est. close): -${fees['entry_fee']:.2f} / -${fees['exit_fee_est']:.2f}"
-        return "\n".join([line1, line2, line3, line4, line5, line6])
+        lines = [line1, line2, line3, line4, line5]
+        if line_style:
+            lines.append(line_style)
+        lines.append(line6)
+        return "\n".join(lines)
 
 
 async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
@@ -7533,14 +8104,6 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
         notional  = None
         if eff_margin and base_margin:
             use_frac = float(eff_margin) / float(base_margin)
-
-        if eff_margin and lev_used:
-            try:
-                notional = float(eff_margin) * int(lev_used)
-            except Exception:
-                pass
-
-        notional = None
         if eff_margin and lev_used:
             try:
                 notional = float(eff_margin) * int(lev_used)
@@ -8169,6 +8732,78 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         )
         log(f"[ALLOC-DEBUG] {symbol} {tf} {exec_signal} req_lev={req_lev} limits={limits} -> qty≈{qty:.6f}")
 
+# [PATCH NEG/CCA GATE BEGIN — maybe_execute_futures_trade]
+    try:
+        coh_on = str(cfg_get("COHERENCE_MODE", "on")).lower() in ("1","on","true","yes")
+        if coh_on:
+            ner_min   = float(cfg_get("NER_MIN",   "0.25"))
+            ner_tgt   = float(cfg_get("NER_TARGET","0.35"))
+            plr_max   = float(cfg_get("PLR_MAX",   "0.80"))
+            scout_pct = float(cfg_get("SCOUT_ALLOC_PCT", "0.15"))
+            edge_dlt  = float(cfg_get("EDGE_SWITCH_DELTA", "0.12"))
+
+            side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
+            price_ref = float(last)
+            L, S      = _symbol_exposure(symbol, price_ref)
+
+            # 후보 notional (eff_margin*lev)
+            cand_notional = float(eff_margin or 0.0) * float(lev or 0.0)
+
+            # CCA: 점수우위
+            new_score = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+            opp_best  = _best_opposite_score(symbol, side_str)
+            cca_weaken = (opp_best > 0.0) and ((new_score - opp_best) < edge_dlt)
+
+            # NEG: 예측치
+            ner_next, plr_next = _ner_plr(L, S, side_str, cand_notional)
+
+            scale_factor = 1.0
+            reason_tags  = []
+
+            if plr_next > plr_max:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append(f"PLR>{plr_max:.2f}")
+
+            heavier = "LONG" if L >= S else "SHORT"
+            if side_str != heavier:
+                x_max = _x_max_for_ner_min(L, S, side_str, ner_min)
+                if x_max <= 0:
+                    scale_factor = min(scale_factor, scout_pct); reason_tags.append("NER_CAP0")
+                elif cand_notional > x_max:
+                    scale_factor = min(scale_factor, max(0.0, x_max / max(cand_notional, 1e-9)))
+                    reason_tags.append("NER_SCALE")
+
+            if cca_weaken:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
+
+            if scale_factor < 0.999:
+                eff_margin = float(eff_margin) * float(scale_factor)
+                EXEC_STATE[("coh_tags", symbol, tf)] = ",".join(reason_tags)
+                log(f"[COHERENCE] FUT {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
+    except Exception as e:
+        log(f"[COHERENCE_WARN] FUT {symbol} {tf} {e}")
+# [PATCH NEG/CCA GATE END — maybe_execute_futures_trade]
+    # [PATCH SAT APPLY BEGIN — maybe_execute_futures_trade]
+    try:
+        side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
+        entry_ref = float(last)
+        sat = _style_sl_tp(symbol, tf, side_str, entry_ref, entry_ref)
+        if sat.get("sl_price") is not None:
+            sl_price = sat["sl_price"]
+            sl_pct = abs((entry_ref - sat["sl_price"]) / entry_ref * 100.0)
+        if sat.get("tp_price") is not None:
+            tp_price = sat["tp_price"]
+            tp_pct = abs((sat["tp_price"] - entry_ref) / entry_ref * 100.0)
+        tr_pct = sat.get("trail_pct", 0.0)
+        EXEC_STATE[("style", symbol, tf)]  = sat.get("style")
+        EXEC_STATE[("regime", symbol, tf)] = sat.get("regime")
+        EXEC_STATE[("sl_mode", symbol, tf)] = sat.get("mode")
+        EXEC_STATE[("rr", symbol, tf)] = sat.get("rr")
+        EXEC_STATE[("atr_mult", symbol, tf)] = sat.get("atr_mult")
+        log(f"[STYLE] FUT {symbol} {tf} {side_str} style={sat.get('style')} regime={sat.get('regime')} mode={sat.get('mode')} rr={sat.get('rr')}")
+    except Exception as e:
+        log(f"[STYLE_WARN] FUT {symbol} {tf} {e}")
+    # [PATCH SAT APPLY END — maybe_execute_futures_trade]
+
     # 6) 수량 계산(레버리지 상한 반영) → 정밀도/최소노치오날 체크
     qty_raw = _qty_from_margin_eff2(ex, symbol, last, eff_margin, tf)
     qty     = _ensure_fut_qty(ex, symbol, last, qty_raw)
@@ -8600,8 +9235,8 @@ HEDGE_MODE   = os.getenv("HEDGE_MODE", "1") == "1"
 
 import re
 
-TF_LEVERAGE = _parse_tf_map(os.getenv("LEVERAGE_BY_TF", ""), int)   # 예: {'15m':7,'1h':5,...}
-TF_MARGIN   = _parse_tf_map(os.getenv("MARGIN_BY_TF", ""), lambda x: x.upper())                  # 예: {'15m':'ISOLATED','4h':'CROSS',...}
+TF_LEVERAGE = _parse_tf_map(os.getenv("TF_LEVERAGE", os.getenv("LEVERAGE_BY_TF", "")), int)   # 예: {'15m':7,'1h':5,...}
+TF_MARGIN   = _parse_tf_map(os.getenv("TF_MARGIN", os.getenv("MARGIN_BY_TF", "")), lambda x: x.upper())                  # 예: {'15m':'ISOLATED','4h':'CROSS',...}
 
 # === Per-symbol per-TF margin-mode overrides ===
 import re as _re
@@ -9173,7 +9808,7 @@ def _fut_min_notional_ok(ex, symbol, price, qty):
     except Exception:
         min_cost = 0.0
     try:
-        env_min = float(os.getenv("FUT_MIN_NOTIONAL", "5"))
+        env_min = float(os.getenv("FUT_MIN_NOTIONAL", os.getenv("MIN_NOTIONAL", "5")))
     except Exception:
         env_min = 5.0
     need = max(min_cost, env_min)
