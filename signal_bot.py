@@ -1464,6 +1464,24 @@ def _fmt_krw(v):
     except Exception:
         return "₩-"
 
+# --- safe number parsers (for ctx fields like "4,812.70") ---
+def _num(x, default=None):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).replace(",", "").strip()
+        if s == "":
+            return default
+        return float(s)
+    except Exception:
+        return default
+
+def _fmt_atr_x(v):
+    v = _num(v, None)
+    return f"{v:.2f}×ATR" if v is not None else "—"
+
 def get_usdkrw_rate(max_age_sec: int = 3600) -> float:
     """
     환율 소스 우선순위:
@@ -2690,6 +2708,22 @@ def _struct_cache_put(symbol: str, tf: str, ts: int, ctx: dict|None, img_path: s
     STRUCT_CACHE[_struct_cache_key(symbol, tf)] = {
         "ctx": ctx, "img": img_path, "ts": int(ts), "mtime": time.time()
     }
+
+async def _refresh_struct_cache(symbol: str, tf: str):
+    try:
+        rows = await asyncio.to_thread(_load_ohlcv, symbol, tf, 240)
+        df = _sce_build_df_from_ohlcv(rows) if rows else None
+        if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
+            return
+        ctx = build_struct_context_basic(df, tf)
+        img = render_struct_overlay(symbol, tf, df, ctx)
+        _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, img)
+        try:
+            _LAST_DF_CACHE[(symbol, tf)] = df
+        except Exception:
+            pass
+    except Exception as e:
+        log(f"[STRUCT_REFRESH_WARN] {symbol} {tf} {type(e).__name__}: {e}")
 
 def _mtf_struct_guard(symbol: str, tf: str, side_signal: str):
     """
@@ -9436,7 +9470,7 @@ def get_open_positions_iter():
         pass
     return out
 
-def _cooldown_remain_sec(symbol: str, tf: str) -> int:
+def _get_cooldown_sec(symbol: str, tf: str) -> int:
     try:
         last = (STRUCT_ALERT_STATE or {}).get((symbol, tf, "ALERT_TEXT"), {}).get("ts", 0)
         if last <= 0:
@@ -9448,81 +9482,97 @@ def _cooldown_remain_sec(symbol: str, tf: str) -> int:
 
 
 def _struct_shortline(symbol: str, tf: str) -> str:
-    """
-    • 최근접 저항/지지 거리(ATR배수) + 구조 사유 1~2개 요약
-    """
     try:
 
-        # 캐시 우선
-        rows = _load_ohlcv(symbol, tf, limit=240)
-        df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
-        if (df_struct is None) and (last_df := _LAST_DF_CACHE.get((symbol, tf))):
+        ent = STRUCT_CACHE.get((symbol, tf))
 
-            if len(last_df) >= env_int("SCE_MIN_ROWS", 60):
-                df_struct = last_df.copy()
-        df = df_struct
-        if df is None or len(df) < 60:
-            return f"{symbol} {tf}: 준비중"
-
-        ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
         if ent and ent.get("ctx"):
             ctx = ent["ctx"]
-        else:
-            ctx = build_struct_context_basic(df, tf)
-            _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, ent.get("img") if ent else None)
+            near = (ctx.get("nearest") or {})
+            res  = near.get("res")
+            sup  = near.get("sup")
+            bits = []
+            if isinstance(res, (list, tuple)) and len(res) >= 3:
+                bits.append(f"저항 {_fmt_atr_x(res[2])}")
+            if isinstance(sup, (list, tuple)) and len(sup) >= 3:
+                bits.append(f"지지 {_fmt_atr_x(sup[2])}")
+            reason = ""
+            for item in ctx.get("reasons", []):
+                try:
+                    t, _, k = item
+                except Exception:
+                    continue
+                if str(k).startswith(("TREND","CHAN","STRUCT_CONFLUENCE","STRUCT_GAP")):
+                    reason = str(t)
+                    break
+            if reason:
+                bits.append(reason)
+            txt = " · ".join(bits) if bits else "구조 OK"
+            return f"{symbol.split('/')[0]}-{tf}: {txt}"
+        try:
+            asyncio.create_task(_refresh_struct_cache(symbol, tf))
+        except Exception:
+            pass
+        return f"{symbol.split('/')[0]}-{tf}: 준비중"
+    except Exception:
+        try:
+            asyncio.create_task(_refresh_struct_cache(symbol, tf))
+        except Exception:
+            pass
+        return f"{symbol.split('/')[0]}-{tf}: 준비중"
 
-        near = ctx.get("nearest") or {}
-        res, sup = near.get("res"), near.get("sup")
-        bits = []
-        if res: bits.append(f"저항 {res[2]:.2f}×ATR")
-        if sup: bits.append(f"지지 {sup[2]:.2f}×ATR")
-
-        # 구조 사유(추세선/채널/컨플루언스) 2개만
-        rsn = []
-        for (txt, sc, key) in ctx.get("reasons", []):
-            if key.startswith(("TREND","CHAN","STRUCT_CONFLUENCE","STRUCT_GAP")):
-                rsn.append(txt)
-            if len(rsn) >= 2:
-                break
-        if rsn:
-            bits.append(" / ".join(rsn))
-        return f"{symbol.split('/')[0]}-{tf}: " + (" · ".join(bits) if bits else "구조 정보 없음")
-    except Exception as e:
-        return f"{symbol} {tf}: 구조 요약 실패({type(e).__name__})"
-
-
-async def _dash_struct_block() -> list[str]:
-    """
-    대시보드 상단 고정 블록:
-    ◼ 구조 컨텍스트 / ◼ MTF 게이트 / ◼ 알림 쿨다운
-    """
-    out = []
-    try:
-        symbols = ("ETH/USDT","BTC/USDT")
-        tfs     = ("1h",)  # 요구사항: 1h 기준 요약 (필요시 15m/4h/1d 추가 가능)
-        # 1) 구조 컨텍스트
-        out.append("◼ 구조 컨텍스트")
-        for s in symbols:
-            for tf in tfs:
-                out.append(" - " + _struct_shortline(s, tf))
-        # 2) MTF 게이트 (1h→상위 TF)
-        out.append("◼ MTF 게이트")
-        for s in symbols:
-            tf = "1h"
+def _mtf_gate_summary(symbols=("ETH/USDT","BTC/USDT"), tfs=("1h",)):
+    lines = []
+    for s in symbols:
+        for tf in tfs:
             try:
-                buy = _mtf_struct_guard(s, tf, "BUY"); sell = _mtf_struct_guard(s, tf, "SELL")
-                out.append(f" - {s.split('/')[0]}-{tf}: BUY={buy.get('action','?')} / SELL={sell.get('action','?')}  ({buy.get('reason') or sell.get('reason') or '—'})")
+                buy = _mtf_struct_guard(s, tf, "BUY")
+                sell = _mtf_struct_guard(s, tf, "SELL")
+                reason = buy.get("reason") or sell.get("reason") or "—"
+                lines.append(f" - {s.split('/')[0]}-{tf}: BUY={buy.get('action','?')} / SELL={sell.get('action','?')} ({reason})")
             except Exception:
-                out.append(f" - {s.split('/')[0]}-{tf}: 게이트 계산 실패")
-        # 3) 알림 쿨다운
-        out.append("◼ 알림 쿨다운")
-        for s in symbols:
-            tf = "1h"
-            sec = _cooldown_remain_sec(s, tf)
+                lines.append(f" - {s.split('/')[0]}-{tf}: 게이트 계산 실패")
+    return lines
+
+async def _dash_struct_block():
+    symbols = ["ETH/USDT","BTC/USDT"]
+    tfs     = ["1h"]
+    out = []
+
+    # 1) 구조 컨텍스트
+    lines = []
+    for s in symbols:
+        for tf in tfs:
+            lines.append(" - " + _struct_shortline(s, tf))
+    # '준비중'만 잔뜩이면 헤더 숨김 (ENV로 on/off 가능)
+    show_pending = env_bool("DASH_STRUCT_SHOW_PENDING", False)
+    eff = [ln for ln in lines if ("준비중" not in ln)]
+    if (eff or show_pending) and lines:
+        out.append("◼ 구조 컨텍스트")
+        out += (lines if show_pending else eff)
+
+    # 2) MTF 게이트
+    gate_lines = _mtf_gate_summary()
+    # NONE만 있으면 숨김 (ENV로 표시 강제 가능)
+    mtf_show_none = env_bool("DASH_MTF_SHOW_NONE", False)
+    eff_gate = [g for g in gate_lines if "NONE" not in g]
+    if (eff_gate or mtf_show_none) and gate_lines:
+        out.append("◼ MTF 게이트")
+        out += (gate_lines if mtf_show_none else eff_gate)
+
+    # 3) 알림 쿨다운
+    cd_lines = []
+    for s in symbols:
+        for tf in tfs:
+            sec = int(_get_cooldown_sec(s, tf) or 0)
             if sec > 0:
-                out.append(f" - {s.split('/')[0]}-{tf}: 남은 {sec}s")
-    except Exception as e:
-        out.append(f"(구조 요약 생성 실패: {type(e).__name__})")
+                cd_lines.append(f" - {s.split('/')[0]}-{tf}: 남은 {sec}s")
+    if cd_lines:
+        out.append("◼ 알림 쿨다운")
+
+        out += cd_lines
+
+
     return out
 
 
@@ -9772,26 +9822,6 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
             ax.text(0.01, 0.02, guide, transform=ax.transAxes, va="bottom", ha="left", fontsize=9,
                     bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="gray", alpha=0.8))
 
-        # [PATCH C1-BEGIN]  << overlay legend inset >>
-        try:
-            if os.getenv("CHART_STRUCT_GUIDE_ON_IMG", "1") == "1":
-                guide_lines = [
-                    "구조 해석 가이드",
-                    "• 수평레벨: 레벨↔가격 거리(ATR배수) 작을수록 반대포지션 위험↑",
-                    "• 추세선: 선 아래 종가마감=하향 유지, 상향선 재진입=스카웃",
-                    "• 회귀채널: 상단=롱 익절/숏 관심, 하단=숏 익절/분할매수 관심",
-                    "• 피보채널: 0.382/0.618/1.0 접촉 시 반응/돌파 체크",
-                    "• 컨플루언스: 다중 레벨이 ATR×ε 내 겹치면 신뢰도↑",
-                ]
-                text = "\n".join(guide_lines)
-                ax.text(
-                    0.01, 0.02, text,
-                    transform=ax.transAxes, va="bottom", ha="left", fontsize=10,
-                    bbox=dict(boxstyle="round,pad=0.4", fc="white", ec="gray", alpha=0.75)
-                )
-        except Exception as _e:
-            log(f"[STRUCT_LEGEND_ON_IMG_WARN] {type(_e).__name__}: {_e}")
-        # [PATCH C1-END]
 
         out = os.path.join(save_dir, f"struct_{symbol.replace('/','-')}_{tf}_{int(time.time())}.png")
         fig.tight_layout(rect=[0.02, 0.02, 0.98, 0.98])
@@ -9942,11 +9972,11 @@ async def _dash_render_text():
 
     # ◼ SCE/MTF 고정 섹션 추가
     try:
-        blk = await _dash_struct_block()
+        blk = await asyncio.wait_for(_dash_struct_block(), timeout=env_float("DASH_STRUCT_TIMEOUT", 0.7))
         if blk:
             lines += blk + [""]
     except Exception as _e:
-        log(f"[DASH_STRUCT_BLOCK_WARN] {_e}")
+        log(f"[DASH_STRUCT_WARN] {_e}")
 
     # 합계 UPNL(수수료 옵션 포함)
     if os.getenv("DASHBOARD_SHOW_TOTAL_UPNL", "1") == "1":
