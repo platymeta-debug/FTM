@@ -9677,7 +9677,8 @@ def _render_struct_legend(ctx: dict, tf: str) -> str:
 
 
 
-# === STRUCT VIEW HELPERS ======================================================
+
+# === STRUCT VIEW HELPERS (extended) ===========================================
 
 import matplotlib.ticker as mticker
 from matplotlib.ticker import FuncFormatter
@@ -9732,12 +9733,13 @@ def _num(x, default=None):
 # ============================================================================
 
 # === Structure overlay renderer (matplotlib) ==================================
-def render_struct_overlay(symbol: str, tf: str, df, struct_info,
+def render_struct_overlay(symbol: str, tf: str, df, struct_info, *,
+                          lookback_override: int|None=None,
+                          anchor_override: float|None=None,
+                          title_suffix: str|None=None,
                           save_dir: str = './charts', width: int = 1600, height: int = 900) -> str | None:
-    """
-    캔들 + 수평 레벨 + 추세선(최근 피벗 2점) + 회귀 채널 + 피보 채널을 그려 저장.
-    반환: 파일 경로 (실패 시 None)
-    """
+    """캔들 + 수평 레벨 + 추세선 + 채널을 그려 저장."""
+
     try:
         os.makedirs(save_dir, exist_ok=True)
         if df is None or len(df) < 60 or struct_info is None:
@@ -9748,7 +9750,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
         dpi = 100
         fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
-        ax.set_title(f"{symbol} • {tf} • Structure Overlay", loc='left')
+
+        ax.set_title(f"{symbol} · {tf} · Structure Overlay", loc='left')
+
 
         CANDLE_ALPHA = env_float('STRUCT_CANDLE_ALPHA', 0.95)
         CANDLE_W     = env_float('STRUCT_CANDLE_WIDTH', 0.7)
@@ -9761,31 +9765,36 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
             ax.add_patch(rb)
 
 
+        # ====== VIEW WINDOW ======
         N = len(df)
-        look = _tf_view_lookback(tf)
+        look = int(lookback_override or _tf_view_lookback(tf))
         look = min(look, N) if N else look
-        anchor = env_float('STRUCT_VIEW_ANCHOR', 0.68)
+        anchor = float(anchor_override if anchor_override is not None else env_float('STRUCT_VIEW_ANCHOR', 0.68))
         anchor = min(0.9, max(0.5, anchor))
-        cur = N - 1
-        left  = max(0, cur - int(look * anchor))
-        right = min(N - 1, left + look)
-        pad_bars = env_int('STRUCT_VIEW_RIGHT_PAD_BARS', 6)
-        x_min = max(0, left - pad_bars)
-        x_max = min(N - 1, right + pad_bars)
 
-        view = df.iloc[left:right+1] if N else df
+        cur = max(0, N-1)
+        left  = max(0, cur - int(look * anchor))
+        right_ix = left + look - 1
+        data_right = min(cur, right_ix)
+        pad_left  = env_int('STRUCT_VIEW_LEFT_PAD_BARS', 1)
+        pad_right = env_int('STRUCT_VIEW_RIGHT_PAD_BARS', 6)
+
+        x_min = max(0, left - pad_left)
+        x_max = right_ix + pad_right
+
+        view = df.iloc[left:data_right+1] if N else df
+
+        # ====== Y RANGE ======
         y_min = float(view['low'].min()); y_max = float(view['high'].max())
         try:
             lv = []
             if struct_info:
                 for it in (struct_info.get('levels') or []):
-                    if isinstance(it, (list,tuple)) and len(it)>=2:
-                        lv.append(_num(it[1]))
+                    if isinstance(it,(list,tuple)) and len(it)>=2:
+                        v = _num(it[1]); lv.append(v)
             if lv:
-                vals = [v for v in lv if v]
-                if vals:
-                    y_min = min(y_min, min(vals))
-                    y_max = max(y_max, max(vals))
+                y_min = min(y_min, min([v for v in lv if v is not None]))
+                y_max = max(y_max, max([v for v in lv if v is not None]))
         except Exception:
             pass
         atr = _atr_fast(view)
@@ -9797,42 +9806,48 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
         ax.margins(x=0.0, y=0.0)
         ax.autoscale(False)
 
+        # ====== 축 포맷 ======
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
         ax.grid(True, axis='y', ls='--', alpha=0.25)
+
         dt = _idx_to_dt(df)
         if dt is not None and N>0:
-            step = max(1, (right-left)//env_int('STRUCT_XTICKS', 6))
-            ticks = np.arange(left, right+1, step)
+            xt_count = max(2, env_int('STRUCT_XTICKS', 6))
+            step = max(1, (data_right - left + 1) // xt_count)
+            ticks = np.arange(left, data_right+1, step)
             ax.set_xticks(ticks)
-            labels = [dt[i].strftime(_tf_timefmt(tf)) for i in ticks]
-            ax.set_xticklabels(labels, rotation=0, fontsize=8)
+            ax.set_xticklabels([dt[i].strftime(_tf_timefmt(tf)) for i in ticks], rotation=0, fontsize=8)
 
+        # ====== R/S 라벨(왼쪽) ======
         try:
             if struct_info and struct_info.get('nearest'):
                 res = struct_info['nearest'].get('res')
                 sup = struct_info['nearest'].get('sup')
-                lx = x_min + 2
+                lx = x_min + 1
                 if res:
                     level, dist = _num(res[1]), _num(res[2])
                     ax.hlines(level, x_min, x_max, color='#d62728', lw=2, zorder=2)
-                    ax.text(lx, level, f"R {level:,.2f} ({dist:.2f}×ATR)",
-                            ha='left', va='bottom', fontsize=9, color='#d62728',
-                            bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#d62728', alpha=0.80))
+                    if level is not None:
+                        ax.text(lx, level, f"R {level:,.2f} ({dist:.2f}×ATR)",
+                                ha='left', va='bottom', fontsize=9, color='#d62728',
+                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#d62728', alpha=0.80))
                 if sup:
                     level, dist = _num(sup[1]), _num(sup[2])
                     ax.hlines(level, x_min, x_max, color='#1f77b4', lw=2, zorder=2)
-                    ax.text(lx, level, f"S {level:,.2f} ({dist:.2f}×ATR)",
-                            ha='left', va='top', fontsize=9, color='#1f77b4',
-                            bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#1f77b4', alpha=0.80))
+                    if level is not None:
+                        ax.text(lx, level, f"S {level:,.2f} ({dist:.2f}×ATR)",
+                                ha='left', va='top', fontsize=9, color='#1f77b4',
+                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#1f77b4', alpha=0.80))
         except Exception as _e:
             log(f"[STRUCT_RS_LABEL_WARN] {type(_e).__name__}: {_e}")
 
+        # ====== 추세/채널 라벨 & 범례(핸들 존재 때만) ======
         try:
             if struct_info and struct_info.get('trend_lines'):
                 for tl in struct_info['trend_lines']:
                     d = tl.get('dir',''); c = '#2ca02c' if d=='up' else '#ff7f0e'
                     (x1,y1) = tl.get('p1',(left, view['close'].iloc[0]))
-                    (x2,y2) = tl.get('p2',(right,view['close'].iloc[-1]))
+                    (x2,y2) = tl.get('p2',(data_right, view['close'].iloc[-1]))
                     x1,x2 = max(x_min,min(x1,x_max)), max(x_min,min(x2,x_max))
                     ax.plot([x1,x2],[y1,y2], ls='--', lw=1.8, color=c, zorder=2, label=f"{'상승' if d=='up' else '하락'} TL")
             if struct_info and struct_info.get('channels'):
@@ -9846,15 +9861,14 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                         for r,p in ch.get('levels', []):
                             p=_num(p)
                             if p: ax.hlines(p, x_min, x_max, colors='#17becf', linestyles='--', lw=1.2, zorder=1)
-            try:
+            handles, labels = ax.get_legend_handles_labels()
+            if labels:
                 leg = ax.legend(loc='upper left', fontsize=9, frameon=True)
-
                 leg.get_frame().set_alpha(0.85)
-            except Exception:
-                pass
         except Exception as _e:
             log(f"[STRUCT_LABEL_WARN] {type(_e).__name__}: {_e}")
 
+        # ====== 가격 윤곽(EMA20/50) + 최종가 보조선 ======
 
         if env_bool('STRUCT_BASELINES_ON', True):
             try:
@@ -9863,26 +9877,19 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                 ema20 = s.ewm(span=20, adjust=False).mean().values
                 ema50 = s.ewm(span=50, adjust=False).mean().values
                 xs = np.arange(N)
-                ax.plot(xs, ema20, lw=1.2, alpha=0.8, color='#555555', label='EMA20')
-                ax.plot(xs, ema50, lw=1.2, alpha=0.8, color='#999999', label='EMA50')
+
+                ax.plot(xs, ema20, lw=1.1, alpha=0.8, color='#666666', label='_ema20')
+                ax.plot(xs, ema50, lw=1.1, alpha=0.6, color='#999999', label='_ema50')
             except Exception as _e:
                 log(f"[STRUCT_BASELINES_WARN] {type(_e).__name__}: {_e}")
 
-        try:
-            if os.getenv('CHART_STRUCT_GUIDE_ON_IMG', '1') == '1':
-                guide_lines = [
-                    '구조 해석 가이드',
-                    '• 수평레벨: 레벨↔가격 거리(ATR배수) 작을수록 반대포지션 위험↑',
-                    '• 추세선: 선 아래 종가마감=하향 유지, 상향선 재진입=스카웃',
-                    '• 회귀채널: 상단=롱 익절/숏 관심, 하단=숏 익절/분할매수 관심',
-                    '• 피보채널: 0.382/0.618/1.0 접촉 시 반응/돌파 체크',
-                    '• 컨플루언스: 다중 레벨이 ATR×ε 내 겹치면 신뢰도↑',
-                ]
-                text = '\n'.join(guide_lines)
-                ax.text(0.01, 0.02, text, transform=ax.transAxes, va='bottom', ha='left', fontsize=10,
-                        bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='gray', alpha=0.75))
-        except Exception as _e:
-            log(f"[STRUCT_LEGEND_ON_IMG_WARN] {type(_e).__name__}: {_e}")
+        if env_bool('STRUCT_LAST_PRICE_LINE', True) and N>0:
+            last = float(df['close'].iloc[-1])
+            ax.hlines(last, x_min, x_max, color='#666666', ls='--', lw=1, alpha=0.3)
+
+        if title_suffix:
+            ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
+
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
         out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{int(time.time())}.png")
@@ -9897,19 +9904,30 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
             pass
         log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
         return None
-# ============================================================================
+
+# ===========================================================================
+
 def render_struct_overlay_pair(symbol, tf, df, struct_info):
+    """근접(near) + 원경(macro) 두 장 생성 (서로 다른 lookback/anchor)."""
     paths = []
-    try:
-        p1 = render_struct_overlay(symbol, tf, df, struct_info)
-        if p1: paths.append(p1)
-        os.environ["STRUCT_VIEW_ANCHOR"] = os.getenv("STRUCT_VIEW_ANCHOR_MACRO","0.80")
-        os.environ["STRUCT_VIEW_LOOKBACK_DEFAULT"] = str(int(_tf_view_lookback(tf) * env_float("STRUCT_VIEW_MACRO_MULT", 3.0)))
-        p2 = render_struct_overlay(symbol, tf, df, struct_info)
-        if p2: paths.append(p2)
-    finally:
-        for k in ("STRUCT_VIEW_ANCHOR","STRUCT_VIEW_LOOKBACK_DEFAULT"):
-            if k in os.environ: del os.environ[k]
+    lb_near = _tf_view_lookback(tf)
+    an_near = env_float('STRUCT_VIEW_ANCHOR', 0.68)
+    p1 = render_struct_overlay(symbol, tf, df, struct_info,
+                               lookback_override=lb_near,
+                               anchor_override=an_near,
+                               title_suffix='· Near')
+    if p1:
+        paths.append(p1)
+
+    lb_macro = int(lb_near * env_float('STRUCT_VIEW_MACRO_MULT', 3.0))
+    an_macro = env_float('STRUCT_VIEW_ANCHOR_MACRO', 0.85)
+    p2 = render_struct_overlay(symbol, tf, df, struct_info,
+                               lookback_override=lb_macro,
+                               anchor_override=an_macro,
+                               title_suffix='· Macro')
+    if p2:
+        paths.append(p2)
+
     return paths
 
 
