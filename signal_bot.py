@@ -3,6 +3,7 @@ import ccxt
 import pandas as pd
 import math
 import time
+import datetime
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # ★ 비대화형 백엔드 (파일 저장 전용)
@@ -13,6 +14,7 @@ import os, sys, logging
 import discord
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
+from zoneinfo import ZoneInfo
 
 # [ANCHOR: DEBUG_FLAG_BEGIN]
 def _env_on(k: str, default="0") -> bool:
@@ -6418,6 +6420,14 @@ MTF_ALERT_ENABLE       = (cfg_get("MTF_ALERT_ENABLE", "1") == "1")
 MTF_ALERT_COOLDOWN_SEC = int(float(cfg_get("MTF_ALERT_COOLDOWN_SEC", "1800")))
 MTF_ALERT_PREWARN_ATR  = float(cfg_get("MTF_ALERT_PREWARN_ATR", "0.6"))  # 사전경고 임계(ATR배수)
 
+# --- REPORT (PDF) ---
+REPORT_PDF_ENABLE       = (cfg_get("REPORT_PDF_ENABLE", "1") == "1")
+REPORT_PDF_TIMES_STR    = cfg_get("REPORT_PDF_TIMES", "09:00,21:00")  # HH:MM[,HH:MM...]
+REPORT_PDF_TIMEZONE     = cfg_get("REPORT_PDF_TIMEZONE", "Asia/Seoul")
+REPORT_PDF_SYMBOLS_STR  = cfg_get("REPORT_PDF_SYMBOLS", "ETH/USDT,BTC/USDT")
+REPORT_PDF_TFS_STR      = cfg_get("REPORT_PDF_TFS", "15m,1h,4h,1d")
+REPORT_PDF_CHANNEL_ID   = cfg_get("REPORT_PDF_CHANNEL_ID", "")  # 빈 값이면 각 심볼 기본 채널 사용
+
 CHANNEL_BANDS_STD   = float(cfg_get("CHANNEL_BANDS_STD", "1.5"))
 AVWAP_ANCHORS       = cfg_get("AVWAP_ANCHORS", "SWING_HI,SWING_LO,LAST_BREAKOUT")
 CTX_ALPHA           = float(cfg_get("CTX_ALPHA", "0.35"))
@@ -9607,6 +9617,55 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
 
 
 
+async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
+    """심볼/TF 한 쌍에 대한 PDF를 생성하고 첨부로 전송."""
+    try:
+        rows = _load_ohlcv(symbol, tf, limit=400)
+        df = _sce_build_df_from_ohlcv(rows) if rows else None
+        if df is None or len(df) < 60:
+            await channel.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족으로 PDF 생략")
+            return
+
+        # SCE 컨텍스트/오버레이
+        struct_info = build_struct_context_basic(df, tf)
+        struct_img  = render_struct_overlay(symbol, tf, df, struct_info)
+
+        # 기본 값들(필요 최소치만)
+        signal = "REPORT"
+        price  = float(df['close'].iloc[-1])
+        score  = 0.0
+        reasons, weights = [], {}
+        agree_long = agree_short = 0
+        now = datetime.datetime.now(tz=ZoneInfo(REPORT_PDF_TIMEZONE))
+        outdir = os.getenv("STRUCT_IMG_DIR", "./charts")
+        os.makedirs(outdir, exist_ok=True)
+        outfile = os.path.join(outdir, f"REPORT_{symbol.replace('/','-')}_{tf}_{now.strftime('%Y%m%d_%H%M')}.pdf")
+
+        # PDF 생성
+        pdf_path = generate_pdf_report(
+            df=df, tf=tf, signal=signal, price=price, score=score,
+            reasons=reasons, weights=weights,
+            agree_long=agree_long, agree_short=agree_short, now=now,
+            output_path=outfile, chart_imgs=[struct_img] if struct_img else None, chart_img=None, ichimoku_img=None,
+            daily_change_pct=None, discord_message=None,
+            symbol=symbol, entry_price=None, entry_time=None,
+            struct_info=struct_info, struct_img=struct_img
+        )
+        # 전송
+        if pdf_path and os.path.exists(pdf_path):
+            cap = f"[PDF] {symbol} {tf} • {now.strftime('%Y-%m-%d %H:%M')} ({REPORT_PDF_TIMEZONE})"
+            await channel.send(content=cap, files=[discord.File(pdf_path)], silent=True)
+        else:
+            await channel.send(content=f"[REPORT] {symbol} {tf}: PDF 생성 실패")
+    except Exception as e:
+        log(f"[REPORT_ERR] {symbol} {tf} {type(e).__name__}: {e}")
+        try:
+            await channel.send(content=f"[REPORT] {symbol} {tf}: 오류 {type(e).__name__}")
+        except Exception:
+            pass
+
+
+
 async def _dash_render_text():
 
     st = _daily_state_load() or {}  # ← Nonesafe
@@ -9804,6 +9863,41 @@ async def _dash_loop(client):
             await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
             continue
         await asyncio.sleep(max(3, DASHBOARD_UPDATE_SEC))
+
+
+async def _report_scheduler_loop(client):
+    """로컬 TZ 기준 지정 시각마다 보고서 PDF 생성·전송."""
+    if not REPORT_PDF_ENABLE:
+        return
+    tz = ZoneInfo(REPORT_PDF_TIMEZONE)
+    times = [t.strip() for t in (REPORT_PDF_TIMES_STR or "").split(",") if t.strip()]
+    sent_mark = set()  # e.g., {"2025-08-23 09:00", ...} 중복 방지
+
+    while True:
+        try:
+            now = datetime.datetime.now(tz=tz)
+            stamp = now.strftime("%Y-%m-%d %H:%M")
+            hhmm  = now.strftime("%H:%M")
+            if hhmm in times and stamp not in sent_mark:
+                symbols = [s.strip() for s in REPORT_PDF_SYMBOLS_STR.split(",") if s.strip()]
+                tfs     = [t.strip() for t in REPORT_PDF_TFS_STR.split(",") if t.strip()]
+                for sym in symbols:
+                    for tf in tfs:
+                        # 채널 선택
+                        if REPORT_PDF_CHANNEL_ID:
+                            ch = client.get_channel(int(REPORT_PDF_CHANNEL_ID))
+                        else:
+                            ch = client.get_channel(_get_trade_channel_id(sym, tf))
+                        if ch:
+                            await _make_and_send_pdf_report(sym, tf, ch)
+                sent_mark.add(stamp)
+            # 오래된 마크 정리(24h)
+            if len(sent_mark) > 64:
+                cutoff = (now - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+                sent_mark = {m for m in sent_mark if m[:10] >= cutoff}
+        except Exception as e:
+            log(f"[REPORT_SCHED_WARN] {type(e).__name__}: {e}")
+        await asyncio.sleep(20)
 
 
 async def _sync_open_state_on_ready():
@@ -10671,6 +10765,13 @@ async def on_ready():
 
     # ✅ 리포트 자동 전송 태스크 시작
     client.loop.create_task(send_timed_reports())
+
+    # 리포트 스케줄러 시작
+    try:
+        asyncio.create_task(_report_scheduler_loop(client))
+        log("[REPORT_SCHED] started")
+    except Exception as e:
+        log(f"[REPORT_SCHED_ERR] {e}")
 
     while True:
         try:
@@ -11682,6 +11783,18 @@ async def on_message(message):
     content = message.content.strip()
     parts = content.split()
     # using global LAST_PRICE cache defined at module scope
+
+    # --- PDF 리포트 온디맨드 ---
+    if content.lower().startswith(("!report","!리포트")):
+        try:
+            # 구문: !report ETH/USDT 1h  (인자 없으면 기본 ETH 1h)
+            toks = content.split()
+            sym = toks[1] if len(toks) >= 2 else "ETH/USDT"
+            tf  = toks[2] if len(toks) >= 3 else "1h"
+            await _make_and_send_pdf_report(sym, tf, message.channel)
+        except Exception as e:
+            await message.channel.send(content=f"[REPORT] 사용법: !report SYMBOL TF  예) !report ETH/USDT 1h  (오류: {type(e).__name__})")
+        return
 
     # [ANCHOR: CMD_SET_GET_SAVEENV]
     if content.startswith(('!set ','!변경')):
