@@ -248,6 +248,9 @@ CTX_STATE: dict[str, dict] = {}
 # 구조 컨텍스트/오버레이 캐시: key=(symbol, tf) -> {"ctx": dict, "img": str|None, "ts": int, "mtime": int}
 STRUCT_CACHE: dict = {}
 
+# 최근 분석에 사용된 DF 캐시 (대시보드/리포트 폴백용)
+_LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+
 # 상위TF 구조 알림/상태 저장
 STRUCT_ALERT_STATE: dict = {}
 
@@ -10924,6 +10927,10 @@ async def on_ready():
 
                 df = await safe_get_ohlcv(symbol_eth, tf, limit=300)
                 df = await safe_add_indicators(df)
+                try:
+                    _LAST_DF_CACHE[(symbol_eth, tf)] = df
+                except Exception:
+                    pass
                 # === 닫힌 봉 기준값 확보 ===
                 c_o, c_h, c_l, c_c = closed_ohlc(df)     # c_c = closed_close
                 c_ts = closed_ts(df)                      # 닫힌 캔들 타임스탬프(초)
@@ -11211,8 +11218,6 @@ async def on_ready():
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
-                # 최근 DF 캐시 (대시보드 폴백용)
-                _LAST_DF_CACHE[(symbol_eth, tf)] = df.copy()
 
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
                 # 기존: rows = _load_ohlcv(...) → df_struct 만들고 실패 시 None → 이미지 미첨부
@@ -11343,10 +11348,18 @@ async def on_ready():
 
                 symbol_short = symbol_eth.split('/')[0]
                 # 2) 분석 메시지 — 푸시에는 안 뜸
+                # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
+                final_files_paths = []
+                if 'struct_img' in locals() and struct_img:
+                    final_files_paths.append(struct_img)
+                # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
+                if 'chart_files' in locals() and chart_files:
+                    final_files_paths += [p for p in chart_files if p and p != struct_img]
+
                 await _discord_send_chunked(
                     channel,
                     main_msg_pdf,
-                    files=[discord.File(p) for p in chart_files if p],
+                    files=[discord.File(p) for p in final_files_paths],
                     silent=True,
                     header_prefix=f"{symbol_short}-{tf}-Analysis"
                 )
@@ -11443,6 +11456,10 @@ async def on_ready():
                     continue
 
                 df = await safe_add_indicators(df)
+                try:
+                    _LAST_DF_CACHE[(symbol_btc, tf)] = df
+                except Exception:
+                    pass
                 signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol_btc)
 
                 # Gate opposite to context when strongly misaligned
@@ -11748,8 +11765,6 @@ async def on_ready():
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
-                # 최근 DF 캐시 (대시보드 폴백용)
-                _LAST_DF_CACHE[(symbol_btc, tf)] = df.copy()
 
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
@@ -11812,10 +11827,18 @@ async def on_ready():
 
                 symbol_short = symbol_btc.split('/')[0]
                 # 2) 분석 메시지
+                # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
+                final_files_paths = []
+                if 'struct_img' in locals() and struct_img:
+                    final_files_paths.append(struct_img)
+                # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
+                if 'chart_files' in locals() and chart_files:
+                    final_files_paths += [p for p in chart_files if p and p != struct_img]
+
                 await _discord_send_chunked(
                     channel,
                     main_msg_pdf,
-                    files=[discord.File(p) for p in chart_files if p],
+                    files=[discord.File(p) for p in final_files_paths],
                     silent=True,
                     header_prefix=f"{symbol_short}-{tf}-Analysis"
                 )
