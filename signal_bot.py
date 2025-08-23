@@ -6153,6 +6153,9 @@ async def _discord_send_chunked(channel, text: str, *, files=None, silent: bool 
         return ids
     except Exception as e:
         # 50035 등 폴백: 하드 컷
+
+        # ✅ 첨부는 Part 1에만 붙이고, 이후 파트는 텍스트만 보냄
+
         if ("50035" in str(e)) or ("Must be 2000" in str(e)):
             try:
                 hard = text[:1900]
@@ -8284,6 +8287,30 @@ def _fmt_pct(frac):
         return "-"
 
 # (구) _fmt_aloc_line는 더이상 사용하지 않음 → 알림에서 바로 포맷팅
+
+# [ANCHOR: STRUCT_INSERT_HELPERS_BEGIN]
+def _insert_struct_block(body: str, struct_block: str) -> str:
+    """
+    본문(body)에서 '📈 퍼포먼스 스냅샷' 헤더 직전에 구조 블록을 삽입한다.
+    • struct_block이 비거나 '데이터 부족' 문구면 아무 것도 넣지 않음(가독성).
+    """
+    try:
+        if not struct_block:
+            return body
+        sb = struct_block.strip()
+        if not sb or ("데이터 부족" in sb):
+            return body
+        needle = "📈 퍼포먼스 스냅샷"
+        idx = body.find(needle)
+        if idx <= 0:
+            # 헤더가 없으면 맨 하단에 붙인다(안전장치).
+            return f"{body.rstrip()}\n\n{sb}\n"
+        head = body[:idx].rstrip()
+        tail = body[idx:]
+        return f"{head}\n\n{sb}\n\n{tail}"
+    except Exception:
+        return body
+# [ANCHOR: STRUCT_INSERT_HELPERS_END]
 
 # [ANCHOR: NOTIFY_ENTRY_BEGIN]
 def _format_entry_message(symbol:str, tf:str, side:str, mode:str, price:float, lev:float,
@@ -11188,13 +11215,17 @@ async def on_ready():
                 )
                 struct_block = None
 
-                # 상단(메인)에는 구조 블록 미삽입
                 try:
                     struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
+                    legend_block = _render_struct_legend(struct_info or {}, tf)
+                    # 본문 상단 프리펜드 대신, '퍼포먼스 스냅샷' 직전에 주입
+                    if legend_block and legend_block.strip():
+                        struct_block = f"{struct_block}\n{legend_block}"
+                    main_msg_pdf = _insert_struct_block(main_msg_pdf, struct_block)
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_eth} {tf} main {type(_e).__name__}: {_e}")
 
-                # 구조 컨텍스트는 요약 하단에만 append
+                # 구조 컨텍스트는 요약 하단에 append
                 try:
 
                     # 캐시에 ctx가 있으면 재사용
@@ -11203,12 +11234,10 @@ async def on_ready():
                         if cache_ent:
                             struct_info = cache_ent.get("ctx")
 
-                    if struct_block is None:
-                        struct_block = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
+                    struct_block_sum = _render_struct_context_text(symbol_eth, tf, df=df_struct, ctx=struct_info)
                     legend_block = _render_struct_legend(struct_info or {}, tf)
-                    # 하단 append, 내용이 있을 때만
-                    if struct_block and struct_block.strip():
-                        summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block}{('\n'+legend_block) if legend_block else ''}"
+                    if struct_block_sum and struct_block_sum.strip():
+                        summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block_sum}{('\n'+legend_block) if legend_block else ''}"
 
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_eth} {tf} summary {type(_e).__name__}: {_e}")
@@ -11633,6 +11662,7 @@ async def on_ready():
                       show_risk=False
                   )
 
+
                 chart_files = save_chart_groups(df, symbol_btc, tf)
                 df_struct = None
                 struct_info = None
@@ -11660,23 +11690,28 @@ async def on_ready():
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
 
                 struct_block = None
-
                 try:
                     struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
+                    legend_block = _render_struct_legend(struct_info or {}, tf)
+                    if legend_block and legend_block.strip():
+                        struct_block = f"{struct_block}\n{legend_block}"
+                    main_msg_pdf = _insert_struct_block(main_msg_pdf, struct_block)
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} main {type(_e).__name__}: {_e}")
 
-                # 구조 컨텍스트는 요약 하단에만 append
+                # 구조 컨텍스트는 요약 하단에 append
+
                 try:
                     # 캐시에 ctx가 있으면 재사용
                     if struct_info is None and df_struct is not None:
                         cache_ent = _struct_cache_get(symbol_btc, tf, _df_last_ts(df_struct))
                         if cache_ent:
                             struct_info = cache_ent.get("ctx")
-                    if struct_block is None:
-                        struct_block = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
-                    if struct_block and struct_block.strip():
-                        summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block}"
+
+                    struct_block_sum = _render_struct_context_text(symbol_btc, tf, df=df_struct, ctx=struct_info)
+                    legend_block = _render_struct_legend(struct_info or {}, tf)
+                    if struct_block_sum and struct_block_sum.strip():
+                        summary_msg_pdf = f"{summary_msg_pdf}\n\n{struct_block_sum}{('\n'+legend_block) if legend_block else ''}"
 
                 except Exception as _e:
                     log(f"[SCE_SECT_WARN] {symbol_btc} {tf} summary {type(_e).__name__}: {_e}")
@@ -12158,6 +12193,38 @@ async def on_message(message):
         
 
         chart_files = save_chart_groups(df, symbol, tf)  # 분할 4장
+
+
+        # [SCE] 수동 명령에도 구조 컨텍스트/오버레이 적용
+        df_struct = None
+        struct_info = None
+        struct_img = None
+        try:
+            # 기존 OHLCV df를 SCE 입력형식으로 변환 후 컨텍스트 구축
+            df_struct = _sce_build_df_from_ohlcv(df)
+            struct_info = build_struct_context_basic(
+                df_struct, tf,
+                atr_mult_near=float(os.getenv("STRUCT_ATR_NEAR", "0.8")),
+                confluence_eps=float(os.getenv("STRUCT_EPS", "0.4")),
+            )
+            if os.getenv("STRUCT_OVERLAY_IMAGE", "1") == "1":
+                struct_img = render_struct_overlay(symbol, tf, df_struct, struct_info)
+                if struct_img:
+                    chart_files = [struct_img] + list(chart_files)
+        except Exception as _e:
+            log(f"[STRUCT_CMD_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
+
+        # 본문에 '구조 컨텍스트'를 퍼포먼스 스냅샷 직전으로 주입
+        try:
+            sb = _render_struct_context_text(symbol, tf, df=df_struct, ctx=struct_info)
+            main_msg_pdf = _insert_struct_block(main_msg_pdf, sb)
+            # 요약문에도 동일(하단에 덧붙이기)
+            if sb and sb.strip() and ("데이터 부족" not in sb):
+                summary_msg_pdf = f"{summary_msg_pdf}\n\n{sb}"
+        except Exception as _e:
+            log(f"[STRUCT_CMD_SECT_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
+
+
         await _discord_send_chunked(
             message.channel,
             main_msg_pdf,
