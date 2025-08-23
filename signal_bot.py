@@ -9415,7 +9415,9 @@ def _struct_shortline(symbol: str, tf: str) -> str:
                 df_struct = last_df.copy()
         df = df_struct
         if df is None or len(df) < 60:
+
             return f"{symbol} {tf}: 준비중"
+
         ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
         if ent and ent.get("ctx"):
             ctx = ent["ctx"]
