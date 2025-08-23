@@ -216,6 +216,7 @@ EXIT_RESOLUTION = cfg_get("EXIT_RESOLUTION", "1m").lower()  # must be "1m"
 EXIT_EVAL_MODE  = cfg_get("EXIT_EVAL_MODE", "TOUCH").upper()  # TOUCH | CLOSE (on 1m)
 # Which price feed to read before clamping. 'mark' is not allowed to trigger directly (we clamp anyway).
 EXIT_PRICE_SOURCE = cfg_get("EXIT_PRICE_SOURCE", "last").lower()  # last | index | mark(→forced last)
+TRIGGER_PRICE_SOURCE = cfg_get("STOP_TRIGGER_PRICE", os.getenv("EXIT_PRICE_SOURCE", "mark")).lower()
 # 1m outlier spike guard (fraction, e.g., 0.03=3% vs 1m open/close); 0 disables
 
 OUTLIER_MAX_1M = float(cfg_get("OUTLIER_MAX_1M", "0.03"))
@@ -4416,20 +4417,36 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
         except Exception:
             pass
 
-    occ = PAPER_POS_TF.get(tf)
+    # --- TF occupancy check (paper vs futures) ---
+    occ = FUT_POS_TF.get(tf) if TRADE_MODE == "futures" else PAPER_POS_TF.get(tf)
+    # Safety: also consider cross-cache occupancy (in case of stale state)
+    occ = occ or PAPER_POS_TF.get(tf) or FUT_POS_TF.get(tf)
+    has_real = False
     if tf not in IGNORE_OCCUPANCY_TFS and occ:
-        has_real = _has_open_position(occ, tf, TRADE_MODE)
-        if POS_TF_STRICT:
-            if has_real:
-                log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
-                return
-        else:
+        try:
+            has_real = _has_open_position(occ, tf, TRADE_MODE)
+        except Exception:
+            has_real = False
+
+        # Disallow different symbol on the same TF when ALLOW_BOTH_PER_TF=0
+        if (not ALLOW_BOTH_PER_TF) and (str(occ) != str(symbol)):
+            log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED(other={occ})")
+            return
+
+        # Strict: if any real open pos exists on this TF → skip re-entry
+        if POS_TF_STRICT and has_real:
             log(f"⏭ {symbol} {tf}: skip reason=OCCUPIED")
             return
+
+        # Autorepair: clear stale occupancy if no real pos remains
         if POS_TF_AUTOREPAIR and not has_real:
             try:
-                PAPER_POS_TF.pop(tf, None)
-                _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
+                if TRADE_MODE == "futures":
+                    if FUT_POS_TF.get(tf):
+                        FUT_POS_TF.pop(tf, None); _save_json(OPEN_TF_FILE, FUT_POS_TF)
+                else:
+                    if PAPER_POS_TF.get(tf):
+                        PAPER_POS_TF.pop(tf, None); _save_json(PAPER_POS_TF_FILE, PAPER_POS_TF)
                 log(f"[OCCUPANCY] cleared stale tf={tf} (was {occ})")
             except Exception:
                 pass
@@ -4744,6 +4761,64 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
     sl_pct      = alloc.get("sl_pct")
     tr_pct      = alloc.get("tr_pct")
     lev         = alloc.get("lev_used")
+
+# [PATCH NEG/CCA GATE BEGIN — maybe_execute_trade]
+    try:
+        # 토글/임계치 (env는 사용자가 설정)
+        coh_on      = str(cfg_get("COHERENCE_MODE", "on")).lower() in ("1","on","true","yes")
+        if coh_on:
+            ner_min   = float(cfg_get("NER_MIN",   "0.25"))
+            ner_tgt   = float(cfg_get("NER_TARGET","0.35"))
+            plr_max   = float(cfg_get("PLR_MAX",   "0.80"))
+            scout_pct = float(cfg_get("SCOUT_ALLOC_PCT", "0.15"))
+            edge_dlt  = float(cfg_get("EDGE_SWITCH_DELTA", "0.12"))
+
+            side_str   = "LONG" if exec_signal == "BUY" else "SHORT"
+            price_ref  = float(last_price)
+            L, S       = _symbol_exposure(symbol, price_ref)
+
+            # 후보 notional (eff_margin*lev 또는 qty*price)
+            cand_notional = (float(eff_margin or 0.0) * float(lev_used or 0.0))
+            if (cand_notional <= 0.0) and qty and price_ref > 0:
+                cand_notional = float(qty) * price_ref
+
+            # CCA: 점수우위 검증 (반대사이드가 강하면 스카웃)
+            new_score = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+            opp_best  = _best_opposite_score(symbol, side_str)
+            cca_weaken = (opp_best > 0.0) and ((new_score - opp_best) < edge_dlt)
+
+            # NEG: NER/PLR 예측
+            ner_next, plr_next = _ner_plr(L, S, side_str, cand_notional)
+
+            scale_factor = 1.0
+            reason_tags  = []
+
+            # PLR 상한 위반 → 스카웃
+            if plr_next > plr_max:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append(f"PLR>{plr_max:.2f}")
+
+            # lighter side 진입 시 NER>=ner_min 유지 위한 x 상한 적용
+            heavier = "LONG" if L >= S else "SHORT"
+            if side_str != heavier:
+                x_max = _x_max_for_ner_min(L, S, side_str, ner_min)
+                if x_max <= 0:
+                    scale_factor = min(scale_factor, scout_pct); reason_tags.append("NER_CAP0")
+                elif cand_notional > x_max:
+                    scale_factor = min(scale_factor, max(0.0, x_max / max(cand_notional, 1e-9)))
+                    reason_tags.append("NER_SCALE")
+
+            # 점수우위 부족 시 스카웃
+            if cca_weaken:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
+
+            # 스케일/스카웃 반영
+            if scale_factor < 0.999:
+                eff_margin = float(eff_margin) * float(scale_factor)
+                qty        = (float(eff_margin) * float(lev_used or 1.0)) / max(price_ref, 1e-9)
+                log(f"[COHERENCE] {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
+    except Exception as e:
+        log(f"[COHERENCE_WARN] {symbol} {tf} {e}")
+# [PATCH NEG/CCA GATE END — maybe_execute_trade]
     _pb_label   = alloc.get("pb_label")
     _pb_w       = alloc.get("pb_w")
     _pb_alloc_mul = alloc.get("pb_alloc_mul")
@@ -5159,13 +5234,20 @@ async def safe_price_hint(symbol:str):
             return _sanitize_exit_price(symbol, last)
         return _sanitize_exit_price(symbol, 0.0)
 
-    # 후보 가격 선택
-    cand = None
-    for k in PRICE_FALLBACK_ORDER:
-        v = snap.get(k)
+    # 트리거 소스 우선(존재하면 cand 고정)
+    pref = (TRIGGER_PRICE_SOURCE or "").strip().lower()
+    if pref and (pref in snap) and (snap.get(pref) is not None):
+        cand = float(snap.get(pref))
+    else:
+        cand = None
 
-        if v is not None:
-            cand = float(v); break
+    # 후보 가격 선택
+    if cand is None:
+        for k in PRICE_FALLBACK_ORDER:
+            v = snap.get(k)
+
+            if v is not None:
+                cand = float(v); break
 
     # mark 직접사용 제한 → last 있으면 last로 클램프
 
@@ -6297,6 +6379,113 @@ PAPER_POS = _load_json(PAPER_POS_FILE, {})   # key: f"{symbol}|{tf}" -> {side, e
 FUT_POS    = _load_json(OPEN_POS_FILE, {})         # symbol -> {'side','qty','entry'}
 FUT_POS_TF = _load_json(OPEN_TF_FILE, {})          # tf -> "BTC/USDT" 또는 "ETH/USDT"
 
+# [PATCH NEG/CCA HELPERS BEGIN]
+def _symbol_exposure(symbol: str, ref_price: float) -> tuple[float, float]:
+    """
+    현재 심볼의 총 Long/Short 노치오날 합계를 계산 (paper+futures).
+    반환: (L_notional, S_notional)
+    """
+    L = S = 0.0
+    try:
+        # PAPER
+        for k, pos in (PAPER_POS or {}).items():
+            if not isinstance(k, str) or not k.startswith(f"{symbol}|"):
+                continue
+            side = str(pos.get("side") or "").upper()
+            qty  = float(pos.get("qty") or 0.0)
+            lev  = float(pos.get("lev") or 0.0)
+            eff  = float(pos.get("eff_margin") or 0.0)
+            notional = (qty * ref_price) if (qty and ref_price) else (eff * lev)
+            if side == "LONG": L += max(0.0, notional)
+            elif side == "SHORT": S += max(0.0, notional)
+    except Exception:
+        pass
+    try:
+        # FUTURES (단일 심볼 키)
+        fp = (FUT_POS or {}).get(symbol) or {}
+        fside = str(fp.get("side") or "").upper()
+        fqty  = abs(float(fp.get("qty") or 0.0))
+        fnot  = fqty * ref_price if ref_price else 0.0
+        if fside == "LONG": L += max(0.0, fnot)
+        elif fside == "SHORT": S += max(0.0, fnot)
+    except Exception:
+        pass
+    return float(L), float(S)
+
+def _ner_plr(L: float, S: float, side: str, x: float) -> tuple[float, float]:
+    """
+    현재 L,S에 후보 포지션 notional(x)을 더했을 때의 (NER, PLR) 계산.
+    NER = |L'-S'|/(L'+S'),  PLR = min/max
+    """
+    Ln = L + (x if side == "LONG" else 0.0)
+    Sn = S + (x if side == "SHORT" else 0.0)
+    tot = Ln + Sn
+    if tot <= 0:
+        return 1.0, 0.0
+    net = abs(Ln - Sn)
+    ner = net / tot
+    mx  = max(Ln, Sn)
+    mn  = min(Ln, Sn)
+    plr = (mn / mx) if mx > 0 else 0.0
+    return float(ner), float(plr)
+
+def _x_max_for_ner_min(L: float, S: float, side: str, t: float) -> float:
+    """
+    '가벼운 쪽(lighter side)'으로 진입할 때 NER>=t를 유지하기 위한 최대 notional x 상한.
+    무제한/해당없음이면 큰 값 반환(=제한 없음), 불가능하면 0 반환.
+    """
+    t = float(t)
+    if t >= 1.0:
+        return 0.0
+    # heavier 판단
+    heavier = "LONG" if L >= S else "SHORT"
+    if side == heavier:
+        return float("inf")  # 무제한 (추가해도 NER 상승/유지)
+    # lighter로 진입 → x 상한 공식
+    if side == "LONG" and S >= L:
+        # NER = (S - L - x)/(S + L + x) >= t  → x <= ((1-t)S - (1+t)L)/(1+t)
+        num = (1.0 - t) * S - (1.0 + t) * L
+        den = (1.0 + t)
+        return max(0.0, num / den)
+    if side == "SHORT" and L >= S:
+        # NER = (L - S - x)/(L + S + x) >= t  → x <= ((1-t)L - (1+t)S)/(1+t)
+        num = (1.0 - t) * L - (1.0 + t) * S
+        den = (1.0 + t)
+        return max(0.0, num / den)
+    return 0.0
+
+def _best_opposite_score(symbol: str, side: str) -> float:
+    """
+    열린 '반대 사이드' 포지션들의 score(절대값) 중 최댓값 반환.
+    EXEC_STATE[('score', symbol, tf)] 사용.
+    """
+    best = 0.0
+    try:
+        # PAPER
+        for k, pos in (PAPER_POS or {}).items():
+            if not isinstance(k, str) or not k.startswith(f"{symbol}|"):
+                continue
+            tf   = k.split("|", 1)[1]
+            pside = str(pos.get("side") or "").upper()
+            if (pside == "LONG" and side == "SHORT") or (pside == "SHORT" and side == "LONG"):
+                sc = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+                if sc > best: best = sc
+    except Exception:
+        pass
+    try:
+        # FUTURES (열린 TF는 FUT_POS_TF에서 역추적)
+        fp = (FUT_POS or {}).get(symbol) or {}
+        fside = str(fp.get("side") or "").upper()
+        if (fside == "LONG" and side == "SHORT") or (fside == "SHORT" and side == "LONG"):
+            for tf, sym in (FUT_POS_TF or {}).items():
+                if sym == symbol:
+                    sc = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+                    if sc > best: best = sc
+    except Exception:
+        pass
+    return float(best)
+# [PATCH NEG/CCA HELPERS END]
+
 # repair hi/lo baselines on boot (applies to all TFs)
 try:
     for key, pos in (PAPER_POS or {}).items():
@@ -6904,8 +7093,8 @@ EXCHANGE_ID  = os.getenv("EXCHANGE_ID", "binanceusdm")
 SANDBOX      = os.getenv("SANDBOX", "1") == "1"
 
 FUT_MGN_USDT = float(os.getenv("FUT_MGN_USDT", "10"))    # 1회 진입 증거금(USDT)
-FUT_LEVERAGE = int(os.getenv("LEVERAGE", "3"))
-FUT_MARGIN   = os.getenv("MARGIN_TYPE", "ISOLATED").upper()  # ISOLATED|CROSS
+FUT_LEVERAGE = int(os.getenv("FUT_LEVERAGE", os.getenv("LEVERAGE", "3")))
+FUT_MARGIN   = os.getenv("FUT_MARGIN", os.getenv("MARGIN_TYPE", "ISOLATED")).upper()  # ISOLATED|CROSS
 SLIPPAGE_PCT = float(os.getenv("SLIPPAGE_PCT", "0.25"))  # 허용 슬리피지(%)
 
 # TF별 TP/SL 퍼센트는 기존 설정을 그대로 사용:
@@ -7533,14 +7722,6 @@ async def _notify_trade_entry(symbol: str, tf: str, signal: str, *,
         notional  = None
         if eff_margin and base_margin:
             use_frac = float(eff_margin) / float(base_margin)
-
-        if eff_margin and lev_used:
-            try:
-                notional = float(eff_margin) * int(lev_used)
-            except Exception:
-                pass
-
-        notional = None
         if eff_margin and lev_used:
             try:
                 notional = float(eff_margin) * int(lev_used)
@@ -8169,6 +8350,56 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
         )
         log(f"[ALLOC-DEBUG] {symbol} {tf} {exec_signal} req_lev={req_lev} limits={limits} -> qty≈{qty:.6f}")
 
+# [PATCH NEG/CCA GATE BEGIN — maybe_execute_futures_trade]
+    try:
+        coh_on = str(cfg_get("COHERENCE_MODE", "on")).lower() in ("1","on","true","yes")
+        if coh_on:
+            ner_min   = float(cfg_get("NER_MIN",   "0.25"))
+            ner_tgt   = float(cfg_get("NER_TARGET","0.35"))
+            plr_max   = float(cfg_get("PLR_MAX",   "0.80"))
+            scout_pct = float(cfg_get("SCOUT_ALLOC_PCT", "0.15"))
+            edge_dlt  = float(cfg_get("EDGE_SWITCH_DELTA", "0.12"))
+
+            side_str  = "LONG" if exec_signal == "BUY" else "SHORT"
+            price_ref = float(last)
+            L, S      = _symbol_exposure(symbol, price_ref)
+
+            # 후보 notional (eff_margin*lev)
+            cand_notional = float(eff_margin or 0.0) * float(lev or 0.0)
+
+            # CCA: 점수우위
+            new_score = abs(float(EXEC_STATE.get(('score', symbol, tf)) or 0.0))
+            opp_best  = _best_opposite_score(symbol, side_str)
+            cca_weaken = (opp_best > 0.0) and ((new_score - opp_best) < edge_dlt)
+
+            # NEG: 예측치
+            ner_next, plr_next = _ner_plr(L, S, side_str, cand_notional)
+
+            scale_factor = 1.0
+            reason_tags  = []
+
+            if plr_next > plr_max:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append(f"PLR>{plr_max:.2f}")
+
+            heavier = "LONG" if L >= S else "SHORT"
+            if side_str != heavier:
+                x_max = _x_max_for_ner_min(L, S, side_str, ner_min)
+                if x_max <= 0:
+                    scale_factor = min(scale_factor, scout_pct); reason_tags.append("NER_CAP0")
+                elif cand_notional > x_max:
+                    scale_factor = min(scale_factor, max(0.0, x_max / max(cand_notional, 1e-9)))
+                    reason_tags.append("NER_SCALE")
+
+            if cca_weaken:
+                scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
+
+            if scale_factor < 0.999:
+                eff_margin = float(eff_margin) * float(scale_factor)
+                log(f"[COHERENCE] FUT {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")
+    except Exception as e:
+        log(f"[COHERENCE_WARN] FUT {symbol} {tf} {e}")
+# [PATCH NEG/CCA GATE END — maybe_execute_futures_trade]
+
     # 6) 수량 계산(레버리지 상한 반영) → 정밀도/최소노치오날 체크
     qty_raw = _qty_from_margin_eff2(ex, symbol, last, eff_margin, tf)
     qty     = _ensure_fut_qty(ex, symbol, last, qty_raw)
@@ -8600,8 +8831,8 @@ HEDGE_MODE   = os.getenv("HEDGE_MODE", "1") == "1"
 
 import re
 
-TF_LEVERAGE = _parse_tf_map(os.getenv("LEVERAGE_BY_TF", ""), int)   # 예: {'15m':7,'1h':5,...}
-TF_MARGIN   = _parse_tf_map(os.getenv("MARGIN_BY_TF", ""), lambda x: x.upper())                  # 예: {'15m':'ISOLATED','4h':'CROSS',...}
+TF_LEVERAGE = _parse_tf_map(os.getenv("TF_LEVERAGE", os.getenv("LEVERAGE_BY_TF", "")), int)   # 예: {'15m':7,'1h':5,...}
+TF_MARGIN   = _parse_tf_map(os.getenv("TF_MARGIN", os.getenv("MARGIN_BY_TF", "")), lambda x: x.upper())                  # 예: {'15m':'ISOLATED','4h':'CROSS',...}
 
 # === Per-symbol per-TF margin-mode overrides ===
 import re as _re
@@ -9173,7 +9404,7 @@ def _fut_min_notional_ok(ex, symbol, price, qty):
     except Exception:
         min_cost = 0.0
     try:
-        env_min = float(os.getenv("FUT_MIN_NOTIONAL", "5"))
+        env_min = float(os.getenv("FUT_MIN_NOTIONAL", os.getenv("MIN_NOTIONAL", "5")))
     except Exception:
         env_min = 5.0
     need = max(min_cost, env_min)
