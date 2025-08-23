@@ -97,6 +97,49 @@ def _boot_env_summary():
 load_env_chain()
 _boot_env_summary()
 
+# ===== ENV safe parsers (strip inline comments like "60  # note") =====
+def _env_strip(v):
+    if v is None:
+        return None
+    s = str(v)
+    # split by '#' once, take left, strip spaces/quotes
+    s = s.split('#', 1)[0].strip().strip('"').strip("'")
+    return s
+
+def env_int(key: str, default: int) -> int:
+    try:
+        v = _env_strip(os.getenv(key))
+        if v is None or v == "":
+            return int(default)
+        # allow float-looking int, e.g., "60.0"
+        return int(float(v))
+    except Exception:
+        try:
+            log(f"[ENV_INT_WARN] {key}='{os.getenv(key)}' -> default {default}")
+        except Exception:
+            pass
+        return int(default)
+
+def env_float(key: str, default: float) -> float:
+    try:
+        v = _env_strip(os.getenv(key))
+        if v is None or v == "":
+            return float(default)
+        return float(v)
+    except Exception:
+        try:
+            log(f"[ENV_FLOAT_WARN] {key}='{os.getenv(key)}' -> default {default}")
+        except Exception:
+            pass
+        return float(default)
+
+def env_bool(key: str, default: bool=False) -> bool:
+    v = _env_strip(os.getenv(key))
+    if v is None or v == "":
+        return bool(default)
+    return v.lower() in ("1","true","on","yes","y")
+# ======================================================================
+
 # [ANCHOR: LOCKS_BEGIN]
 import asyncio
 ENABLE_POS_LOCK   = int(os.getenv("ENABLE_POS_LOCK","1") or 1)
@@ -255,7 +298,7 @@ _LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 STRUCT_ALERT_STATE: dict = {}
 
 # 차트/오버레이 렌더 동시성 제한
-RENDER_SEMA = asyncio.Semaphore(int(os.getenv("RENDER_MAX_CONCURRENCY", "1")))
+RENDER_SEMA = asyncio.Semaphore(env_int("RENDER_MAX_CONCURRENCY", 1))
 
 def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
     """Try multiple loaders; ALWAYS return list of [ts, o, h, l, c, v]."""
@@ -1437,7 +1480,7 @@ def get_usdkrw_rate(max_age_sec: int = 3600) -> float:
     # 2-1) 교차 환산(BTC)
     try:
         import ccxt
-        b = ccxt.binance({'enableRateLimit': True, 'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000"))})
+        b = ccxt.binance({'enableRateLimit': True, 'timeout': env_int("CCXT_TIMEOUT_MS", 5000)})
         u = ccxt.upbit({'enableRateLimit': True})
         btc_usdt = b.fetch_ticker('BTC/USDT')['last']
         btc_krw  = u.fetch_ticker('BTC/KRW')['last']
@@ -1449,7 +1492,7 @@ def get_usdkrw_rate(max_age_sec: int = 3600) -> float:
     if not rate:
         try:
             import ccxt
-            b = ccxt.binance({'enableRateLimit': True, 'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000"))})
+            b = ccxt.binance({'enableRateLimit': True, 'timeout': env_int("CCXT_TIMEOUT_MS", 5000)})
             u = ccxt.upbit({'enableRateLimit': True})
             eth_usdt = b.fetch_ticker('ETH/USDT')['last']
             eth_krw  = u.fetch_ticker('ETH/KRW')['last']
@@ -1645,7 +1688,7 @@ def get_btc_dominance():
 
 def _get_ethbtc_snapshot(tf='1h'):
     try:
-        ex = ccxt.binance({'enableRateLimit': True, 'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000")), 'options': {'defaultType': 'spot'}})
+        ex = ccxt.binance({'enableRateLimit': True, 'timeout': env_int("CCXT_TIMEOUT_MS", 5000), 'options': {'defaultType': 'spot'}})
         ex.load_markets()
         ohlcv = ex.fetch_ohlcv('ETH/BTC', timeframe=tf, limit=60)
         import pandas as pd, numpy as np
@@ -1738,7 +1781,7 @@ def fetch_live_price(symbol: str) -> float | None:
     try:
         ex = ccxt.binance({
             'enableRateLimit': True,
-            'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000")),
+            'timeout': env_int("CCXT_TIMEOUT_MS", 5000),
             'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
         })
         t = ex.fetch_ticker(symbol)
@@ -2263,7 +2306,7 @@ def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
     # CCXT 최신과 바이낸스 응답 포맷 이슈 회피
     exchange = ccxt.binance({
         'enableRateLimit': True,
-        'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000")),
+        'timeout': env_int("CCXT_TIMEOUT_MS", 5000),
         'options': {
             'defaultType': 'spot',          # 선물/마진 말고 스팟 고정
             'adjustForTimeDifference': True
@@ -2635,7 +2678,7 @@ def _struct_cache_get(symbol: str, tf: str, ts: int):
     if int(ent.get("ts", -1)) != int(ts):
         return None
     # TTL 체크(선택)
-    ttl = int(float(os.getenv("STRUCT_CACHE_TTL_SEC","7200")))
+    ttl = env_int("STRUCT_CACHE_TTL_SEC", 7200)
     if ttl > 0 and (time.time() - ent.get("mtime", 0)) > ttl:
         return None
     return ent
@@ -9414,11 +9457,11 @@ def _struct_shortline(symbol: str, tf: str) -> str:
         rows = _load_ohlcv(symbol, tf, limit=240)
         df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
         if (df_struct is None) and (last_df := _LAST_DF_CACHE.get((symbol, tf))):
-            if len(last_df) >= int(os.getenv("SCE_MIN_ROWS", "60")):
+
+            if len(last_df) >= env_int("SCE_MIN_ROWS", 60):
                 df_struct = last_df.copy()
         df = df_struct
         if df is None or len(df) < 60:
-
             return f"{symbol} {tf}: 준비중"
 
         ent = _struct_cache_get(symbol, tf, _df_last_ts(df))
@@ -9496,7 +9539,7 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
     try:
 
         # --- 폴백/최소행수 파라미터 ---
-        MIN_ROWS = int(os.getenv("SCE_MIN_ROWS", "60"))
+        MIN_ROWS = env_int("SCE_MIN_ROWS", 60)
         LIMIT    = int(os.getenv("SCE_FETCH_LIMIT", "400"))
         rows = None
         # 1) 입력 df 우선 사용, 없으면 로더
@@ -10001,7 +10044,7 @@ async def _report_scheduler_loop(client):
 
 
 async def _loop_jitter_watchdog():
-    thr_ms = float(os.getenv("WATCHDOG_JITTER_WARN_MS", "1500"))
+    thr_ms = env_float("WATCHDOG_JITTER_WARN_MS", 1500)
     last = asyncio.get_running_loop().time()
     while True:
         await asyncio.sleep(1.0)
@@ -11218,7 +11261,6 @@ async def on_ready():
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
-
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
                 # 기존: rows = _load_ohlcv(...) → df_struct 만들고 실패 시 None → 이미지 미첨부
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
@@ -11229,7 +11271,9 @@ async def on_ready():
                     df_struct = None
 
                 # 폴백: 기존 분석에 사용된 df로 대체 (최소행수 만족 시)
-                if (df_struct is None) and (df is not None) and (len(df) >= int(os.getenv("SCE_MIN_ROWS", "60"))):
+
+                if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
+
                     df_struct = df.copy()
 
                 struct_info = None
@@ -11773,7 +11817,9 @@ async def on_ready():
                 except Exception:
                     df_struct = None
 
-                if (df_struct is None) and (df is not None) and (len(df) >= int(os.getenv("SCE_MIN_ROWS", "60"))):
+
+                if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
+
                     df_struct = df.copy()
 
                 struct_info = None
@@ -11950,15 +11996,17 @@ async def on_message(message):
                 df = (_LAST_DF_CACHE.get((symbol, tf)) if '_LAST_DF_CACHE' in globals() else None)
 
             # 2) 로컬 분석 df 폴백
-            if (df is None or len(df) < int(os.getenv("SCE_MIN_ROWS","60"))) and '_LAST_DF_CACHE' in globals():
+
+            if (df is None or len(df) < env_int("SCE_MIN_ROWS", 60)) and '_LAST_DF_CACHE' in globals():
                 df = _LAST_DF_CACHE.get((symbol, tf))
 
             # 3) 네트워크(워커 스레드) 최후 시도
-            if df is None or len(df) < int(os.getenv("SCE_MIN_ROWS","60")):
+            if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
                 rows = await asyncio.to_thread(_load_ohlcv, symbol, tf, 400)
                 df = _sce_build_df_from_ohlcv(rows) if rows else None
 
-            if df is None or len(df) < int(os.getenv("SCE_MIN_ROWS","60")):
+            if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
+
                 await ch.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족(입력/네트워크 실패)")
                 return
 
@@ -12336,8 +12384,8 @@ async def on_message(message):
             df_struct = _sce_build_df_from_ohlcv(df)
             struct_info = build_struct_context_basic(
                 df_struct, tf,
-                atr_mult_near=float(os.getenv("STRUCT_ATR_NEAR", "0.8")),
-                confluence_eps=float(os.getenv("STRUCT_EPS", "0.4")),
+                atr_mult_near=env_float("STRUCT_ATR_NEAR", 0.8),
+                confluence_eps=env_float("STRUCT_EPS", 0.4),
             )
             if os.getenv("STRUCT_OVERLAY_IMAGE", "1") == "1":
 
