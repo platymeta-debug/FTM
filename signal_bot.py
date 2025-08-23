@@ -192,6 +192,9 @@ symbol_btc = 'BTC/USDT'
 LATEST_WEIGHTS = defaultdict(dict)          # key: (symbol, tf) -> {indicator: score}
 LATEST_WEIGHTS_DETAIL = defaultdict(dict)   # key: (symbol, tf) -> {indicator: reason}
 
+# 최근 분석에 사용된 DF 캐시 (대시보드 폴백용)
+_LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
+
 # [ANCHOR: PAUSE_GLOBALS]
 KST = timezone(timedelta(hours=9))
 PAUSE_UNTIL = {}  # (symbol, tf) -> epoch_ms; "__ALL__" -> epoch_ms
@@ -1460,6 +1463,7 @@ def _fmt_krw(v):
         return f"₩{int(round(float(v))):,}"
     except Exception:
         return "₩-"
+
 
 def _fmt_atr_x(v):
     v = _num(v, None)
@@ -9466,7 +9470,9 @@ def _get_cooldown_sec(symbol: str, tf: str) -> int:
 
 def _struct_shortline(symbol: str, tf: str) -> str:
     try:
+
         ent = STRUCT_CACHE.get((symbol, tf))
+
         if ent and ent.get("ctx"):
             ctx = ent["ctx"]
             near = (ctx.get("nearest") or {})
@@ -9524,6 +9530,7 @@ async def _dash_struct_block():
     lines = []
     for s in symbols:
         for tf in tfs:
+
             ent = STRUCT_CACHE.get((s, tf))
             if not ent or not ent.get("ctx"):
                 try:
@@ -9540,6 +9547,7 @@ async def _dash_struct_block():
                         _struct_cache_put(s, tf, _df_last_ts(df_struct), ctx, None)
                     except Exception:
                         pass
+
             lines.append(" - " + _struct_shortline(s, tf))
     # '준비중'만 잔뜩이면 헤더 숨김 (ENV로 on/off 가능)
     show_pending = env_bool("DASH_STRUCT_SHOW_PENDING", False)
@@ -9566,7 +9574,9 @@ async def _dash_struct_block():
                 cd_lines.append(f" - {s.split('/')[0]}-{tf}: 남은 {sec}s")
     if cd_lines:
         out.append("◼ 알림 쿨다운")
+
         out += cd_lines
+
 
     return out
 
@@ -9668,6 +9678,7 @@ def _render_struct_legend(ctx: dict, tf: str) -> str:
 
 
 # === STRUCT VIEW HELPERS ======================================================
+
 import matplotlib.ticker as mticker
 from matplotlib.ticker import FuncFormatter
 
@@ -9717,6 +9728,7 @@ def _num(x, default=None):
         return float(str(x).replace(",", "").strip())
     except Exception:
         return default
+
 # ============================================================================
 
 # === Structure overlay renderer (matplotlib) ==================================
@@ -9747,6 +9759,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                            CANDLE_W, abs(c[i]-o[i]),
                            facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA)
             ax.add_patch(rb)
+
 
         N = len(df)
         look = _tf_view_lookback(tf)
@@ -9835,11 +9848,13 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
                             if p: ax.hlines(p, x_min, x_max, colors='#17becf', linestyles='--', lw=1.2, zorder=1)
             try:
                 leg = ax.legend(loc='upper left', fontsize=9, frameon=True)
+
                 leg.get_frame().set_alpha(0.85)
             except Exception:
                 pass
         except Exception as _e:
             log(f"[STRUCT_LABEL_WARN] {type(_e).__name__}: {_e}")
+
 
         if env_bool('STRUCT_BASELINES_ON', True):
             try:
@@ -9872,6 +9887,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info,
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
         out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{int(time.time())}.png")
         fig.savefig(out, dpi=140, bbox_inches='tight', pad_inches=0.1)
+
         plt.close(fig)
         return out
     except Exception as e:
@@ -11417,6 +11433,7 @@ async def on_ready():
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
                 # 기존: rows = _load_ohlcv(...) → df_struct 만들고 실패 시 None → 이미지 미첨부
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
+
                 try:
                     rows = _load_ohlcv(symbol_eth, tf, limit=400)
                     df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
@@ -11440,6 +11457,7 @@ async def on_ready():
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
                         if struct_imgs:
                             chart_files = list(struct_imgs) + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A1-END]
@@ -11548,11 +11566,13 @@ async def on_ready():
                 # 2) 분석 메시지 — 푸시에는 안 뜸
                 # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
                 final_files_paths = []
+
                 if 'struct_imgs' in locals() and struct_imgs:
                     final_files_paths += [p for p in struct_imgs if p]
                 # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
                 if 'chart_files' in locals() and chart_files:
                     final_files_paths += [p for p in chart_files if p and (p not in (struct_imgs or []))]
+
 
                 await _discord_send_chunked(
                     channel,
@@ -11963,6 +11983,7 @@ async def on_ready():
                 async with RENDER_SEMA:
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
+
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
                     rows = _load_ohlcv(symbol_btc, tf, limit=400)
@@ -11986,6 +12007,7 @@ async def on_ready():
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
                         if struct_imgs:
                             chart_files = list(struct_imgs) + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A2-END]
@@ -12029,11 +12051,13 @@ async def on_ready():
                 # 2) 분석 메시지
                 # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
                 final_files_paths = []
+
                 if 'struct_imgs' in locals() and struct_imgs:
                     final_files_paths += [p for p in struct_imgs if p]
                 # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
                 if 'chart_files' in locals() and chart_files:
                     final_files_paths += [p for p in chart_files if p and (p not in (struct_imgs or []))]
+
 
                 await _discord_send_chunked(
                     channel,
@@ -12150,6 +12174,7 @@ async def on_message(message):
                 df = (_LAST_DF_CACHE.get((symbol, tf)) if '_LAST_DF_CACHE' in globals() else None)
 
             # 2) 로컬 분석 df 폴백
+
             if (df is None or len(df) < env_int("SCE_MIN_ROWS", 60)) and '_LAST_DF_CACHE' in globals():
                 df = _LAST_DF_CACHE.get((symbol, tf))
 
@@ -12159,6 +12184,7 @@ async def on_message(message):
                 df = _sce_build_df_from_ohlcv(rows) if rows else None
 
             if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
+
                 await ch.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족(입력/네트워크 실패)")
                 return
 
