@@ -237,6 +237,9 @@ def get_last_price(symbol: str, default_price: float = 0.0) -> float:
 #                           structure_bias, channel_z, avwap_dist, hhhl_tag, summary}
 CTX_STATE: dict[str, dict] = {}
 
+# 상위TF 구조 알림/상태 저장
+STRUCT_ALERT_STATE: dict = {}
+
 def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
     """Try multiple loaders; ALWAYS return list of [ts, o, h, l, c, v]."""
     providers = []
@@ -1143,6 +1146,40 @@ def _abs_score(c: dict) -> float:
     except Exception:
         pass
     return 0.0
+#
+def _parse_mtf_map(spec: str) -> dict[str, list[str]]:
+    """
+    "15m:1h,4h;1h:4h,1d;4h:1d" -> {"15m":["1h","4h"], "1h":["4h","1d"], "4h":["1d"]}
+    """
+    out = {}
+    try:
+        for seg in (spec or "").split(";"):
+            seg = seg.strip()
+            if not seg:
+                continue
+            k, v = seg.split(":")
+            out[k.strip()] = [x.strip() for x in v.split(",") if x.strip()]
+    except Exception:
+        pass
+    return out
+
+async def _struct_alert(symbol: str, tf: str, text: str):
+    """트레이드 채널에 구조 경고 발송(쿨다운 적용)."""
+    try:
+        if not MTF_ALERT_ENABLE:
+            return
+        key = (symbol, tf, "ALERT_TEXT")
+        last = STRUCT_ALERT_STATE.get(key, {}).get("ts", 0)
+        now  = _now_ms()
+        if (now - last) < MTF_ALERT_COOLDOWN_SEC * 1000:
+            return
+        STRUCT_ALERT_STATE[key] = {"ts": now}
+        cid = _get_trade_channel_id(symbol, tf)
+        ch  = client.get_channel(cid) if cid else None
+        if ch:
+            await ch.send(f"🧭 {symbol} · {tf} • {text}")
+    except Exception as e:
+        log(f"[STRUCT_ALERT_WARN] {symbol} {tf} {e}")
 
 # [ANCHOR: GATEKEEPER_V3_BEGIN]
 def gatekeeper_offer(tf: str, candle_ts_ms: int, cand: dict) -> bool:
@@ -2551,6 +2588,78 @@ def _sce_value_on_line(tl, x):
     if i2 == i1: return p2
     m = (p2 - p1) / (i2 - i1); b = p1 - m * i1
     return m * x + b
+
+
+def _sce_build_df_from_ohlcv(rows):
+    return pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+
+def _mtf_struct_guard(symbol: str, tf: str, side_signal: str):
+    """
+    상위TF 구조 근접/돌파 컨텍스트를 계산해 'BLOCK/SCOUT/NONE' 과 메시지를 돌려준다.
+    반환: {"action": "BLOCK|SCOUT|NONE", "reason": str}
+    """
+    try:
+        if not MTF_STRUCT_BIAS:
+            return {"action":"NONE", "reason":""}
+
+        mtf_map = _parse_mtf_map(MTF_STRUCT_MAP_STR)
+        higher_list = mtf_map.get(tf, [])
+        if not higher_list:
+            return {"action":"NONE", "reason":""}
+
+        # 신호 방향
+        is_buy  = (side_signal.upper() == "BUY")
+        is_sell = (side_signal.upper() == "SELL")
+
+        # 상위TF들 검사
+        for htf in higher_list:
+            rows = _load_ohlcv(symbol, htf, limit=400)
+            if not rows or len(rows) < 50:
+                continue
+            hdf = _sce_build_df_from_ohlcv(rows)
+            ctx = build_struct_context_basic(hdf, htf)
+            atr = ctx.get("atr", 0.0) or 0.0
+            near = ctx.get("nearest") or {}
+            res  = near.get("res"); sup = near.get("sup")
+
+            # 사전 경고(저항/지지까지 남은 거리)
+            try:
+                if MTF_ALERT_ENABLE and atr > 0:
+                    if res and (abs(res[2]) <= MTF_ALERT_PREWARN_ATR):
+                        asyncio.create_task(_struct_alert(symbol, htf, f"{htf} 저항까지 {res[2]:.2f}×ATR 남음 — 분할익절/레버 축소 고려"))
+                    if sup and (abs(sup[2]) <= MTF_ALERT_PREWARN_ATR):
+                        asyncio.create_task(_struct_alert(symbol, htf, f"{htf} 지지까지 {sup[2]:.2f}×ATR 남음 — 분할매수/스탑 여유 고려"))
+            except Exception:
+                pass
+
+            # 돌파 컨펌/리테스트 대기 알림
+            try:
+                break_buf = float(cfg_get("STRUCT_BREAK_CLOSE_ATR", "0.2"))
+                h_close   = float(hdf['close'].iloc[-1])
+                if res and (h_close > float(res[1]) + break_buf*atr):
+                    asyncio.create_task(_struct_alert(symbol, htf, f"{htf} 전고/저항 종가 돌파(+{break_buf}×ATR) — 리테스트 대기"))
+                if sup and (h_close < float(sup[1]) - break_buf*atr):
+                    asyncio.create_task(_struct_alert(symbol, htf, f"{htf} 지지 종가 이탈(−{break_buf}×ATR) — 리바운드 여부 관찰"))
+            except Exception:
+                pass
+
+            # 진입 바이어스/게이트
+            if atr > 0:
+                if is_buy and res and (res[2] <= MTF_NEAR_THR_ATR):
+                    if MTF_BLOCK_NEAR:
+                        return {"action":"BLOCK", "reason":f"{htf} 상단저항 근접({res[2]:.2f}×ATR)"}
+                    if MTF_SCOUT_ONLY_NEAR:
+                        return {"action":"SCOUT", "reason":f"{htf} 상단저항 근접({res[2]:.2f}×ATR)"}
+                if is_sell and sup and (sup[2] <= MTF_NEAR_THR_ATR):
+                    if MTF_BLOCK_NEAR:
+                        return {"action":"BLOCK", "reason":f"{htf} 하단지지 근접({sup[2]:.2f}×ATR)"}
+                    if MTF_SCOUT_ONLY_NEAR:
+                        return {"action":"SCOUT", "reason":f"{htf} 하단지지 근접({sup[2]:.2f}×ATR)"}
+        return {"action":"NONE", "reason":""}
+    except Exception as e:
+        log(f"[MTF_GUARD_WARN] {symbol} {tf} {e}")
+        return {"action":"NONE", "reason":""}
+
 
 
 def build_struct_context_basic(df, tf, atr_len=None,
@@ -4914,6 +5023,17 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
 
 # [PATCH NEG/CCA GATE BEGIN — maybe_execute_trade]
     try:
+
+        # ── MTF 구조 게이트 적용 ──────────────────────────────────────────────
+        try:
+            mtf_dec = _mtf_struct_guard(symbol, tf, exec_signal)
+            if mtf_dec.get("action") == "BLOCK":
+                log(f"[MTF-GATE] {symbol} {tf} {exec_signal} → WAIT: {mtf_dec.get('reason')}")
+                return
+        except Exception as _e:
+            log(f"[MTF-GATE-WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
+        # ─────────────────────────────────────────────────────────────────────
+
         # 토글/임계치 (env는 사용자가 설정)
         coh_on      = str(cfg_get("COHERENCE_MODE", "on")).lower() in ("1","on","true","yes")
         if coh_on:
@@ -4960,6 +5080,17 @@ async def maybe_execute_trade(symbol, tf, signal, last_price, candle_ts=None):
             # 점수우위 부족 시 스카웃
             if cca_weaken:
                 scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
+
+
+            # 상위TF 근접으로 스카웃만 허용된 경우
+            try:
+                mtf_dec = _mtf_struct_guard(symbol, tf, exec_signal)
+                if mtf_dec.get("action") == "SCOUT":
+                    scale_factor = min(scale_factor, scout_pct)
+                    reason_tags.append("MTF_NEAR")
+            except Exception:
+                pass
+
 
             # 스케일/스카웃 반영
             if scale_factor < 0.999:
@@ -6131,6 +6262,17 @@ STRUCT_NEAR_THR_ATR    = float(cfg_get("STRUCT_NEAR_THR_ATR", "0.8"))
 STRUCT_MAX_LEVELS      = int(float(cfg_get("STRUCT_MAX_LEVELS", "6")))
 # (B 단계에서 사용)
 STRUCT_BREAK_CLOSE_ATR = float(cfg_get("STRUCT_BREAK_CLOSE_ATR", "0.2"))
+
+# --- SCE (E) MTF gate/bias ---
+MTF_STRUCT_BIAS        = (cfg_get("MTF_STRUCT_BIAS", "on").lower() in ("1","on","true","yes"))
+MTF_STRUCT_MAP_STR     = cfg_get("MTF_STRUCT_MAP", "15m:1h,4h;1h:4h,1d;4h:1d")
+MTF_NEAR_THR_ATR       = float(cfg_get("MTF_NEAR_THR_ATR", "1.0"))
+MTF_SCOUT_ONLY_NEAR    = (cfg_get("MTF_SCOUT_ONLY_NEAR", "1") == "1")
+MTF_BLOCK_NEAR         = (cfg_get("MTF_BLOCK_NEAR", "0") == "1")  # true면 근접 시 진입 보류
+MTF_ALERT_ENABLE       = (cfg_get("MTF_ALERT_ENABLE", "1") == "1")
+MTF_ALERT_COOLDOWN_SEC = int(float(cfg_get("MTF_ALERT_COOLDOWN_SEC", "1800")))
+MTF_ALERT_PREWARN_ATR  = float(cfg_get("MTF_ALERT_PREWARN_ATR", "0.6"))  # 사전경고 임계(ATR배수)
+
 CHANNEL_BANDS_STD   = float(cfg_get("CHANNEL_BANDS_STD", "1.5"))
 AVWAP_ANCHORS       = cfg_get("AVWAP_ANCHORS", "SWING_HI,SWING_LO,LAST_BREAKOUT")
 CTX_ALPHA           = float(cfg_get("CTX_ALPHA", "0.35"))
@@ -8781,9 +8923,18 @@ async def maybe_execute_futures_trade(symbol, tf, signal, signal_price, candle_t
             if cca_weaken:
                 scale_factor = min(scale_factor, scout_pct); reason_tags.append("EDGE")
 
+
+            # 상위TF 근접으로 스카웃만 허용된 경우
+            try:
+                mtf_dec = _mtf_struct_guard(symbol, tf, exec_signal)
+                if mtf_dec.get("action") == "SCOUT":
+                    scale_factor = min(scale_factor, scout_pct)
+                    reason_tags.append("MTF_NEAR")
+            except Exception:
+                pass
+
             if scale_factor < 0.999:
                 eff_margin = float(eff_margin) * float(scale_factor)
-
                 EXEC_STATE[("coh_tags", symbol, tf)] = ",".join(reason_tags)
 
                 log(f"[COHERENCE] FUT {symbol} {tf} {side_str} scale×{scale_factor:.2f} tags={','.join(reason_tags)}")

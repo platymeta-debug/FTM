@@ -165,6 +165,36 @@ def _reason_performance(df, top_n=5):
     return rows
 
 
+# 구조 스냅샷 표 생성
+def _struct_snapshot_table(struct_info: dict|None):
+    """
+    struct_info 예시: {
+        "levels":[("ATH",4870.4),("PH",4820.2),...],
+        "nearest":{"res":("PH",4820.2,0.45),"sup":("PL",4380.5,0.72)},
+        "atr": 145.1
+    }
+    """
+    if not struct_info:
+        return [["데이터 없음"]]
+    rows = [["유형","값","거리(ATR)","메모"]]
+    price = None
+    try:  # 가격을 reasons 문자열에서 추출하거나 생략
+        pass
+    except Exception:
+        pass
+    near = struct_info.get("nearest") or {}
+    res, sup = near.get("res"), near.get("sup")
+    for t, v in struct_info.get("levels", [])[:10]:
+        note = []
+        if res and v == res[1]: note.append("상단 최근접")
+        if sup and v == sup[1]: note.append("하단 최근접")
+        rows.append([str(t), f"{float(v):.2f}", "-", ", ".join(note)])
+    if res:
+        rows.append(["최근접저항", f"{float(res[1]):.2f}", f"{float(res[2]):.2f}", ""])
+    if sup:
+        rows.append(["최근접지지", f"{float(sup[1]):.2f}", f"{float(sup[2]):.2f}", ""])
+    return rows
+
 # ===== PDF 생성 =====
 def generate_pdf_report(
     df, tf, signal, price, score, reasons, weights,
@@ -172,7 +202,8 @@ def generate_pdf_report(
     output_path=None, chart_imgs=None, chart_img=None, ichimoku_img=None,
     daily_change_pct=None, discord_message=None,
     symbol=None,
-    entry_price=None, entry_time=None
+    entry_price=None, entry_time=None,
+    struct_info=None, struct_img=None
 ):
 
     logs_df = _load_logs(tf, symbol=symbol)
@@ -211,7 +242,21 @@ def generate_pdf_report(
     if discord_message:
         elements.append(_para(discord_message.replace("\n", "<br/>"), size=9))
         elements.append(Spacer(1, 0.5*cm))
-
+    
+    # ◼ 구조 스냅샷(있을 때만)
+    if struct_info or struct_img:
+        elements.append(_para("◼ 구조 스냅샷", size=13, bold=True))
+        if struct_info:
+            st = Table(_struct_snapshot_table(struct_info))
+            st.setStyle(TableStyle([
+                ("FONTNAME",(0,0),(-1,-1),FONT_NAME),
+                ("BACKGROUND",(0,0),(-1,0),colors.lightgrey),
+                ("BOX",(0,0),(-1,-1),0.6,colors.black),
+                ("INNERGRID",(0,0),(-1,-1),0.4,colors.black),
+            ]))
+            elements += [st, Spacer(1, 0.5*cm)]
+        if struct_img and os.path.exists(struct_img):
+            elements += [Image(struct_img, width=16*cm, height=8*cm), Spacer(1, 0.4*cm)]
 
     # 최근 신호
     elements.append(_para("◼ 최근 신호 이력", size=13, bold=True))
