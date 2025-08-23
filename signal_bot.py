@@ -15,6 +15,7 @@ import discord
 import json, uuid
 import asyncio  # ✅ 이 줄을 꼭 추가
 from zoneinfo import ZoneInfo
+import datetime as dt
 
 # [ANCHOR: DEBUG_FLAG_BEGIN]
 def _env_on(k: str, default="0") -> bool:
@@ -9636,7 +9637,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
         score  = 0.0
         reasons, weights = [], {}
         agree_long = agree_short = 0
-        now = datetime.datetime.now(tz=ZoneInfo(REPORT_PDF_TIMEZONE))
+        now = dt.datetime.now(tz=ZoneInfo(REPORT_PDF_TIMEZONE))
         outdir = os.getenv("STRUCT_IMG_DIR", "./charts")
         os.makedirs(outdir, exist_ok=True)
         outfile = os.path.join(outdir, f"REPORT_{symbol.replace('/','-')}_{tf}_{now.strftime('%Y%m%d_%H%M')}.pdf")
@@ -9875,7 +9876,7 @@ async def _report_scheduler_loop(client):
 
     while True:
         try:
-            now = datetime.datetime.now(tz=tz)
+            now = dt.datetime.now(tz=tz)
             stamp = now.strftime("%Y-%m-%d %H:%M")
             hhmm  = now.strftime("%H:%M")
             if hhmm in times and stamp not in sent_mark:
@@ -9893,7 +9894,7 @@ async def _report_scheduler_loop(client):
                 sent_mark.add(stamp)
             # 오래된 마크 정리(24h)
             if len(sent_mark) > 64:
-                cutoff = (now - datetime.timedelta(days=2)).strftime("%Y-%m-%d")
+                cutoff = (now - dt.timedelta(days=2)).strftime("%Y-%m-%d")
                 sent_mark = {m for m in sent_mark if m[:10] >= cutoff}
         except Exception as e:
             log(f"[REPORT_SCHED_WARN] {type(e).__name__}: {e}")
