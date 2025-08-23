@@ -248,6 +248,9 @@ STRUCT_CACHE: dict = {}
 # 상위TF 구조 알림/상태 저장
 STRUCT_ALERT_STATE: dict = {}
 
+# 차트/오버레이 렌더 동시성 제한
+RENDER_SEMA = asyncio.Semaphore(int(os.getenv("RENDER_MAX_CONCURRENCY", "1")))
+
 def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
     """Try multiple loaders; ALWAYS return list of [ts, o, h, l, c, v]."""
     providers = []
@@ -1428,7 +1431,7 @@ def get_usdkrw_rate(max_age_sec: int = 3600) -> float:
     # 2-1) 교차 환산(BTC)
     try:
         import ccxt
-        b = ccxt.binance({'enableRateLimit': True})
+        b = ccxt.binance({'enableRateLimit': True, 'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000"))})
         u = ccxt.upbit({'enableRateLimit': True})
         btc_usdt = b.fetch_ticker('BTC/USDT')['last']
         btc_krw  = u.fetch_ticker('BTC/KRW')['last']
@@ -1440,7 +1443,7 @@ def get_usdkrw_rate(max_age_sec: int = 3600) -> float:
     if not rate:
         try:
             import ccxt
-            b = ccxt.binance({'enableRateLimit': True})
+            b = ccxt.binance({'enableRateLimit': True, 'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000"))})
             u = ccxt.upbit({'enableRateLimit': True})
             eth_usdt = b.fetch_ticker('ETH/USDT')['last']
             eth_krw  = u.fetch_ticker('ETH/KRW')['last']
@@ -1636,7 +1639,7 @@ def get_btc_dominance():
 
 def _get_ethbtc_snapshot(tf='1h'):
     try:
-        ex = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'spot'}})
+        ex = ccxt.binance({'enableRateLimit': True, 'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000")), 'options': {'defaultType': 'spot'}})
         ex.load_markets()
         ohlcv = ex.fetch_ohlcv('ETH/BTC', timeframe=tf, limit=60)
         import pandas as pd, numpy as np
@@ -1729,6 +1732,7 @@ def fetch_live_price(symbol: str) -> float | None:
     try:
         ex = ccxt.binance({
             'enableRateLimit': True,
+            'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000")),
             'options': {'defaultType': 'spot', 'adjustForTimeDifference': True}
         })
         t = ex.fetch_ticker(symbol)
@@ -2253,6 +2257,7 @@ def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
     # CCXT 최신과 바이낸스 응답 포맷 이슈 회피
     exchange = ccxt.binance({
         'enableRateLimit': True,
+        'timeout': int(os.getenv("CCXT_TIMEOUT_MS","5000")),
         'options': {
             'defaultType': 'spot',          # 선물/마진 말고 스팟 고정
             'adjustForTimeDifference': True
@@ -9660,7 +9665,10 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
 
         # SCE 컨텍스트/오버레이
         struct_info = build_struct_context_basic(df, tf)
-        struct_img  = render_struct_overlay(symbol, tf, df, struct_info)
+
+        async with RENDER_SEMA:
+            struct_img  = await asyncio.to_thread(render_struct_overlay, symbol, tf, df, struct_info)
+
 
         # 기본 값들(필요 최소치만)
         signal = "REPORT"
@@ -9676,15 +9684,19 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
         outfile = os.path.join(outdir, f"REPORT_{symbol.replace('/','-')}_{tf}_{now.strftime('%Y%m%d_%H%M')}.pdf")
 
         # PDF 생성
-        pdf_path = generate_pdf_report(
-            df=df, tf=tf, signal=signal, price=price, score=score,
-            reasons=reasons, weights=weights,
-            agree_long=agree_long, agree_short=agree_short, now=now,
-            output_path=outfile, chart_imgs=[struct_img] if struct_img else None, chart_img=None, ichimoku_img=None,
-            daily_change_pct=None, discord_message=None,
-            symbol=symbol, entry_price=None, entry_time=None,
-            struct_info=struct_info, struct_img=struct_img
-        )
+
+        async with RENDER_SEMA:
+            pdf_path = await asyncio.to_thread(
+                generate_pdf_report,
+                df=df, tf=tf, signal=signal, price=price, score=score,
+                reasons=reasons, weights=weights,
+                agree_long=agree_long, agree_short=agree_short, now=now,
+                output_path=outfile, chart_imgs=[struct_img] if struct_img else None, chart_img=None, ichimoku_img=None,
+                daily_change_pct=None, discord_message=None,
+                symbol=symbol, entry_price=None, entry_time=None,
+                struct_info=struct_info, struct_img=struct_img
+            )
+
         # 전송
         if pdf_path and os.path.exists(pdf_path):
             cap = f"[PDF] {symbol} {tf} • {now.strftime('%Y-%m-%d %H:%M')} ({REPORT_PDF_TIMEZONE})"
@@ -9936,6 +9948,20 @@ async def _report_scheduler_loop(client):
         except Exception as e:
             log(f"[REPORT_SCHED_WARN] {type(e).__name__}: {e}")
         await asyncio.sleep(20)
+
+
+
+async def _loop_jitter_watchdog():
+    thr_ms = float(os.getenv("WATCHDOG_JITTER_WARN_MS", "1500"))
+    last = asyncio.get_running_loop().time()
+    while True:
+        await asyncio.sleep(1.0)
+        now = asyncio.get_running_loop().time()
+        drift = (now - last - 1.0) * 1000.0
+        if drift > thr_ms:
+            log(f"[LOOP_JITTER_WARN] drift={drift:.0f}ms")
+        last = now
+
 
 
 async def _sync_open_state_on_ready():
@@ -10642,7 +10668,8 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
     df = add_indicators(df)
 
     # 차트/리포트 산출물
-    chart_files        = save_chart_groups(df, symbol, tf)           # 4장
+    async with RENDER_SEMA:
+        chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
     performance_file   = generate_performance_stats(tf, symbol=symbol)
@@ -10810,6 +10837,11 @@ async def on_ready():
         log("[REPORT_SCHED] started")
     except Exception as e:
         log(f"[REPORT_SCHED_ERR] {e}")
+
+
+    # 루프 지터 워치독 시작
+    asyncio.create_task(_loop_jitter_watchdog())
+
 
     while True:
         try:
@@ -11129,7 +11161,10 @@ async def on_ready():
                     elif previous == 'SELL' and signal == 'BUY':
                         pnl = ((entry_price - price) / entry_price) * 100
 
-                chart_files = save_chart_groups(df, symbol_eth, tf)
+
+                async with RENDER_SEMA:
+                    chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
+
                 df_struct = None
                 struct_info = None
                 struct_img = None
@@ -11146,11 +11181,12 @@ async def on_ready():
                     if struct_info is None and df_struct is not None:
                         struct_info = build_struct_context_basic(df_struct, tf)
                     if struct_img is None and df_struct is not None and struct_info is not None:
-                        struct_img = render_struct_overlay(symbol_eth, tf, df_struct, struct_info)
+
+                        async with RENDER_SEMA:
+                            struct_img = await asyncio.to_thread(render_struct_overlay, symbol_eth, tf, df_struct, struct_info)
                     # 캐시에 기록
                     if df_struct is not None and struct_info is not None:
                         _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
-
                     if struct_img:
                         # 오버레이를 첫 번째 첨부로(가시성↑)
                         chart_files = [struct_img] + list(chart_files)
@@ -11663,7 +11699,9 @@ async def on_ready():
                   )
 
 
-                chart_files = save_chart_groups(df, symbol_btc, tf)
+                async with RENDER_SEMA:
+                    chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
+
                 df_struct = None
                 struct_info = None
                 struct_img = None
@@ -11680,7 +11718,10 @@ async def on_ready():
                     if struct_info is None and df_struct is not None:
                         struct_info = build_struct_context_basic(df_struct, tf)
                     if struct_img is None and df_struct is not None and struct_info is not None:
-                        struct_img = render_struct_overlay(symbol_btc, tf, df_struct, struct_info)
+
+                        async with RENDER_SEMA:
+                            struct_img = await asyncio.to_thread(render_struct_overlay, symbol_btc, tf, df_struct, struct_info)
+
                     if df_struct is not None and struct_info is not None:
                         _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
                     if struct_img:
@@ -12191,8 +12232,8 @@ async def on_message(message):
             show_risk=False
             )
         
-
-        chart_files = save_chart_groups(df, symbol, tf)  # 분할 4장
+        async with RENDER_SEMA:
+            chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
 
 
         # [SCE] 수동 명령에도 구조 컨텍스트/오버레이 적용
@@ -12208,7 +12249,10 @@ async def on_message(message):
                 confluence_eps=float(os.getenv("STRUCT_EPS", "0.4")),
             )
             if os.getenv("STRUCT_OVERLAY_IMAGE", "1") == "1":
-                struct_img = render_struct_overlay(symbol, tf, df_struct, struct_info)
+
+                async with RENDER_SEMA:
+                    struct_img = await asyncio.to_thread(render_struct_overlay, symbol, tf, df_struct, struct_info)
+
                 if struct_img:
                     chart_files = [struct_img] + list(chart_files)
         except Exception as _e:
