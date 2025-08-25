@@ -686,59 +686,41 @@ def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
     return out
 
 
-def _best_trendlines(df: pd.DataFrame, tf:str=None):
-    pivH, pivL = _pivot_points(df)
-    x = np.arange(len(df))
-    tf_l = str(tf or "").lower()
-    is_daily = tf_l in ("1d","d","1w","w","1m","m")
 
-    # 변환 공간 (linear/log) — 일봉에서 로그 면 더 일관됨
-    scale_mode = _choose_scale(tf=tf)
-    y_low_t, inv = _y_transform(df["low"].values, scale_mode)
-    y_high_t, _ = _y_transform(df["high"].values, scale_mode)
+def _best_trendlines(df, tf:str=None):
+    """
+    상승=저가(밑꼬리) 지지선 / 하락=고가(위꼬리) 저항선.
+    STRUCT_TL_USE_CLOSED=1 이면 미완 봉 제외.
+    일봉/그 외 모두 '직선'으로 시각화하도록 linear 기반 기울기 계산.
+    """
+    # 닫힌 봉만 쓸지
+    use_closed = env_bool("STRUCT_TL_USE_CLOSED", True)
+    df_src = df.iloc[:-1] if (use_closed and len(df) >= 2) else df
 
-    def fit_line(ii, yvals_t):
-        xs = x[ii].astype(float); ys = yvals_t[ii].astype(float)
-        if len(xs) < 2: return None
-        m_t, b_t = np.polyfit(xs, ys, 1)
-        yhat_t = m_t*xs + b_t
-        ssr = np.sum((ys - yhat_t)**2); sst = np.sum((ys - ys.mean())**2) + 1e-9
-        r2 = 1.0 - (ssr/sst)
-        # convert line back to price space
-        y_line = inv(m_t*x + b_t)
-        m, b = np.polyfit(x, y_line, 1)
-        return m, b, r2
+    # 피벗
+    w = env_int("STRUCT_PIVOT_WINDOW", 3)
+    pivH, pivL = _pivot_points(df_src, w=w)
 
 
+    # 앵커 모드
+    anchor_up   = (os.getenv("STRUCT_TL_ANCHOR_UP","low")  or "low").lower()   # low
+    anchor_down = (os.getenv("STRUCT_TL_ANCHOR_DOWN","high") or "high").lower()# high
+
+    x = np.arange(len(df_src))
     up = dn = None
-    if is_daily:
-        if len(pivL) >= 3:
-            cand = []
-            ii = np.array(pivL[-4:], dtype=int)
-            for k in range(2, min(4, len(ii))+1):
-                res = fit_line(ii[-k:], y_low_t)
-                if res: cand.append(("up",)+res)
-            if cand:
-                c = max(cand, key=lambda t: t[3]); up = ("up", c[1], c[2])
-        if len(pivH) >= 3:
-            cand = []
-            ii = np.array(pivH[-4:], dtype=int)
-            for k in range(2, min(4, len(ii))+1):
-                res = fit_line(ii[-k:], y_high_t)
-                if res: cand.append(("down",)+res)
-            if cand:
-                c = max(cand, key=lambda t: t[3]); dn = ("down", c[1], c[2])
-    else:
-        if len(pivL) >= 2:
-            i1, i2 = pivL[-2], pivL[-1]
-            m = (df["low"].iloc[i2]-df["low"].iloc[i1])/((i2-i1)+1e-9)
-            b = df["low"].iloc[i2] - m*i2
-            up = ("up", m, b)
-        if len(pivH) >= 2:
-            i1, i2 = pivH[-2], pivH[-1]
-            m = (df["high"].iloc[i2]-df["high"].iloc[i1])/((i2-i1)+1e-9)
-            b = df["high"].iloc[i2] - m*i2
-            dn = ("down", m, b)
+
+    # 상승: 저가 피벗 2~3점으로 선형 회귀
+    if len(pivL) >= 2 and anchor_up == "low":
+        i1, i2 = pivL[-2], pivL[-1]
+        m = (df_src["low"].iloc[i2] - df_src["low"].iloc[i1]) / max((i2 - i1), 1e-9)
+        b = df_src["low"].iloc[i2] - m * i2
+        up = ("up", float(m), float(b))
+    # 하락: 고가 피벗 2~3점
+    if len(pivH) >= 2 and anchor_down == "high":
+        i1, i2 = pivH[-2], pivH[-1]
+        m = (df_src["high"].iloc[i2] - df_src["high"].iloc[i1]) / max((i2 - i1), 1e-9)
+        b = df_src["high"].iloc[i2] - m * i2
+        dn = ("down", float(m), float(b))
 
     return up, dn
 
@@ -861,12 +843,14 @@ def _draw_tls(ax, df, tls, tf:str=None):
         if scale_mode == "log":
             # y_t = m*x + b  → y = exp(y_t)
             y = np.exp(m*x + b)
+
         else:
             y = m*x + b
         if t.get("dir")=="up":
             ax.plot(xdt, y, linestyle="--", color=os.getenv("STRUCT_COL_TL_UP","#28a745"),
                     linewidth=env_float("STRUCT_LW_TL", 1.6), label=os.getenv("STRUCT_LBL_TL_UP","상승추세선"), zorder=1)
         else:
+
             ax.plot(xdt, y, linestyle="--", color=os.getenv("STRUCT_COL_TL_DN","#dc3545"),
                     linewidth=env_float("STRUCT_LW_TL", 1.6), label=os.getenv("STRUCT_LBL_TL_DN","하락추세선"), zorder=1)
 
@@ -1140,6 +1124,7 @@ def _bigfig_levels(ax, df, k:int=6):
                   alpha=alpha, zorder=1)
 
 
+
 # === scale/viewport helpers ==================================================
 def _decide_scale(tf: str) -> str:
     """Determine visual scale for y-axis."""
@@ -1228,6 +1213,7 @@ def _safe_legend(ax):
             leg.get_frame().set_alpha(0.7)
         except Exception:
             pass
+
 
 # =============================================================================
 
@@ -10672,6 +10658,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
             w, h = [int(x.strip()) for x in str(s).lower().replace("x", ",").split(",")[:2]]
             return max(600, w), max(400, h)
         except Exception:
+
             return default_w, default_h
     if mode == "near":
         w_px, h_px = _parse_size(os.getenv("STRUCT_SIZE_NEAR", "900x1600"), 900, 1600)
@@ -10713,6 +10700,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         err_flags.append(("tl", e))
     try:
         if env_bool("STRUCT_DRAW_REGCH", True):
+
             _draw_reg_channel(ax, df, k=env_float("STRUCT_REGCH_K", 1.0), tf=tf)
     except Exception as e:
         err_flags.append(("reg", e))
@@ -10721,6 +10709,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
             base = struct_info.get("fib_base") if isinstance(struct_info, dict) else None
             fib_levels = _resolve_fib_levels(tf)
             _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
+
     except Exception as e:
         err_flags.append(("fib", e))
     try:
@@ -10751,6 +10740,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         err_flags.append(("legend", e))
     out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
     try:
+
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
         fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches='tight', pad_inches=0.1)
     except Exception as e:
