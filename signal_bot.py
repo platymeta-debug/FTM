@@ -508,12 +508,23 @@ def _rows_to_df(rows):
 
 
     cols = [c for c in ["ts","time","open","high","low","close","volume","timestamp"] if c in df.columns]
+    # ensure index doesn't carry 'timestamp' name to avoid ambiguity with the column
+    try:
+        df.index.name = None
+    except Exception:
+        pass
     return df[cols]
 
 def _log_panel_source(symbol: str, tf: str, rows_or_df):
     try:
         df = _rows_to_df(rows_or_df)
-        df = df.sort_values('timestamp') if 'timestamp' in df.columns else df
+        # prefer numeric 'ts' if present; else fall back to 'timestamp'; else index
+        if 'ts' in df.columns:
+            df = df.sort_values('ts')
+        elif 'timestamp' in df.columns:
+            df = df.sort_values('timestamp')
+        else:
+            df = df.sort_index()
 
         if len(df) == 0:
             log(f"[PANEL_SOURCE] {symbol} {tf} len=0")
@@ -546,10 +557,46 @@ def _pivot_points(df: pd.DataFrame, w: int = None):
     return pivH, pivL
 
 def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
-    """struct_info에 레벨이 없으면 DF 기반으로 자동 생성(ATH/ATL/최근 피벗)."""
+    """
+    Accept both:
+      - dict format: [{"type":"R|S","price":float,"name":"ATH|PH|..."}]
+      - tuple format: [("ATH", 1234.5), ("PL", 987.6), ...]
+    Fallback to auto-detection (ATH/ATL + recent pivots) when empty.
+    """
+    def _norm_one(lv, close_val):
+        # already dict → shallow normalize
+        if isinstance(lv, dict):
+            p = float(lv.get("price") or lv.get("p") or 0.0)
+            tp = (lv.get("type") or lv.get("tp") or "").upper()
+            nm = (lv.get("name") or lv.get("label") or "").upper()
+            if not tp:
+                if nm in ("ATH","PH","R","RES","RESISTANCE"): tp = "R"
+                elif nm in ("ATL","PL","S","SUP","SUPPORT"): tp = "S"
+            if not tp:
+                tp = "R" if (close_val is not None and p >= close_val) else "S"
+            return {"type": tp, "price": p, "name": (nm or tp)}
+        # tuple/list → ("TAG", price) or ("R", price) ...
+        if isinstance(lv, (list, tuple)) and len(lv) >= 2:
+            tag = str(lv[0]).upper()
+            p   = float(lv[1])
+            if tag in ("ATH","PH","R","RES","RESISTANCE"):
+                tp = "R"
+            elif tag in ("ATL","PL","S","SUP","SUPPORT"):
+                tp = "S"
+            else:
+                tp = "R" if (close_val is not None and p >= close_val) else "S"
+            return {"type": tp, "price": p, "name": tag}
+        return None
+
+    close = float(df["close"].iloc[-1]) if len(df) else None
+
+    # 1) read from struct_info if provided
     levels = []
     if struct_info and isinstance(struct_info, dict):
-        levels = struct_info.get("levels", []) or []
+        raw = struct_info.get("levels", []) or []
+        levels = [x for x in (_norm_one(lv, close) for lv in raw) if x]
+
+    # 2) auto-build if empty
     if not levels:
         pivH, pivL = _pivot_points(df)
         selH = sorted(pivH[-8:], key=lambda i: df["high"].iloc[i], reverse=True)[:2]
@@ -561,11 +608,12 @@ def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
             levels.append({"type":"R","price": float(df["high"].iloc[i]), "name":"PH"})
         for i in selL:
             levels.append({"type":"S","price": float(df["low"].iloc[i]),  "name":"PL"})
-    close = float(df["close"].iloc[-1]) if len(df) else None
+
+    # 3) distance in ATR + sort & cap
     out = []
     for lv in levels:
         p = float(lv.get("price", 0.0))
-        d_atr = abs((close - p))/atr if close and atr>0 else None
+        d_atr = (abs((close - p))/atr) if (close is not None and atr and atr > 0) else None
         out.append({**lv, "dist_atr": d_atr})
     out = sorted(out, key=lambda x: (x["dist_atr"] if x["dist_atr"] is not None else 9e9))[:env_int("STRUCT_MAX_LEVELS", 6)]
     return out
@@ -588,12 +636,41 @@ def _best_trendlines(df: pd.DataFrame):
     return up, dn
 
 def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame):
-    tls = []
+    """
+    Accept:
+      - [{"dir":"up|down","m":float,"b":float}, ...]
+      - [("up", m, b), (m, b, "down"), ...]
+    Fallback to _best_trendlines when nothing usable.
+    """
+    def _norm_tl(t):
+        if isinstance(t, dict):
+            d = t
+            return {
+                "dir":  (str(d.get("dir") or d.get("direction") or "") or "").lower(),
+                "m":    float(d.get("m") or d.get("slope") or 0.0),
+                "b":    float(d.get("b") or d.get("intercept") or 0.0),
+            }
+        if isinstance(t, (list, tuple)):
+            if len(t) >= 3:
+                if isinstance(t[0], str):
+                    dirv, m, b = t[0], float(t[1]), float(t[2])
+                elif isinstance(t[2], str):
+                    m, b, dirv = float(t[0]), float(t[1]), t[2]
+                else:
+                    return None
+                return {"dir": str(dirv).lower(), "m": m, "b": b}
+        return None
+
+    # 1) try struct_info
     if struct_info and isinstance(struct_info, dict):
-        tls = struct_info.get("trendlines", []) or []
+        raw = struct_info.get("trendlines", []) or []
+        tls = [x for x in (_norm_tl(t) for t in raw) if x and x.get("dir") in ("up","down")]
         if tls:
             return tls
+
+    # 2) fallback auto
     up, dn = _best_trendlines(df)
+    tls = []
     if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
     if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
     return tls
@@ -618,9 +695,24 @@ def _draw_tls(ax, df, tls):
     if not tls: return
     x = np.arange(len(df)); xdt = df.index
     for t in tls:
-        m = float(t["m"]); b = float(t["b"])
+        try:
+            if isinstance(t, dict):
+                dirv = (t.get("dir") or "").lower()
+                m = float(t.get("m")); b = float(t.get("b"))
+            elif isinstance(t, (list, tuple)) and len(t) >= 3:
+                if isinstance(t[0], str):
+                    dirv, m, b = str(t[0]).lower(), float(t[1]), float(t[2])
+                elif isinstance(t[2], str):
+                    dirv, m, b = str(t[2]).lower(), float(t[0]), float(t[1])
+                else:
+                    continue
+            else:
+                continue
+        except Exception:
+            continue
+
         y = m*x + b
-        if t.get("dir")=="up":
+        if dirv == "up":
             ax.plot(xdt, y, linestyle="--", color="#28a745", linewidth=1.6, label="up TL")
         else:
             ax.plot(xdt, y, linestyle="--", color="#dc3545", linewidth=1.6, label="down TL")
@@ -11273,23 +11365,25 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
     # 차트/리포트 산출물
     async with RENDER_SEMA:
         _log_panel_source(symbol, tf, df)
-        chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
-        # === [PATCH] 구조 오버레이 near/macro 2장 생성 & 첨부(앞쪽) ===
+        chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 4장
+        # === [STRUCT_OVERLAY_FOR_OLDSTYLE] attach Near/Macro first ===
         try:
             rows_struct = _load_ohlcv_rows(symbol, tf, limit=400)
-            df_struct   = _rows_to_df(rows_struct) if rows_struct else None
+            df_struct = _rows_to_df(rows_struct)
         except Exception:
             rows_struct, df_struct = [], None
         if (not rows_struct) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
-            # 안전 폴백: 현재 df 사용
             rows_struct = df[['ts','open','high','low','close','volume']].values.tolist() if hasattr(df, 'values') else []
-            df_struct   = _rows_to_df(rows_struct)
+            df_struct = _rows_to_df(rows_struct)
+
         struct_imgs = []
+        struct_info = None
         try:
-            if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
+            if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS", 60):
+                _log_panel_source(symbol, tf, df_struct)
                 struct_info = build_struct_context_basic(df_struct, tf)
                 lb = _tf_view_lookback(tf)
-                near_img  = render_struct_overlay(
+                near_img = render_struct_overlay(
                     symbol, tf, df_struct, struct_info,
                     lookback_override=lb,
                     anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
@@ -11297,15 +11391,18 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
                 )
                 macro_img = render_struct_overlay(
                     symbol, tf, df_struct, struct_info,
-                    lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
-                    anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                    lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT", 3.0)),
+                    anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO", 0.85),
                     title_suffix="· Macro",
                 )
                 struct_imgs = [p for p in (near_img, macro_img) if p]
+                if struct_info is not None:
+                    _struct_cache_put(symbol, tf, _df_last_ts(df_struct), struct_info, near_img)
                 if struct_imgs:
-                    chart_files = struct_imgs + list(chart_files)  # 구조 2장을 앞에 PREPEND → 총 6장
+                    chart_files = struct_imgs + list(chart_files)
         except Exception as _e:
             log(f"[STRUCT_IMG_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
+        # === [/STRUCT_OVERLAY_FOR_OLDSTYLE] ===
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
     performance_file   = generate_performance_stats(tf, symbol=symbol)
