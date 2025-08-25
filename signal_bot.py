@@ -539,6 +539,7 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
 # ==== Structure calc & draw helpers ==========================================
 # --- price scale transform ----------------------------------------------------
 def _choose_scale(tf:str=None):
+
     """calc mode: auto|linear|log (auto: 전체를 log로 쓰고 싶으면 .env에서 log로 강제)"""
     mode = (os.getenv("STRUCT_SCALE_MODE", "log") or "log").lower()  # 기본 log
     if mode == "auto":
@@ -547,20 +548,25 @@ def _choose_scale(tf:str=None):
     return "log" if mode=="log" else "linear"
 
 def _y_transform(y: np.ndarray, mode: str):
+
     if mode == "log":
         y_safe = np.clip(y.astype(float), 1e-9, np.inf)
         return np.log(y_safe), np.exp
     return y.astype(float), (lambda z: z)
 
+
 def _fib_base_from_env(df: pd.DataFrame):
     """
     .env:
       STRUCT_FIB_BASE_MODE=recent|global|manual
+
       STRUCT_FIB_BASE=2024-10-13,2025-08-25   # ISO 날짜(시간 포함 가능) 또는 'idx:123,456'
       STRUCT_FIB_BASE_KIND=bull|bear|close    # 기준 y: 저→고 / 고→저 / 종가
     반환: (i0, i1) 또는 None
     """
+
     mode = (os.getenv("STRUCT_FIB_BASE_MODE","recent") or "recent").lower()
+
     if mode != "manual":
         return None
     raw = os.getenv("STRUCT_FIB_BASE") or ""
@@ -590,6 +596,7 @@ def _fib_base_from_env(df: pd.DataFrame):
         return (i0, i1)
     except Exception:
         return None
+
 
 def ta_atr(high, low, close, n=14):
     h = pd.Series(high, dtype=float)
@@ -673,6 +680,7 @@ def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
     return out
 
 
+
 def _best_trendlines(df, tf:str=None):
     """
     상승=저가(밑꼬리) 지지선 / 하락=고가(위꼬리) 저항선.
@@ -687,12 +695,14 @@ def _best_trendlines(df, tf:str=None):
     w = env_int("STRUCT_PIVOT_WINDOW", 3)
     pivH, pivL = _pivot_points(df_src, w=w)
 
+
     # 앵커 모드
     anchor_up   = (os.getenv("STRUCT_TL_ANCHOR_UP","low")  or "low").lower()   # low
     anchor_down = (os.getenv("STRUCT_TL_ANCHOR_DOWN","high") or "high").lower()# high
 
     x = np.arange(len(df_src))
     up = dn = None
+
     # 상승: 저가 피벗 2~3점으로 선형 회귀
     if len(pivL) >= 2 and anchor_up == "low":
         i1, i2 = pivL[-2], pivL[-1]
@@ -705,6 +715,7 @@ def _best_trendlines(df, tf:str=None):
         m = (df_src["high"].iloc[i2] - df_src["high"].iloc[i1]) / max((i2 - i1), 1e-9)
         b = df_src["high"].iloc[i2] - m * i2
         dn = ("down", float(m), float(b))
+
     return up, dn
 
 def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame, tf:str=None):
@@ -865,9 +876,11 @@ def _draw_reg_channel(ax, df, k=None, tf:str=None):
     x = np.arange(len(df))
     y = df["close"].values
 
+
     # === scale transform (linear/log)
     scale_mode = _choose_scale(tf=tf)
     y_t, inv = _y_transform(y, scale_mode)
+
 
     # slope/intercept in transformed space
     method = os.getenv("STRUCT_REGCH_METHOD","ols").lower()
@@ -877,9 +890,11 @@ def _draw_reg_channel(ax, df, k=None, tf:str=None):
     else:
         m, b = np.polyfit(x, y_t, 1)
 
+
     yhat_t = m*x + b
     resid_t = y_t - yhat_t
     sigma_t = np.std(resid_t) if np.std(resid_t) > 0 else 1e-6
+
 
     # invert back to price for plotting
     y_mu  = inv(yhat_t)
@@ -889,8 +904,10 @@ def _draw_reg_channel(ax, df, k=None, tf:str=None):
 
     col_reg = os.getenv("STRUCT_COL_REG", "#6f42c1")
     lw_reg  = env_float("STRUCT_LW_REG", 1.4)
+
     lbl_reg = os.getenv("STRUCT_LBL_REG", "Regression μ")
     ax.plot(df.index, y_mu, color=col_reg, linewidth=lw_reg, label=lbl_reg, zorder=1)
+
     if show_sigma:
         ax.plot(df.index, y_p, color=col_reg, linewidth=1.0, linestyle=":", label=f"+{k}σ", zorder=1)
         ax.plot(df.index, y_m, color=col_reg, linewidth=1.0, linestyle=":", label=f"-{k}σ", zorder=1)
@@ -922,6 +939,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
     # === scale transform (linear/log)
     scale_mode = _choose_scale(tf=tf)
     y_t, inv = _y_transform(y, scale_mode)
+
 
     # 기준선: 변환공간에서 직선 적합 (base_mode: global/recent/manual)
     if base is None:
@@ -993,6 +1011,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
         up = inv(y0_t + lv*scale_t)
         dn = inv(y0_t - lv*scale_t)
         lbl = (lbl_fib_lvl if first_level_label else None)
+
         first_level_label = False
         ax.plot(df.index, up, color=clr, linewidth=lw_main, linestyle="--", alpha=alpha_m, label=lbl, zorder=1)
         ax.plot(df.index, dn, color=clr, linewidth=lw_main, linestyle="--", alpha=alpha_m, zorder=1)
@@ -1003,6 +1022,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
         for a, b_ in zip(pairs[:-1], pairs[1:]):
             mid = 0.5*(a + b_)
             up = inv(y0_t + mid*scale_t); dn = inv(y0_t - mid*scale_t)
+
             lbl = (lbl_fib_mid if not mid_labeled else None); mid_labeled = True
             ax.plot(df.index, up, color=clr, linewidth=lw_mid, linestyle=":", alpha=alpha_mid, label=lbl, zorder=1)
             ax.plot(df.index, dn, color=clr, linewidth=lw_mid, linestyle=":", alpha=alpha_mid, zorder=1)
@@ -1033,6 +1053,7 @@ def _draw_ath_lines(ax, df, ath, show_h=True, show_v=True):
                         clip_on=False, zorder=2)
     if show_v:
         ax.axvline(ath["time"], color=col, linestyle=(0,(4,3)), linewidth=lw, alpha=alpha*0.9, zorder=1)
+
 
 # === Prev-cycle Tops =========================================================
 def _prev_cycle_tops(df, n=None, min_gap_bars=None):
@@ -1102,6 +1123,7 @@ def _fix_time_axis(ax, tf:str):
         lab.set_ha("center")
     if env_bool("STRUCT_XGRID_ON", True):
         ax.grid(True, axis="x", alpha=0.15)
+
 
 # =============================================================================
 
@@ -10604,6 +10626,20 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         fig = plt.figure(figsize=(w_px/dpi, h_px/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
 
+        # === Y axis scale (visual) ====================================================
+        # visual: linear|log|match  (match = 계산 모드와 동일)
+        vis_scale = (os.getenv("STRUCT_AXIS_SCALE_VISUAL","match") or "match").lower()
+        calc_scale = _choose_scale(tf=tf)  # 아래 B-1에서 정의됨 (log/linear)
+        if vis_scale == "match":
+            vis_scale = calc_scale
+        ax.set_yscale("log" if vis_scale=="log" else "linear")
+
+        # 로그 축 tick (가독성)
+        if vis_scale == "log":
+            ax.yaxis.set_major_locator(LogLocator(base=10, numticks=8))
+            ax.yaxis.set_major_formatter(LogFormatter())
+            ax.yaxis.set_minor_formatter(NullFormatter())
+
         ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
 
 
@@ -10661,7 +10697,9 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             pass
 
         # ====== 축 포맷 ======
+
         if y_mode != "log":
+
             ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
         ax.grid(True, axis='y', ls='--', alpha=0.25)
 
@@ -10712,8 +10750,10 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
             _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
 
+
         # (6) 15m 축/라벨 겹침 방지
         _fix_time_axis(ax, tf)
+
 
         # === Legend (lean) ===
         handles, labels = ax.get_legend_handles_labels()
