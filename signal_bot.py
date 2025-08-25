@@ -378,7 +378,9 @@ def _load_ohlcv(symbol: str, tf: str, limit: int = 240, since: int | None = None
         df = pd.DataFrame(arr, columns=["ts", "open", "high", "low", "close", "volume"])
         dt = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
         df.index = dt
+
         df["timestamp"] = dt
+
         df = df[~df.index.duplicated(keep="last")]
         for c in ("open", "high", "low", "close", "volume"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -9937,11 +9939,13 @@ def render_struct_overlay(symbol: str, tf: str, rows, struct_info, *, mode: str 
             ax.add_patch(rb)
 
         # ====== VIEW WINDOW ======
+
         if ts and ts[-1]:
             right_pad = int(_TF_SEC.get(tf, 900) * 0.7)
             left_span = _TF_SEC.get(tf, 900) * (90 if mode == 'near' else 480)
             ax.set_xlim(pd.to_datetime(ts[-1] - left_span, unit='ms', utc=True),
                         pd.to_datetime(ts[-1] + right_pad, unit='ms', utc=True))
+
 
         # ====== Y RANGE ======
         y_min = float(df['low'].min()); y_max = float(df['high'].max())
@@ -11571,8 +11575,10 @@ async def on_ready():
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
 
                 try:
+
                     rows_struct = _load_ohlcv_rows(symbol_eth, tf, limit=400)
                     df_struct = _rows_to_df(rows_struct)
+
                 except Exception:
                     rows_struct, df_struct = [], None
 
@@ -11582,12 +11588,14 @@ async def on_ready():
 
                 struct_info = None
                 try:
+
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         log(f"[PANEL_SOURCE] {symbol_eth} {tf} len={len(df_struct)} first={df_struct.index[0]} last={df_struct.index[-1]}")
                         struct_info = build_struct_context_basic(df_struct, tf)
                         near_img  = render_struct_overlay(symbol_eth, tf, rows_struct, struct_info, mode="near")
                         macro_img = render_struct_overlay(symbol_eth, tf, rows_struct, struct_info, mode="macro")
                         if struct_info is not None:
+
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
                         chart_files = [p for p in (near_img, macro_img) if p] + list(chart_files)
                 except Exception as _e:
@@ -12119,8 +12127,10 @@ async def on_ready():
 
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
+
                     rows_struct = _load_ohlcv_rows(symbol_btc, tf, limit=400)
                     df_struct = _rows_to_df(rows_struct)
+
                 except Exception:
                     rows_struct, df_struct = [], None
 
@@ -12130,12 +12140,14 @@ async def on_ready():
 
                 struct_info = None
                 try:
+
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         log(f"[PANEL_SOURCE] {symbol_btc} {tf} len={len(df_struct)} first={df_struct.index[0]} last={df_struct.index[-1]}")
                         struct_info = build_struct_context_basic(df_struct, tf)
                         near_img  = render_struct_overlay(symbol_btc, tf, rows_struct, struct_info, mode="near")
                         macro_img = render_struct_overlay(symbol_btc, tf, rows_struct, struct_info, mode="macro")
                         if struct_info is not None:
+
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
                         chart_files = [p for p in (near_img, macro_img) if p] + list(chart_files)
                 except Exception as _e:
