@@ -459,65 +459,65 @@ def _row_to_ohlcv(row):
 
 def _rows_to_df(rows):
 
-    """
-    list/tuple/dict/DataFrame -> DataFrame
-    - time/ts 컬럼을 UTC DatetimeIndex로 강제
-    - 컬럼: ['time','open','high','low','close','volume']
-    """
+    """list 기반 OHLCV를 pandas DataFrame으로 안전 변환."""
     import pandas as _pd
 
     if rows is None:
-        return _pd.DataFrame(columns=["time","open","high","low","close","volume"])
+        return _pd.DataFrame(columns=["ts","time","open","high","low","close","volume","timestamp"])
 
-    if hasattr(rows, "columns"):  # 이미 DF
+    if hasattr(rows, "columns"):  # 이미 DataFrame
         df = rows.copy()
-        # 'time' 또는 'ts' 중 하나를 인덱스로 승격
-        if "time" in df.columns:
-            dt = _pd.to_datetime(df["time"].astype("int64"), unit="ms", utc=True)
-            df.index = dt
-        elif "ts" in df.columns:
-            dt = _pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
-            df["time"] = df["ts"].astype("int64")
-            df.index = dt
-        return df[["time","open","high","low","close","volume"]]
-
-    # list/tuple/dict list → DataFrame
-    if not rows:
-        return _pd.DataFrame(columns=["time","open","high","low","close","volume"])
-
-    first = rows[0]
-    if isinstance(first, (list, tuple)):
-        # [ts, o, h, l, c, v] 또는 [o,h,l,c]
-        if len(first) >= 6:
-            df = _pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
-        elif len(first) >= 4:
-            df = _pd.DataFrame(rows, columns=["open","high","low","close"])
-            df["volume"] = 0.0
-            df["time"] = _pd.NaT
-        else:
-            raise ValueError(f"Bad OHLCV row len={len(first)}")
     else:
-        # dict list
-        df = _pd.DataFrame(rows)
-        if "time" not in df.columns and "ts" in df.columns:
-            df["time"] = df["ts"]
+        if not rows:
+            return _pd.DataFrame(columns=["ts","time","open","high","low","close","volume","timestamp"])
+        first = rows[0]
+        if isinstance(first, (list, tuple)):
+            if len(first) >= 6:
+                df = _pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+            elif len(first) >= 4:
+                df = _pd.DataFrame(rows, columns=["open","high","low","close"])
+                df["volume"] = 0.0
+                df["ts"] = _pd.NA
+            else:
+                raise ValueError(f"Bad OHLCV row len={len(first)}")
+        else:
+            df = _pd.DataFrame(rows)
 
-    # 시간 인덱스 강제
-    if "time" in df.columns and df["time"].notna().any():
-        dt = _pd.to_datetime(df["time"].astype("int64"), unit="ms", utc=True)
-        df.index = dt
+    if "ts" not in df.columns and "time" in df.columns:
+        df["ts"] = df["time"]
+    if "time" not in df.columns and "ts" in df.columns:
+        df["time"] = df["ts"]
 
-    # 타입 보정 & 컬럼 정렬
+    if "timestamp" not in df:
+        base = "time" if "time" in df.columns else ("ts" if "ts" in df.columns else None)
+        if base is not None:
+            df["timestamp"] = _pd.to_datetime(df[base].astype("int64"), unit="ms", utc=True)
+            if not isinstance(df.index, _pd.DatetimeIndex):
+                df.index = df["timestamp"]
+        else:
+            if not isinstance(df.index, _pd.DatetimeIndex):
+                df["timestamp"] = _pd.to_datetime(df.index)
+            else:
+                df["timestamp"] = df.index
+
+
     for c in ("open","high","low","close","volume"):
         if c in df.columns:
             df[c] = _pd.to_numeric(df[c], errors="coerce")
         else:
             df[c] = _pd.NA
-    return df[["time","open","high","low","close","volume"]]
+
+
+    cols = [c for c in ["ts","time","open","high","low","close","volume","timestamp"] if c in df.columns]
+    return df[cols]
+
 
 def _log_panel_source(symbol: str, tf: str, rows_or_df):
     try:
         df = _rows_to_df(rows_or_df)
+
+        df = df.sort_values('timestamp') if 'timestamp' in df.columns else df
+
         if len(df) == 0:
             log(f"[PANEL_SOURCE] {symbol} {tf} len=0")
             return
@@ -2008,9 +2008,9 @@ def sanitize_price_for_tf(symbol: str, tf: str, price: float) -> float:
         rows_chk = get_ohlcv(symbol, tf, limit=2)
         df_chk = _rows_to_df(rows_chk)
         if len(df_chk) >= 2:
-            row = df_chk.iloc[-2]  # 닫힌 캔들
-            lo = float(row['low']); hi = float(row['high'])
-            p  = float(price)
+            row = df_chk.iloc[-2].to_dict()  # 닫힌 캔들
+            _, _, hi, lo, _, _ = _row_to_ohlcv(row)
+            p = float(price)
             if not (lo <= p <= hi):
                 return min(max(p, lo), hi)
     except Exception:
@@ -2915,7 +2915,19 @@ async def _refresh_struct_cache(symbol: str, tf: str):
         if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
             return
         ctx = build_struct_context_basic(df, tf)
-        img = render_struct_overlay(symbol, tf, rows, ctx, mode="near")
+
+        lb = _tf_view_lookback(tf)
+        _log_panel_source(symbol, tf, df)
+        img = render_struct_overlay(
+            symbol,
+            tf,
+            df,
+            ctx,
+            lookback_override=lb,
+            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+            title_suffix="· Near",
+        )
+
         _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, img)
         try:
             _LAST_DF_CACHE[(symbol, tf)] = df
@@ -3066,12 +3078,10 @@ def calculate_signal(df, tf, symbol):
     # === [PATCH-②] 닫힌 캔들만 사용 ===
     # ccxt의 OHLCV는 맨 끝 행이 '진행 중' 캔들이라서 항상 -2(직전 캔들)를 본다.
     idx = -2 if len(df) >= 2 else -1
-    row = df.iloc[idx]
+    row = df.iloc[idx].to_dict()
 
     # 신호/로그용 가격은 닫힌 캔들의 종가로 고정
-    close_for_calc = float(row['close'])
-    hi_for_check   = float(row['high'])
-    lo_for_check   = float(row['low'])
+    _, _, hi_for_check, lo_for_check, close_for_calc, _ = _row_to_ohlcv(row)
 
     # (표시용 실시간 가격은 별도로 쓸 수 있지만, 신호·로그에는 close_for_calc만 사용)
     price_for_signal = close_for_calc
@@ -9947,41 +9957,52 @@ def _num(x, default=None):
 # ============================================================================
 
 # === Structure overlay renderer (matplotlib) ==================================
-def _slice_by_mode(rows, tf, mode="near"):
-    if not rows:
-        return rows
-    n_near = int(os.getenv("STRUCT_NEAR_BARS", 180))
-    n_macro = int(os.getenv("STRUCT_MACRO_BARS", 900))
-    n = n_near if mode == "near" else n_macro
-    return rows[-n:] if len(rows) > n else rows
 
-def render_struct_overlay(symbol: str, tf: str, rows, struct_info, *, mode: str = "near",
+def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
+                          lookback_override: int | None = None,
+                          anchor_override: float | None = None,
+                          title_suffix: str = "",
+
                           save_dir: str = './charts', width: int = 1600, height: int = 900) -> str | None:
     """캔들 + 수평 레벨 + 추세선 + 채널을 그려 저장."""
 
     try:
         os.makedirs(save_dir, exist_ok=True)
-        rows = sorted(rows, key=lambda r: (_row_to_ohlcv(r)[0] or 0))
-        rows = _slice_by_mode(rows, tf, mode=mode)
-        df = _rows_to_df(rows)
+
+        df = _rows_to_df(rows_or_df)
         if df is None or len(df) < 60 or struct_info is None:
             return None
 
-        o, h, l, c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
-        ts = [ _row_to_ohlcv(r)[0] for r in rows ]
+        N = len(df)
+        right = max(0, N - 1)
+        look = int(lookback_override or _tf_view_lookback(tf))
+        look = min(look, N) if N else look
+        anchor = float(anchor_override if anchor_override is not None else env_float("STRUCT_VIEW_ANCHOR", 0.68))
+        anchor = min(0.9, max(0.5, anchor))
+        left = max(0, right - int(look * anchor))
+        pad_l = env_int("STRUCT_VIEW_LEFT_PAD_BARS", 1)
+        pad_r = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
+        x_start = max(0, left - pad_l)
+        view = df.iloc[x_start:right+1]
+
         import matplotlib.dates as mdates
-        xs = [mdates.date2num(pd.to_datetime(t, unit='ms', utc=True)) for t in ts]
+        xs = [mdates.date2num(ts) for ts in view['timestamp']]
+        o, h, l, c = view['open'].values, view['high'].values, view['low'].values, view['close'].values
+
 
         dpi = 100
         fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
 
-        ax.set_title(f"{symbol} · {tf} · Structure Overlay {'· Near' if mode=='near' else '· Macro'}", loc='left')
+        ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
+
 
         CANDLE_ALPHA = env_float('STRUCT_CANDLE_ALPHA', 0.95)
         CANDLE_W     = env_float('STRUCT_CANDLE_WIDTH', 0.7)
         w = (_TF_SEC.get(tf, 900) / 86400.0) * CANDLE_W
-        for i in range(len(df)):
+
+        for i in range(len(view)):
+
             color = '#2ca02c' if c[i] >= o[i] else '#d62728'
             ax.vlines(xs[i], l[i], h[i], linewidth=1, color=color, alpha=CANDLE_ALPHA)
             rb = Rectangle((xs[i] - w/2, min(o[i], c[i])), w, abs(c[i]-o[i]),
@@ -9990,10 +10011,10 @@ def render_struct_overlay(symbol: str, tf: str, rows, struct_info, *, mode: str 
 
 
         # ====== VIEW WINDOW (right = 실제 마지막 바) ======
-        if len(df):
-            right_dt = df.index[-1]
-            left_dt = right_dt - pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * (90 if mode == 'near' else 480))
-            ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=int(_TF_SEC.get(tf,900)*0.7)))
+        if N:
+            right_dt = df.index[right]
+            left_dt = df.index[x_start]
+            ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * pad_r))
 
 
         # ====== Y RANGE ======
@@ -10030,20 +10051,24 @@ def render_struct_overlay(symbol: str, tf: str, rows, struct_info, *, mode: str 
                     level, dist = _num(res[1]), _num(res[2])
                     ax.hlines(level, ax.get_xlim()[0], ax.get_xlim()[1], color='#d62728', lw=2, zorder=2)
                     if level is not None:
-                        ax.annotate(f"R {level:,.2f} ({dist:.2f}×ATR)",
-                                    xy=(ax.get_xlim()[0], level), xytext=(0,8), textcoords='offset points',
-                                    ha='left', va='bottom', fontsize=9, color='#d62728',
-                                    bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#d62728', alpha=0.80),
-                                    clip_on=False)
+
+                        ax.text(ax.get_xlim()[0], level + atr*0.05,
+                                f"R {level:,.2f} ({dist:.2f}×ATR)",
+                                ha='left', va='bottom', fontsize=9, color='#d62728',
+                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#d62728', alpha=0.80),
+                                clip_on=False)
+
                 if sup:
                     level, dist = _num(sup[1]), _num(sup[2])
                     ax.hlines(level, ax.get_xlim()[0], ax.get_xlim()[1], color='#1f77b4', lw=2, zorder=2)
                     if level is not None:
-                        ax.annotate(f"S {level:,.2f} ({dist:.2f}×ATR)",
-                                    xy=(ax.get_xlim()[0], level), xytext=(0,-8), textcoords='offset points',
-                                    ha='left', va='top', fontsize=9, color='#1f77b4',
-                                    bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#1f77b4', alpha=0.80),
-                                    clip_on=False)
+
+                        ax.text(ax.get_xlim()[0], level - atr*0.05,
+                                f"S {level:,.2f} ({dist:.2f}×ATR)",
+                                ha='left', va='top', fontsize=9, color='#1f77b4',
+                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#1f77b4', alpha=0.80),
+                                clip_on=False)
+
         except Exception as _e:
             log(f"[STRUCT_RS_LABEL_WARN] {type(_e).__name__}: {_e}")
 
@@ -10078,7 +10103,10 @@ def render_struct_overlay(symbol: str, tf: str, rows, struct_info, *, mode: str 
             log(f"[STRUCT_LABEL_WARN] {type(_e).__name__}: {_e}")
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
-        out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
+
+        name = "near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view")
+        out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{name}_{int(time.time())}.png")
+
         fig.savefig(out, dpi=140, bbox_inches='tight', pad_inches=0.1)
 
         plt.close(fig)
@@ -10113,7 +10141,18 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
         rows_struct = df[['ts','open','high','low','close','volume']].values.tolist()
 
         async with RENDER_SEMA:
-            struct_img  = await asyncio.to_thread(render_struct_overlay, symbol, tf, rows_struct, struct_info, mode="near")
+            lb = _tf_view_lookback(tf)
+            struct_img = await asyncio.to_thread(
+                render_struct_overlay,
+                symbol,
+                tf,
+                df,
+                struct_info,
+                lookback_override=lb,
+                anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                title_suffix="· Near",
+            )
+
 
 
         # 기본 값들(필요 최소치만)
@@ -11115,9 +11154,7 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
 
     # 차트/리포트 산출물
     async with RENDER_SEMA:
-
         _log_panel_source(symbol, tf, df)
-
         chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
@@ -11647,8 +11684,26 @@ async def on_ready():
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         _log_panel_source(symbol_eth, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
-                        near_img  = render_struct_overlay(symbol_eth, tf, rows_struct, struct_info, mode="near")
-                        macro_img = render_struct_overlay(symbol_eth, tf, rows_struct, struct_info, mode="macro")
+                        lb = _tf_view_lookback(tf)
+                        near_img  = render_struct_overlay(
+                            symbol_eth,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=lb,
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                            title_suffix="· Near",
+                        )
+                        macro_img = render_struct_overlay(
+                            symbol_eth,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                            title_suffix="· Macro",
+                        )
+
                         struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
@@ -12205,8 +12260,26 @@ async def on_ready():
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         _log_panel_source(symbol_btc, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
-                        near_img  = render_struct_overlay(symbol_btc, tf, rows_struct, struct_info, mode="near")
-                        macro_img = render_struct_overlay(symbol_btc, tf, rows_struct, struct_info, mode="macro")
+                        lb = _tf_view_lookback(tf)
+                        near_img  = render_struct_overlay(
+                            symbol_btc,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=lb,
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                            title_suffix="· Near",
+                        )
+                        macro_img = render_struct_overlay(
+                            symbol_btc,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                            title_suffix="· Macro",
+                        )
+
                         struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
@@ -12774,10 +12847,20 @@ async def on_message(message):
                 confluence_eps=env_float("STRUCT_EPS", 0.4),
             )
             if os.getenv("STRUCT_OVERLAY_IMAGE", "1") == "1":
-                rows_struct = df_struct[['ts','open','high','low','close','volume']].values.tolist()
-
                 async with RENDER_SEMA:
-                    struct_img = await asyncio.to_thread(render_struct_overlay, symbol, tf, rows_struct, struct_info, mode="near")
+                    lb = _tf_view_lookback(tf)
+                    _log_panel_source(symbol, tf, df_struct)
+                    struct_img = await asyncio.to_thread(
+                        render_struct_overlay,
+                        symbol,
+                        tf,
+                        df_struct,
+                        struct_info,
+                        lookback_override=lb,
+                        anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                        title_suffix="· Near",
+                    )
+
 
                 if struct_img:
                     chart_files = [struct_img] + list(chart_files)
