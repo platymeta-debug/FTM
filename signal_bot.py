@@ -484,6 +484,10 @@ def _rows_to_df(rows):
         else:
             df = _pd.DataFrame(rows)
 
+    # guard: avoid 'timestamp' both as index and column
+    if getattr(df.index, "name", None) == "timestamp" and "timestamp" in df.columns:
+        df = df.reset_index(drop=True)
+
     if "ts" not in df.columns and "time" in df.columns:
         df["ts"] = df["time"]
     if "time" not in df.columns and "ts" in df.columns:
@@ -839,12 +843,14 @@ def _draw_tls(ax, df, tls, tf:str=None):
         if scale_mode == "log":
             # y_t = m*x + b  → y = exp(y_t)
             y = np.exp(m*x + b)
+
         else:
             y = m*x + b
         if t.get("dir")=="up":
             ax.plot(xdt, y, linestyle="--", color=os.getenv("STRUCT_COL_TL_UP","#28a745"),
                     linewidth=env_float("STRUCT_LW_TL", 1.6), label=os.getenv("STRUCT_LBL_TL_UP","상승추세선"), zorder=1)
         else:
+
             ax.plot(xdt, y, linestyle="--", color=os.getenv("STRUCT_COL_TL_DN","#dc3545"),
                     linewidth=env_float("STRUCT_LW_TL", 1.6), label=os.getenv("STRUCT_LBL_TL_DN","하락추세선"), zorder=1)
 
@@ -1040,7 +1046,6 @@ def _draw_ath_lines(ax, df, ath, show_h=True, show_v=True):
         ax.axvline(ath["time"], color=col, linestyle=(0,(4,3)), linewidth=lw, alpha=alpha*0.9, zorder=1)
 
 
-
 # === Anchored VWAP helpers ====================================================
 def _avwap_series(df: pd.DataFrame, start_idx: int, price_src: str = None):
     """
@@ -1118,6 +1123,96 @@ def _bigfig_levels(ax, df, k:int=6):
         ax.hlines(p, df.index[0], df.index[-1], colors=col, linewidths=lw, linestyles=":",
                   alpha=alpha, zorder=1)
 
+
+
+# === scale/viewport helpers ==================================================
+def _decide_scale(tf: str) -> str:
+    """Determine visual scale for y-axis."""
+    mode = (os.getenv("STRUCT_AXIS_SCALE_VISUAL")
+            or os.getenv("STRUCT_YAXIS_SCALE")
+            or os.getenv("STRUCT_SCALE_MODE")
+            or "auto")
+    mode = mode.lower()
+    if mode == "auto":
+        return "log" if str(tf).lower().endswith(("d","w")) else "linear"
+    return "log" if mode == "log" else "linear"
+
+
+def _draw_candles(ax, df: pd.DataFrame, scale: str):
+    import matplotlib.dates as mdates
+    CANDLE_ALPHA = env_float('STRUCT_CANDLE_ALPHA', 0.95)
+    CANDLE_W     = env_float('STRUCT_CANDLE_WIDTH', 0.7)
+    xs = mdates.date2num(df.index)
+    o = df['open'].values; h = df['high'].values
+    l = df['low'].values;  c = df['close'].values
+    if len(xs) > 1:
+        step = np.median(np.diff(xs))
+    else:
+        step = 1/96  # default quarter day
+    w = step * CANDLE_W
+    y_low = max(1e-6, np.nanmin(l))
+    if scale == "log":
+        ax.set_yscale("log")
+        ax.set_ylim(y_low, np.nanmax(h)*1.02)
+    else:
+        ax.set_yscale("linear")
+        ax.set_ylim(np.nanmin(l)*0.98, np.nanmax(h)*1.02)
+    for i in range(len(xs)):
+        color = '#2ca02c' if c[i] >= o[i] else '#d62728'
+        ax.vlines(xs[i], l[i], h[i], linewidth=1, color=color,
+                  alpha=CANDLE_ALPHA, zorder=3)
+        rb = Rectangle((xs[i] - w/2, min(o[i], c[i])), w, abs(c[i]-o[i]),
+                       facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA, zorder=3)
+        ax.add_patch(rb)
+
+
+def _compute_viewport(df: pd.DataFrame, mode: str = "near"):
+    N = len(df)
+    lookback = env_int("STRUCT_LOOKBACK", 240 if mode == "near" else 600)
+    anchor = min(0.95, max(0.05, env_float("STRUCT_ANCHOR", 0.6)))
+    L = max(0, N - lookback)
+    L += int(lookback * (anchor - 0.5) * 2)
+    R = N - 1
+    L = min(L, max(0, N - 60))
+    if L >= R - 10:
+        L = max(0, R - 120)
+    return L, R
+
+
+def _safe_atr(df: pd.DataFrame, n: int | None = None) -> float:
+    try:
+        n = n or env_int("STRUCT_ATR_N", 14)
+        if len(df) > n + 2:
+            return float(ta_atr(df["high"], df["low"], df["close"], n)[-1])
+    except Exception:
+        pass
+    if len(df) > 0:
+        return float((df["high"] - df["low"]).tail(n or 14).mean())
+    return 1.0
+
+
+def _merge_close_levels(levels, df: pd.DataFrame):
+    try:
+        atr = _safe_atr(df)
+        return _merge_nearby_levels(levels, atr, eps_factor=env_float("STRUCT_LEVEL_MERGE_ATR", 0.25))
+    except Exception:
+        return levels
+
+
+def _resolve_fib_levels(tf: str):
+    raw = os.getenv("STRUCT_FIB_LEVELS", "0.382,0.5,0.618,1.0")
+    return [float(x) for x in raw.split(",") if x]
+
+
+def _safe_legend(ax):
+    handles, labels = ax.get_legend_handles_labels()
+    if labels:
+        try:
+            leg = ax.legend(handles, labels, loc='lower left', fontsize=8, frameon=True, ncol=2,
+                            bbox_to_anchor=(0.02, 0.02))
+            leg.get_frame().set_alpha(0.7)
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -3518,9 +3613,7 @@ async def _refresh_struct_cache(symbol: str, tf: str):
             tf,
             df,
             ctx,
-            lookback_override=lb,
-            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
-            title_suffix="· Near",
+            mode="near",
         )
 
         _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, img)
@@ -10552,274 +10645,114 @@ def _num(x, default=None):
 # ============================================================================
 
 # === Structure overlay renderer (matplotlib) ==================================
-def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
-                          lookback_override: int | None = None,
-                          anchor_override: float | None = None,
-                          title_suffix: str = "",
-                          save_dir: str = './charts', width: int = 1600, height: int = 900) -> str | None:
-    """캔들 + 수평 레벨 + 추세선 + 채널을 그려 저장."""
+def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: str = "near", save_dir: str = './charts') -> str | None:
+    """Draw structure overlay; robust to partial failures."""
+    import matplotlib.dates as mdates
+    from matplotlib.ticker import MaxNLocator
+    os.makedirs(save_dir, exist_ok=True)
+    df = _rows_to_df(df)
+    if df is None or len(df) == 0:
+        return None
+    def _parse_size(s, default_w, default_h):
+        try:
+            w, h = [int(x.strip()) for x in str(s).lower().replace("x", ",").split(",")[:2]]
+            return max(600, w), max(400, h)
+        except Exception:
 
+            return default_w, default_h
+    if mode == "near":
+        w_px, h_px = _parse_size(os.getenv("STRUCT_SIZE_NEAR", "900x1600"), 900, 1600)
+    else:
+        w_px, h_px = _parse_size(os.getenv("STRUCT_SIZE_MACRO", "1600x900"), 1600, 900)
+    dpi = 100
+    fig = plt.figure(figsize=(w_px/dpi, h_px/dpi), dpi=dpi)
+    ax = fig.add_subplot(111)
+    err_flags = []
     try:
-        os.makedirs(save_dir, exist_ok=True)
-
-        df = _rows_to_df(rows_or_df)
-        if df is None or len(df) < 60:
-            return None
-
-        N = len(df)
-        right = max(0, N - 1)
-        if N:
-            def _lb(tf:str)->int:
-                return _tf_view_lookback(tf)
-            look = int(lookback_override if lookback_override else _lb(tf))
-            look = max(60, min(look, N))
-            anc = 0.68 if anchor_override is None else float(anchor_override)
-            anc = max(0.05, min(0.95, anc))
-            R = right
-            L = max(0, N - look)
-            shift = int(look * (anc - 0.5) * 2.0)
-            L = max(0, min(L + shift, N - look))
-            R = min(N - 1, L + look - 1)
-            pad_l = env_int("STRUCT_VIEW_LEFT_PAD_BARS", 1)
-            pad_r = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
-            if L >= R - 10:
-                L = max(0, R - 120)
-            x_start = max(0, L - pad_l)
-            right_dt = df.index[R]
-            left_dt  = df.index[x_start]
-        else:
-            R = max(0, N-1)
-            L = max(0, R-120)
-            pad_r = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
-            x_start = L
-            right_dt = df.index[R]
-            left_dt  = df.index[x_start]
-
-        view = df.iloc[x_start:R+1]
-
-        import matplotlib.dates as mdates
-        from matplotlib.ticker import LogLocator, LogFormatter, NullFormatter
-        xs = [mdates.date2num(ts) for ts in view['timestamp']]
-        o, h, l, c = view['open'].values, view['high'].values, view['low'].values, view['close'].values
-
-        name_hint = ("near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view"))
-        def _parse_size(s, default_w, default_h):
-            try:
-                w,h = [int(x.strip()) for x in str(s).lower().replace("x",",").split(",")[:2]]
-                return max(600,w), max(400,h)
-            except Exception:
-                return default_w, default_h
-
-        if name_hint == "near":
-            w_px, h_px = _parse_size(os.getenv("STRUCT_SIZE_NEAR","900x1600"), 900, 1600)
-        elif name_hint == "macro":
-            w_px, h_px = _parse_size(os.getenv("STRUCT_SIZE_MACRO","1600x900"), 1600, 900)
-        else:
-            w_px, h_px = width, height
-
-        dpi = 100
-        fig = plt.figure(figsize=(w_px/dpi, h_px/dpi), dpi=dpi)
-        ax = fig.add_subplot(111)
-
-        # === Y axis scale (visual) ====================================================
-        # visual: linear|log|match  (match = 계산 모드와 동일)
-        vis_scale = (os.getenv("STRUCT_AXIS_SCALE_VISUAL","match") or "match").lower()
-        calc_scale = _choose_scale(tf=tf)  # 아래 B-1에서 정의됨 (log/linear)
-        if vis_scale == "match":
-            vis_scale = calc_scale
-        ax.set_yscale("log" if vis_scale=="log" else "linear")
-
-        # 로그 축 tick (가독성)
-        if vis_scale == "log":
-            ax.yaxis.set_major_locator(LogLocator(base=10, numticks=8))
-            ax.yaxis.set_major_formatter(LogFormatter())
-            ax.yaxis.set_minor_formatter(NullFormatter())
-
-        ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
-
-
-        CANDLE_ALPHA = env_float('STRUCT_CANDLE_ALPHA', 0.95)
-        CANDLE_W     = env_float('STRUCT_CANDLE_WIDTH', 0.7)
-        w = (_TF_SEC.get(tf, 900) / 86400.0) * CANDLE_W
-
-        for i in range(len(view)):
-            color = '#2ca02c' if c[i] >= o[i] else '#d62728'
-            ax.vlines(xs[i], l[i], h[i], linewidth=1, color=color,
-                      alpha=CANDLE_ALPHA, zorder=3)
-            rb = Rectangle((xs[i] - w/2, min(o[i], c[i])), w, abs(c[i]-o[i]),
-                           facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA, zorder=3)
-            ax.add_patch(rb)
-
-        ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * pad_r))
-
-
-        # ====== Y RANGE ======
-        y_min = float(df['low'].min()); y_max = float(df['high'].max())
-        try:
-            lv = []
-            if struct_info:
-                for it in (struct_info.get('levels') or []):
-                    if isinstance(it, (list, tuple)) and len(it) >= 2:
-                        v = _num(it[1]); lv.append(v)
-            if lv:
-                y_min = min(y_min, min([v for v in lv if v is not None]))
-                y_max = max(y_max, max([v for v in lv if v is not None]))
-        except Exception:
-            pass
-        atr = _atr_fast(df)
-        y_pad = max((y_max - y_min) * 0.08, atr * env_float('STRUCT_VIEW_Y_PAD_ATR', 0.6))
-
-        ax.set_ylim(y_min - y_pad, y_max + y_pad)
-        ax.margins(x=0.0, y=0.0)
-        ax.autoscale(False)
-        ax.xaxis_date()
-
-        # === Y-axis scale (linear/log/auto) ==========================================
-        def _yaxis_mode(tf:str=None):
-            mode = (os.getenv("STRUCT_YAXIS_SCALE","auto") or "auto").lower()
-            if mode == "auto":
-                return "log" if str(tf or "").lower() in ("1d","d","1w","w","1m","m") else "linear"
-            return mode
-
-        y_mode = _yaxis_mode(tf)
-        try:
-            ax.set_yscale("log" if y_mode=="log" else "linear")
-            if y_mode == "log":
-                ax.yaxis.set_major_locator(LogLocator(base=10, numticks=8))
-                ax.yaxis.set_major_formatter(LogFormatter())
-                ax.yaxis.set_minor_formatter(NullFormatter())
-        except Exception:
-            pass
-
-        # ====== 축 포맷 ======
-
-        if y_mode != "log":
-
-            ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
-        ax.grid(True, axis='y', ls='--', alpha=0.25)
-
-        # === 구조 계산/드로잉 토글 ===
-        draw_sr   = env_bool("STRUCT_DRAW_SR", True)
-        draw_tl   = env_bool("STRUCT_DRAW_TL", True)
-        draw_reg  = env_bool("STRUCT_DRAW_REGCH", True)
-        draw_fib  = env_bool("STRUCT_DRAW_FIBCH", True)
-
-        atr_n = env_int("STRUCT_ATR_N", 14)
-        if len(df) > atr_n + 2:
-            atr = float(ta_atr(df["high"], df["low"], df["close"], atr_n)[-1])
-        else:
-            atr = max(1.0, (df["high"]-df["low"]).tail(atr_n).mean())
-
-        try:
-            info_txt = f"Close {df['close'].iloc[-1]:,.2f}  |  ATR({atr_n}) {atr:,.2f}"
-            ax.text(0.02, 0.98, info_txt, transform=ax.transAxes, ha="left", va="top",
-                    fontsize=9, bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"))
-        except Exception:
-            pass
-
-        # (1) ATH — 수평만(세로 OFF는 env로 제어)
-        ath = _get_ath_info(df)
-        _draw_ath_lines(ax, df, ath, show_h=True, show_v=env_bool("STRUCT_SHOW_ATH_V", False))
-
-        # (2) 이전 사이클 Top N개
-        _draw_prev_tops(ax, df)
-
-        # (3) 수평 R/S
-        if draw_sr:
-            levels = _levels_from_info_or_df(struct_info, df, atr)
-            _draw_levels(ax, df, levels, atr)
-
-
-        # 빅피겨 라운드 넘버 (선택)
-        if env_bool("STRUCT_DRAW_BIGFIG", True):
-            _bigfig_levels(ax, df, k=env_int("STRUCT_BIGFIG_K", 6))
-
-
-        if draw_tl:
+        _draw_candles(ax, df, scale=_decide_scale(tf))
+        L, R = _compute_viewport(df, mode=mode)
+        ax.set_xlim(df.index[L], df.index[R])
+    except Exception as e:
+        err_flags.append(("candles", e))
+        df_fb = df.tail(120)
+        _draw_candles(ax, df_fb, scale="linear")
+        ax.set_xlim(df_fb.index[0], df_fb.index[-1])
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    ax.xaxis.set_tick_params(rotation=env_int("STRUCT_XTICK_ROT", 0))
+    ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
+    if str(tf).lower() == "15m":
+        locator = mdates.MinuteLocator(interval=30)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    try:
+        if env_bool("STRUCT_DRAW_SR", True):
+            levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
+            _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
+    except Exception as e:
+        err_flags.append(("sr", e))
+    try:
+        if env_bool("STRUCT_DRAW_TL", True):
             tls = _trendlines_from_info_or_df(struct_info, df, tf=tf)
-            _draw_tls(ax, df, tls)
+            _draw_tls(ax, df, tls, tf=tf)
+    except Exception as e:
+        err_flags.append(("tl", e))
+    try:
+        if env_bool("STRUCT_DRAW_REGCH", True):
 
-        # (5) 회귀 μ / Fib 채널
-        if draw_reg:
             _draw_reg_channel(ax, df, k=env_float("STRUCT_REGCH_K", 1.0), tf=tf)
-
-        if draw_fib:
-            base = None
-            if struct_info and isinstance(struct_info, dict):
-                base = struct_info.get("fib_base")
-            fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
+    except Exception as e:
+        err_flags.append(("reg", e))
+    try:
+        if env_bool("STRUCT_DRAW_FIBCH", True):
+            base = struct_info.get("fib_base") if isinstance(struct_info, dict) else None
+            fib_levels = _resolve_fib_levels(tf)
             _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
 
-
-        # (6) 15m 축/라벨 겹침 방지
-        _fix_time_axis(ax, tf)
-
-
-        # 보강: 초근접 TF에선 분단위 고정 locator
-        if str(tf).lower()=="15m":
-            locator = mdates.MinuteLocator(interval=30)
-            formatter = mdates.ConciseDateFormatter(locator)
-            ax.xaxis.set_major_locator(locator)
-            ax.xaxis.set_major_formatter(formatter)
-            for lab in ax.get_xticklabels():
-                lab.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
-
-        # === AVWAP lines ==============================================================
-        try:
-            draw_ytd = env_bool("STRUCT_DRAW_AVWAP_YTD", True)
-            draw_ath = env_bool("STRUCT_DRAW_AVWAP_ATH", True)
-            lw_av    = env_float("STRUCT_LW_AVWAP", 1.6)
-            px_src   = os.getenv("STRUCT_AVWAP_PRICE", "hlc3")
-
-            if draw_ytd:
-                i0 = _ytd_anchor_idx(df)
-                s  = _avwap_series(df, i0, price_src=px_src)
-                _draw_avwap(ax, df, s, os.getenv("STRUCT_COL_AVWAP_YTD", "#ff7f0e"),
-                            os.getenv("STRUCT_LBL_AVWAP_YTD", "YTD AVWAP"), lw=lw_av, alpha=0.95)
-
-            if draw_ath:
-                i1 = _ath_anchor_idx(df)
-                s  = _avwap_series(df, i1, price_src=px_src)
-                _draw_avwap(ax, df, s, os.getenv("STRUCT_COL_AVWAP_ATH", "#8c564b"),
-                            os.getenv("STRUCT_LBL_AVWAP_ATH", "ATH AVWAP"), lw=lw_av, alpha=0.95)
-        except Exception as _e:
-            logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
-
-        # === Legend (lean) ===
-        handles, labels = ax.get_legend_handles_labels()
-        if labels:
-
-            lbl_up = os.getenv("STRUCT_LBL_TL_UP", "Trend ↑")
-            lbl_dn = os.getenv("STRUCT_LBL_TL_DN", "Trend ↓")
-            lbl_reg = os.getenv("STRUCT_LBL_REG", "Regression μ")
-            lbl_fib_base = os.getenv("STRUCT_LBL_FIB_BASE", "Fib base")
-            lbl_fib_lvl  = os.getenv("STRUCT_LBL_FIB_LVL", "Fib levels")
-            lbl_fib_mid  = os.getenv("STRUCT_LBL_FIB_MID", "Fib mid")
-            keep = {lbl_up, lbl_dn, lbl_reg, lbl_fib_base, lbl_fib_lvl, lbl_fib_mid}
-            filt = [(h,l) for (h,l) in zip(handles, labels) if (l in keep and l is not None)]
-            if filt:
-                handles, labels = zip(*filt)
-                leg = ax.legend(handles, labels, loc='lower left', fontsize=8, frameon=True, ncol=2,
-                                bbox_to_anchor=(0.02, 0.02))
-                leg.get_frame().set_alpha(0.7)
-
+    except Exception as e:
+        err_flags.append(("fib", e))
+    try:
+        if env_bool("STRUCT_DRAW_BIGFIG", True):
+            _bigfig_levels(ax, df, k=env_int("STRUCT_BIGFIG_K", 6))
+    except Exception as e:
+        err_flags.append(("bigfig", e))
+    try:
+        draw_ytd = env_bool("STRUCT_DRAW_AVWAP_YTD", True)
+        draw_ath = env_bool("STRUCT_DRAW_AVWAP_ATH", True)
+        lw_av = env_float("STRUCT_LW_AVWAP", 1.6)
+        px_src = os.getenv("STRUCT_AVWAP_PRICE", "hlc3")
+        if draw_ytd:
+            i0 = _ytd_anchor_idx(df)
+            s = _avwap_series(df, i0, price_src=px_src)
+            _draw_avwap(ax, df, s, os.getenv("STRUCT_COL_AVWAP_YTD", "#ff7f0e"),
+                        os.getenv("STRUCT_LBL_AVWAP_YTD", "YTD AVWAP"), lw=lw_av, alpha=0.95)
+        if draw_ath:
+            i1 = _ath_anchor_idx(df)
+            s = _avwap_series(df, i1, price_src=px_src)
+            _draw_avwap(ax, df, s, os.getenv("STRUCT_COL_AVWAP_ATH", "#8c564b"),
+                        os.getenv("STRUCT_LBL_AVWAP_ATH", "ATH AVWAP"), lw=lw_av, alpha=0.95)
+    except Exception as e:
+        err_flags.append(("avwap", e))
+    try:
+        _safe_legend(ax)
+    except Exception as e:
+        err_flags.append(("legend", e))
+    out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
+    try:
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
-        name = "near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view")
-        out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{name}_{int(time.time())}.png")
-
-        fig.savefig(out, dpi=140, bbox_inches='tight', pad_inches=0.1)
-
-        plt.close(fig)
-        return out
+        fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches='tight', pad_inches=0.1)
     except Exception as e:
-        try:
-            plt.close('all')
-        except Exception:
-            pass
+        plt.close(fig)
         log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
         return None
-
+    finally:
+        plt.close(fig)
+    if err_flags:
+        names = ",".join([n for n,_ in err_flags])
+        log(f"[STRUCT_OVERLAY_WARN] partial_errors={names}")
+    return out
 # ===========================================================================
 
 
@@ -10849,9 +10782,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 tf,
                 df,
                 struct_info,
-                lookback_override=lb,
-                anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
-                title_suffix="· Near",
+                mode="near",
             )
 
             macro_img = await asyncio.to_thread(
@@ -10860,9 +10791,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 tf,
                 df,
                 struct_info,
-                lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
-                anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
-                title_suffix="· Macro",
+                mode="macro",
             )
 
 
@@ -11886,25 +11815,19 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
                 _log_panel_source(symbol, tf, df_struct)
                 struct_info = build_struct_context_basic(df_struct, tf)
                 lb = _tf_view_lookback(tf)
-                near_img = render_struct_overlay(
-                    symbol, tf, df_struct, struct_info,
-                    lookback_override=lb,
-                    anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
-                    title_suffix="· Near",
-                )
-                macro_img = render_struct_overlay(
-                    symbol, tf, df_struct, struct_info,
-                    lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT", 3.0)),
-                    anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO", 0.85),
-                    title_suffix="· Macro",
-                )
+                near_img = render_struct_overlay(symbol, tf, df_struct, struct_info, mode="near")
+                macro_img = render_struct_overlay(symbol, tf, df_struct, struct_info, mode="macro")
                 struct_imgs = [p for p in (near_img, macro_img) if p]
                 if struct_info is not None:
                     _struct_cache_put(symbol, tf, _df_last_ts(df_struct), struct_info, near_img)
-                if struct_imgs:
-                    chart_files = struct_imgs + list(chart_files)
         except Exception as _e:
             log(f"[STRUCT_IMG_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
+        if not struct_imgs or len(struct_imgs) < 2:
+            for mode in ("near", "macro"):
+                p = render_struct_overlay(symbol, tf, df_struct if df_struct is not None else df, struct_info={}, mode=mode)
+                if p:
+                    struct_imgs.append(p)
+        chart_files = struct_imgs + list(chart_files)
         # === [/STRUCT_OVERLAY_FOR_OLDSTYLE] ===
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
@@ -12443,33 +12366,21 @@ async def on_ready():
                         _log_panel_source(symbol_eth, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
                         lb = _tf_view_lookback(tf)
-                        near_img  = render_struct_overlay(
-                            symbol_eth,
-                            tf,
-                            df_struct,
-                            struct_info,
-                            lookback_override=lb,
-                            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
-                            title_suffix="· Near",
-                        )
-                        macro_img = render_struct_overlay(
-                            symbol_eth,
-                            tf,
-                            df_struct,
-                            struct_info,
-                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
-                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
-                            title_suffix="· Macro",
-                        )
+                        near_img  = render_struct_overlay(symbol_eth, tf, df_struct, struct_info, mode="near")
+                        macro_img = render_struct_overlay(symbol_eth, tf, df_struct, struct_info, mode="macro")
 
                         struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
-                        if struct_imgs:
-                            chart_files = struct_imgs + list(chart_files)
 
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
+                if not struct_imgs or len(struct_imgs) < 2:
+                    for mode in ("near", "macro"):
+                        p = render_struct_overlay(symbol_eth, tf, df_struct if df_struct is not None else df, struct_info={}, mode=mode)
+                        if p:
+                            struct_imgs.append(p)
+                chart_files = struct_imgs + list(chart_files)
                 # [PATCH A1-END]
 
                 # ✅ entry_data가 없을 경우 None으로 초기화
@@ -13019,33 +12930,21 @@ async def on_ready():
                         _log_panel_source(symbol_btc, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
                         lb = _tf_view_lookback(tf)
-                        near_img  = render_struct_overlay(
-                            symbol_btc,
-                            tf,
-                            df_struct,
-                            struct_info,
-                            lookback_override=lb,
-                            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
-                            title_suffix="· Near",
-                        )
-                        macro_img = render_struct_overlay(
-                            symbol_btc,
-                            tf,
-                            df_struct,
-                            struct_info,
-                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
-                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
-                            title_suffix="· Macro",
-                        )
+                        near_img  = render_struct_overlay(symbol_btc, tf, df_struct, struct_info, mode="near")
+                        macro_img = render_struct_overlay(symbol_btc, tf, df_struct, struct_info, mode="macro")
 
                         struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
-                        if struct_imgs:
-                            chart_files = struct_imgs + list(chart_files)
 
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
+                if not struct_imgs or len(struct_imgs) < 2:
+                    for mode in ("near", "macro"):
+                        p = render_struct_overlay(symbol_btc, tf, df_struct if df_struct is not None else df, struct_info={}, mode=mode)
+                        if p:
+                            struct_imgs.append(p)
+                chart_files = struct_imgs + list(chart_files)
                 # [PATCH A2-END]
 
                 struct_block = None
@@ -13613,27 +13512,24 @@ async def on_message(message):
                     near_img = await asyncio.to_thread(
                         render_struct_overlay,
                         symbol, tf, df_struct, struct_info,
-
-                        lookback_override=lb,
-                        anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
-                        title_suffix="· Near",
+                        mode="near",
                     )
-
 
                     # Macro (Near 대비 더 넓은 구간)
                     macro_img = await asyncio.to_thread(
                         render_struct_overlay,
                         symbol, tf, df_struct, struct_info,
-                        lookback_override=int(lb * env_float("STRUCT_VIEW_MACRO_MULT", 3.0)),
-                        anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO", 0.85),
-                        title_suffix="· Macro",
+                        mode="macro",
                     )
 
                 struct_imgs = [p for p in (near_img, macro_img) if p]
 
-            # 항상: 구조 이미지가 있으면 분할 4장 앞에 붙여 총 6장(=2+4)
-            if struct_imgs:
-                chart_files = list(struct_imgs) + list(chart_files)
+            if not struct_imgs or len(struct_imgs) < 2:
+                for mode in ("near", "macro"):
+                    p = render_struct_overlay(symbol, tf, df_struct if df_struct is not None else df, struct_info={}, mode=mode)
+                    if p:
+                        struct_imgs.append(p)
+            chart_files = list(struct_imgs) + list(chart_files)
 
 
         except Exception as _e:
