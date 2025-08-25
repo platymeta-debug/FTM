@@ -985,6 +985,7 @@ def _draw_reg_channel(ax, df, k=None, tf: str=None):
     x = np.arange(len(df))
     y = df["close"].values.astype(float)
 
+
     calc = _calc_scale() or _decide_scale(tf)
     y_t = _to_scale(y, calc)
 
@@ -1010,12 +1011,14 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
     Base trend (two points) + parallel offsets measured in transformed space (log-safe).
     """
     if len(df) < 30: return
+
     # Normalize levels (strings, extra tokens tolerated)
     levels = [float(x) for x in map(str, levels or []) if x not in ("", None)]
     # Normalize base to (i0,i1)
     if base and isinstance(base, (list, tuple)) and len(base) >= 2:
         base = (int(base[0]), int(base[1]))
     if not levels:
+
         tf_l = str(tf).lower()
         if tf_l.endswith("d"):
             lv_s = os.getenv("STRUCT_FIB_LEVELS_1D","0.382,0.5,0.618,1.0")
@@ -1025,7 +1028,9 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
             mid_on = env_bool("STRUCT_FIB_MIDLINES_INTRADAY", False)
         levels = [float(x) for x in lv_s.split(",") if x]
     else:
+
         mid_on = False
+
 
     x = np.arange(len(df)); y = df["close"].values.astype(float)
     calc = _calc_scale() or _decide_scale(tf)
@@ -1177,11 +1182,13 @@ def _draw_avwap_items(ax, df):
 
     if draw_ytd:
         i0 = _ytd_anchor_idx(df)
+
         ret = _calc_avwap_xy(df, i0, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
             if style == "series":
                 ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
+
                         linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
             else:
                 _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
@@ -1189,11 +1196,13 @@ def _draw_avwap_items(ax, df):
 
     if draw_ath:
         i1 = _ath_anchor_idx(df)
+
         ret = _calc_avwap_xy(df, i1, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
             if style == "series":
                 ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
+
                         linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
             else:
                 _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
@@ -10842,11 +10851,13 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
     atr_n = env_int("STRUCT_ATR_N", 14)
     atr = _safe_atr(df, atr_n)
+
     info_line = f"Close {df['close'].iloc[-1]:,.2f} | ATR({atr_n}) {atr:.2f}"
     pos_x, pos_y = _env_xy("STRUCT_INFO_POS", (0.66, 0.66))
     ax.text(pos_x, pos_y, info_line,
             transform=ax.transAxes, ha="left", va="top",
             fontsize=9, bbox=dict(facecolor="white", alpha=0.65, edgecolor="none"))
+
     try:
         _safe_legend(ax)
     except Exception as e:
@@ -11942,6 +11953,7 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
             for mode in ("near","macro"):
                 p = render_struct_overlay(symbol, tf, df, struct_info={}, mode=mode)
                 if p: struct_imgs.append(p)
+
         # === Attach bundle guard ===
         bundle = []
         bundle += struct_imgs or []
@@ -11951,6 +11963,7 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
             bundle = bundle[:6]
         logger.info(f"[ATTACH_CNT] {len(bundle)} files (struct={len(struct_imgs or [])}, base={len(chart_files or [])})")
         files_to_send = bundle
+
         # === [/STRUCT_OVERLAY_FOR_OLDSTYLE] ===
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
@@ -12505,6 +12518,7 @@ async def on_ready():
                     for mode in ("near","macro"):
                         p = render_struct_overlay(symbol_eth, tf, df, struct_info={}, mode=mode)
                         if p: struct_imgs.append(p)
+
                 # === Attach bundle guard ===
                 bundle = []
                 bundle += struct_imgs or []
@@ -12514,6 +12528,7 @@ async def on_ready():
                     bundle = bundle[:6]
                 logger.info(f"[ATTACH_CNT] {len(bundle)} files (struct={len(struct_imgs or [])}, base={len(chart_files or [])})")
                 files_to_send = bundle
+
                 # [PATCH A1-END]
 
                 # ✅ entry_data가 없을 경우 None으로 초기화
@@ -13078,6 +13093,7 @@ async def on_ready():
                     for mode in ("near","macro"):
                         p = render_struct_overlay(symbol_btc, tf, df, struct_info={}, mode=mode)
                         if p: struct_imgs.append(p)
+
                 # === Attach bundle guard ===
                 bundle = []
                 bundle += struct_imgs or []
@@ -13087,6 +13103,7 @@ async def on_ready():
                     bundle = bundle[:6]
                 logger.info(f"[ATTACH_CNT] {len(bundle)} files (struct={len(struct_imgs or [])}, base={len(chart_files or [])})")
                 files_to_send = bundle
+
                 # [PATCH A2-END]
 
                 struct_block = None
@@ -13669,6 +13686,7 @@ async def on_message(message):
                 for mode in ("near","macro"):
                     p = render_struct_overlay(symbol, tf, df, struct_info={}, mode=mode)
                     if p: struct_imgs.append(p)
+
             # === Attach bundle guard ===
             bundle = []
             bundle += struct_imgs or []
