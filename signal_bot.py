@@ -458,27 +458,75 @@ def _row_to_ohlcv(row):
     )
 
 def _rows_to_df(rows):
-    """list 기반 OHLCV를 pandas DataFrame으로 안전 변환(필요할 때만)."""
+
+    """
+    list/tuple/dict/DataFrame -> DataFrame
+    - time/ts 컬럼을 UTC DatetimeIndex로 강제
+    - 컬럼: ['time','open','high','low','close','volume']
+    """
     import pandas as _pd
-    if hasattr(rows, "columns"):
-        if "timestamp" not in rows.columns and "ts" in rows.columns:
-            rows["timestamp"] = rows["ts"]
-        return rows
+
+    if rows is None:
+        return _pd.DataFrame(columns=["time","open","high","low","close","volume"])
+
+    if hasattr(rows, "columns"):  # 이미 DF
+        df = rows.copy()
+        # 'time' 또는 'ts' 중 하나를 인덱스로 승격
+        if "time" in df.columns:
+            dt = _pd.to_datetime(df["time"].astype("int64"), unit="ms", utc=True)
+            df.index = dt
+        elif "ts" in df.columns:
+            dt = _pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+            df["time"] = df["ts"].astype("int64")
+            df.index = dt
+        return df[["time","open","high","low","close","volume"]]
+
+    # list/tuple/dict list → DataFrame
     if not rows:
-        return _pd.DataFrame(columns=["ts","open","high","low","close","volume"])
+        return _pd.DataFrame(columns=["time","open","high","low","close","volume"])
+
     first = rows[0]
     if isinstance(first, (list, tuple)):
-        cols = ["ts","open","high","low","close","volume"][:len(first)]
-        df = _pd.DataFrame(rows, columns=cols)
-        if "ts" in df.columns:
-            df["ts"] = _pd.to_datetime(df["ts"], unit="ms", utc=True)
-            df["timestamp"] = df["ts"]
-        return df
-    df = _pd.DataFrame(rows)
-    if "ts" in df.columns:
-        df["ts"] = _pd.to_datetime(df["ts"], unit="ms", utc=True)
-        df["timestamp"] = df["ts"]
-    return df[["ts","open","high","low","close","volume"]]
+        # [ts, o, h, l, c, v] 또는 [o,h,l,c]
+        if len(first) >= 6:
+            df = _pd.DataFrame(rows, columns=["time","open","high","low","close","volume"])
+        elif len(first) >= 4:
+            df = _pd.DataFrame(rows, columns=["open","high","low","close"])
+            df["volume"] = 0.0
+            df["time"] = _pd.NaT
+        else:
+            raise ValueError(f"Bad OHLCV row len={len(first)}")
+    else:
+        # dict list
+        df = _pd.DataFrame(rows)
+        if "time" not in df.columns and "ts" in df.columns:
+            df["time"] = df["ts"]
+
+    # 시간 인덱스 강제
+    if "time" in df.columns and df["time"].notna().any():
+        dt = _pd.to_datetime(df["time"].astype("int64"), unit="ms", utc=True)
+        df.index = dt
+
+    # 타입 보정 & 컬럼 정렬
+    for c in ("open","high","low","close","volume"):
+        if c in df.columns:
+            df[c] = _pd.to_numeric(df[c], errors="coerce")
+        else:
+            df[c] = _pd.NA
+    return df[["time","open","high","low","close","volume"]]
+
+def _log_panel_source(symbol: str, tf: str, rows_or_df):
+    try:
+        df = _rows_to_df(rows_or_df)
+        if len(df) == 0:
+            log(f"[PANEL_SOURCE] {symbol} {tf} len=0")
+            return
+        fts = df.index[0].strftime("%Y-%m-%d %H:%M")
+        lts = df.index[-1].strftime("%Y-%m-%d %H:%M")
+        log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={fts} last={lts}")
+    except Exception as e:
+        log(f"[PANEL_SOURCE_WARN] {symbol} {tf} {type(e).__name__}: {e}")
+
 
 def candle_price(kl_last):
     """기존 dict 전용 → list/dict 겸용으로 교체."""
@@ -2826,7 +2874,9 @@ def _sce_build_df_from_ohlcv(rows):
 
 def _df_last_ts(df) -> int:
     try:
-        return int(df['ts'].iloc[-1])
+        if 'ts' in df.columns:
+            return int(df['ts'].iloc[-1])
+        return int(df['time'].iloc[-1])
     except Exception:
         return int(time.time()*1000)
 
@@ -9938,13 +9988,12 @@ def render_struct_overlay(symbol: str, tf: str, rows, struct_info, *, mode: str 
                            facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA)
             ax.add_patch(rb)
 
-        # ====== VIEW WINDOW ======
 
-        if ts and ts[-1]:
-            right_pad = int(_TF_SEC.get(tf, 900) * 0.7)
-            left_span = _TF_SEC.get(tf, 900) * (90 if mode == 'near' else 480)
-            ax.set_xlim(pd.to_datetime(ts[-1] - left_span, unit='ms', utc=True),
-                        pd.to_datetime(ts[-1] + right_pad, unit='ms', utc=True))
+        # ====== VIEW WINDOW (right = 실제 마지막 바) ======
+        if len(df):
+            right_dt = df.index[-1]
+            left_dt = right_dt - pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * (90 if mode == 'near' else 480))
+            ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=int(_TF_SEC.get(tf,900)*0.7)))
 
 
         # ====== Y RANGE ======
@@ -10059,7 +10108,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
             return
 
         # SCE 컨텍스트/오버레이
-        log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
+        _log_panel_source(symbol, tf, df)
         struct_info = build_struct_context_basic(df, tf)
         rows_struct = df[['ts','open','high','low','close','volume']].values.tolist()
 
@@ -11066,7 +11115,9 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
 
     # 차트/리포트 산출물
     async with RENDER_SEMA:
-        log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
+
+        _log_panel_source(symbol, tf, df)
+
         chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
@@ -11566,8 +11617,11 @@ async def on_ready():
                         pnl = ((entry_price - price) / entry_price) * 100
 
 
+                chart_files = []
                 async with RENDER_SEMA:
-                    log(f"[PANEL_SOURCE] {symbol_eth} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
+
+                    _log_panel_source(symbol_eth, tf, df)
+
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
@@ -11586,18 +11640,21 @@ async def on_ready():
                     rows_struct = df[['ts','open','high','low','close','volume']].values.tolist() if hasattr(df, 'values') else []
                     df_struct = _rows_to_df(rows_struct)
 
+                struct_imgs = []
                 struct_info = None
                 try:
 
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
-                        log(f"[PANEL_SOURCE] {symbol_eth} {tf} len={len(df_struct)} first={df_struct.index[0]} last={df_struct.index[-1]}")
+                        _log_panel_source(symbol_eth, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
                         near_img  = render_struct_overlay(symbol_eth, tf, rows_struct, struct_info, mode="near")
                         macro_img = render_struct_overlay(symbol_eth, tf, rows_struct, struct_info, mode="macro")
+                        struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
-
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
-                        chart_files = [p for p in (near_img, macro_img) if p] + list(chart_files)
+                        if struct_imgs:
+                            chart_files = struct_imgs + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A1-END]
@@ -11707,11 +11764,11 @@ async def on_ready():
                 # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
                 final_files_paths = []
 
-                if 'struct_imgs' in locals() and struct_imgs:
+                if struct_imgs:
                     final_files_paths += [p for p in struct_imgs if p]
                 # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
-                if 'chart_files' in locals() and chart_files:
-                    final_files_paths += [p for p in chart_files if p and (p not in (struct_imgs or []))]
+                if chart_files:
+                    final_files_paths += [p for p in chart_files if p and (p not in struct_imgs)]
 
 
                 await _discord_send_chunked(
@@ -12120,8 +12177,11 @@ async def on_ready():
                   )
 
 
+                chart_files = []
                 async with RENDER_SEMA:
-                    log(f"[PANEL_SOURCE] {symbol_btc} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
+
+                    _log_panel_source(symbol_btc, tf, df)
+
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
 
@@ -12138,18 +12198,21 @@ async def on_ready():
                     rows_struct = df[['ts','open','high','low','close','volume']].values.tolist() if hasattr(df, 'values') else []
                     df_struct = _rows_to_df(rows_struct)
 
+                struct_imgs = []
                 struct_info = None
                 try:
 
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
-                        log(f"[PANEL_SOURCE] {symbol_btc} {tf} len={len(df_struct)} first={df_struct.index[0]} last={df_struct.index[-1]}")
+                        _log_panel_source(symbol_btc, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
                         near_img  = render_struct_overlay(symbol_btc, tf, rows_struct, struct_info, mode="near")
                         macro_img = render_struct_overlay(symbol_btc, tf, rows_struct, struct_info, mode="macro")
+                        struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
-
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
-                        chart_files = [p for p in (near_img, macro_img) if p] + list(chart_files)
+                        if struct_imgs:
+                            chart_files = struct_imgs + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A2-END]
@@ -12194,11 +12257,11 @@ async def on_ready():
                 # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
                 final_files_paths = []
 
-                if 'struct_imgs' in locals() and struct_imgs:
+                if struct_imgs:
                     final_files_paths += [p for p in struct_imgs if p]
                 # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
-                if 'chart_files' in locals() and chart_files:
-                    final_files_paths += [p for p in chart_files if p and (p not in (struct_imgs or []))]
+                if chart_files:
+                    final_files_paths += [p for p in chart_files if p and (p not in struct_imgs)]
 
 
                 await _discord_send_chunked(
@@ -12692,7 +12755,9 @@ async def on_message(message):
             )
         
         async with RENDER_SEMA:
-            log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
+
+            _log_panel_source(symbol, tf, df)
+
             chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
 
 
