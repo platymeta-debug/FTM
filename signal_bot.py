@@ -294,13 +294,123 @@ STRUCT_CACHE: dict = {}
 # 최근 분석에 사용된 DF 캐시 (대시보드/리포트 폴백용)
 _LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 
+# ==== OHLCV cache & time helpers =============================================
+OHLCV_CACHE = {}  # key: (symbol, tf) -> {"ts": int(last_bar_ms), "df": pd.DataFrame}
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+def _cache_alive(key):
+    ent = OHLCV_CACHE.get(key)
+    if not ent:
+        return False
+    ttl_ms = env_int("OHLCV_TTL_SEC", 60) * 1000
+    return (_now_ms() - ent["ts"]) < ttl_ms
+
+_TF_SEC = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800,
+    "12h": 43200, "1d": 86400
+}
+
+def _tf_sec(tf: str) -> int:
+    return _TF_SEC.get(tf, 0)
+
+def _is_stale(df: "pd.DataFrame", tf: str) -> bool:
+    if df is None or len(df) == 0:
+        return True
+    last_ms = int(df["ts"].iloc[-1])
+    gap = (_now_ms() - last_ms) / 1000.0
+    fac = env_float("OHLCV_STALE_FACTOR", 2.2)  # 캔들 2.2개 이상 비면 stale
+    thr = max(120.0, _tf_sec(tf) * fac)
+    return gap > thr
+# ============================================================================
+
+def _get_ccxt():
+    return ccxt.binance({
+        'enableRateLimit': True,
+        'timeout': env_int('CCXT_TIMEOUT_MS', 5000),
+        'options': {
+            'defaultType': 'spot',
+            'adjustForTimeDifference': True
+        },
+    })
+
+def get_ohlcv(symbol: str, tf: str, limit: int = 240, since: int | None = None):
+    exchange = _get_ccxt()
+    exchange.load_markets()
+    market = symbol if symbol in exchange.markets else exchange.market(symbol)["id"]
+    rows = exchange.fetch_ohlcv(market, timeframe=tf, since=since, limit=limit)
+    return rows
+
+def _fetch_ohlcv_rest(symbol: str, tf: str, limit: int = 240):
+    """Binance Futures REST (testnet/live 자동 선택, env로 live 강제 가능)"""
+    import requests
+    sym = symbol.replace("/", "")
+    use_live = bool(env_int("OHLCV_FORCE_LIVE", 0)) or env_int("SANDBOX", 0) == 0
+    base = "https://fapi.binance.com" if use_live else "https://testnet.binancefuture.com"
+    url = f"{base}/fapi/v1/klines"
+    params = {"symbol": sym, "interval": tf, "limit": limit}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    rows = [[x[0], float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in data]
+    return rows
+
+def _load_ohlcv(symbol: str, tf: str, limit: int = 240, since: int | None = None) -> pd.DataFrame:
+    key = (symbol, tf)
+    if _cache_alive(key):
+        return OHLCV_CACHE[key]["df"].copy()
+
+    # 1) CCXT 우선
+    rows = []
+    try:
+        rows = get_ohlcv(symbol, tf, limit=limit, since=since) or []
+    except Exception as e:
+        log(f"[OHLCV_CCXT_ERR] {symbol} {tf} {e}")
+
+    # 2) REST 폴백 (비어있거나 stale면)
+    def _to_df(_rows):
+        if not _rows:
+            return None
+        arr = np.array(_rows, dtype=float)
+        arr = arr[np.argsort(arr[:, 0])]
+        df = pd.DataFrame(arr, columns=["ts", "open", "high", "low", "close", "volume"])
+        dt = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+        df.index = dt
+        df = df[~df.index.duplicated(keep="last")]
+        for c in ("open", "high", "low", "close", "volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["open", "high", "low", "close"])
+
+    df = _to_df(rows)
+    if df is None or _is_stale(df, tf):
+        try:
+            rows2 = _fetch_ohlcv_rest(symbol, tf, limit=limit)
+            df2 = _to_df(rows2)
+            if df2 is not None:
+                log(
+                    f"[OHLCV_REST] {symbol} {tf} live={'Y' if env_int('OHLCV_FORCE_LIVE',0) or env_int('SANDBOX',0)==0 else 'N'} "
+                    f"first={df2.index[0]} last={df2.index[-1]}"
+                )
+                df = df2
+        except Exception as e:
+            log(f"[OHLCV_REST_ERR] {symbol} {tf} {e}")
+
+    if df is None or len(df) == 0:
+        raise RuntimeError(f"OHLCV empty: {symbol} {tf}")
+
+    OHLCV_CACHE[key] = {"ts": int(df['ts'].iloc[-1]), "df": df}
+    log(f"[OHLCV] {symbol} {tf} rows={len(df)} first={df.index[0]} last={df.index[-1]}")
+    return df.copy()
+
 # 상위TF 구조 알림/상태 저장
 STRUCT_ALERT_STATE: dict = {}
 
 # 차트/오버레이 렌더 동시성 제한
 RENDER_SEMA = asyncio.Semaphore(env_int("RENDER_MAX_CONCURRENCY", 1))
 
-def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
+def _load_ohlcv_rows(symbol: str, tf: str, limit: int = 300):
     """Try multiple loaders; ALWAYS return list of [ts, o, h, l, c, v]."""
     providers = []
     if 'get_ohlcv' in globals(): providers.append(lambda: get_ohlcv(symbol, tf, limit=limit))
@@ -586,7 +696,7 @@ def _compute_context(symbol: str) -> dict|None:
         st = CTX_STATE.get(symbol)
         if st and (now - st.get("ts", 0) < CTX_TTL_SEC):
             return st
-        rows = _load_ohlcv(symbol, REGIME_TF, limit=max(200, REGIME_LOOKBACK+5))
+        rows = _load_ohlcv_rows(symbol, REGIME_TF, limit=max(200, REGIME_LOOKBACK+5))
         # rows must be list now; guard length only
         if len(rows) < max(60, REGIME_LOOKBACK//2):
             return None
@@ -2307,7 +2417,7 @@ os.makedirs("logs", exist_ok=True)
 os.makedirs("images", exist_ok=True)
 
 
-def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
+def get_ohlcv_ccxt_df(symbol='ETH/USDT', timeframe='1h', limit=300):
     # CCXT 최신과 바이낸스 응답 포맷 이슈 회피
     exchange = ccxt.binance({
         'enableRateLimit': True,
@@ -2698,7 +2808,7 @@ def _struct_cache_put(symbol: str, tf: str, ts: int, ctx: dict|None, img_path: s
 
 async def _refresh_struct_cache(symbol: str, tf: str):
     try:
-        rows = await asyncio.to_thread(_load_ohlcv, symbol, tf, 240)
+        rows = await asyncio.to_thread(_load_ohlcv_rows, symbol, tf, 240)
         df = _sce_build_df_from_ohlcv(rows) if rows else None
         if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
             return
@@ -2732,7 +2842,7 @@ def _mtf_struct_guard(symbol: str, tf: str, side_signal: str):
 
         # 상위TF들 검사
         for htf in higher_list:
-            rows = _load_ohlcv(symbol, htf, limit=400)
+            rows = _load_ohlcv_rows(symbol, htf, limit=400)
             if not rows or len(rows) < 50:
                 continue
             hdf = _sce_build_df_from_ohlcv(rows)
@@ -9534,7 +9644,7 @@ async def _dash_struct_block():
             ent = STRUCT_CACHE.get((s, tf))
             if not ent or not ent.get("ctx"):
                 try:
-                    rows = _load_ohlcv(s, tf, limit=240)
+                    rows = _load_ohlcv_rows(s, tf, limit=240)
                     df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
                 except Exception:
                     df_struct = None
@@ -9599,14 +9709,14 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
         rows = None
         # 1) 입력 df 우선 사용, 없으면 로더
         if df is None:
-            rows = _load_ohlcv(symbol, tf, limit=LIMIT)
+            rows = _load_ohlcv_rows(symbol, tf, limit=LIMIT)
             df2  = _sce_build_df_from_ohlcv(rows) if rows else None
         else:
             df2 = df
         # 2) 폴백: 로더 부족 시 메인 분석 df를 강제 재사용
         if df2 is None or len(df2) < MIN_ROWS:
             try:
-                _rows_fb = _load_ohlcv(symbol, tf, limit=LIMIT)
+                _rows_fb = _load_ohlcv_rows(symbol, tf, limit=LIMIT)
                 _df_fb   = _sce_build_df_from_ohlcv(_rows_fb) if _rows_fb else None
                 if _df_fb is not None and len(_df_fb) >= MIN_ROWS:
                     df2 = _df_fb
@@ -9771,18 +9881,13 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info, *,
         look = min(look, N) if N else look
         anchor = float(anchor_override if anchor_override is not None else env_float('STRUCT_VIEW_ANCHOR', 0.68))
         anchor = min(0.9, max(0.5, anchor))
-
-        cur = max(0, N-1)
-        left  = max(0, cur - int(look * anchor))
-        right_ix = left + look - 1
-        data_right = min(cur, right_ix)
-        pad_left  = env_int('STRUCT_VIEW_LEFT_PAD_BARS', 1)
-        pad_right = env_int('STRUCT_VIEW_RIGHT_PAD_BARS', 6)
-
-        x_min = max(0, left - pad_left)
-        x_max = right_ix + pad_right
-
-        view = df.iloc[left:data_right+1] if N else df
+        right = max(0, N - 1)
+        left = max(0, right - int(look * anchor))
+        pad_l = env_int('STRUCT_VIEW_LEFT_PAD_BARS', 1)
+        pad_r = env_int('STRUCT_VIEW_RIGHT_PAD_BARS', 6)
+        x_min = max(0, left - pad_l)
+        x_max = right + pad_r
+        view = df.iloc[left:right+1] if N else df
 
         # ====== Y RANGE ======
         y_min = float(view['low'].min()); y_max = float(view['high'].max())
@@ -9936,13 +10041,16 @@ def render_struct_overlay_pair(symbol, tf, df, struct_info):
 async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
     """심볼/TF 한 쌍에 대한 PDF를 생성하고 첨부로 전송."""
     try:
-        rows = _load_ohlcv(symbol, tf, limit=400)
-        df = _sce_build_df_from_ohlcv(rows) if rows else None
+        try:
+            df = _load_ohlcv(symbol, tf, limit=400)
+        except Exception:
+            df = None
         if df is None or len(df) < 60:
             await channel.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족으로 PDF 생략")
             return
 
         # SCE 컨텍스트/오버레이
+        log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
         struct_info = build_struct_context_basic(df, tf)
 
         async with RENDER_SEMA:
@@ -10943,11 +11051,12 @@ async def generate_pnl_pdf():
 # [ANCHOR] OLDSTYLE_REPORT_BEGIN
 async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
     # 데이터/지표
-    df = get_ohlcv(symbol, tf, limit=300)
+    df = _load_ohlcv(symbol, tf, limit=300)
     df = add_indicators(df)
 
     # 차트/리포트 산출물
     async with RENDER_SEMA:
+        log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
         chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
@@ -11446,6 +11555,7 @@ async def on_ready():
 
 
                 async with RENDER_SEMA:
+                    log(f"[PANEL_SOURCE] {symbol_eth} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
@@ -11453,8 +11563,7 @@ async def on_ready():
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
 
                 try:
-                    rows = _load_ohlcv(symbol_eth, tf, limit=400)
-                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                    df_struct = _load_ohlcv(symbol_eth, tf, limit=400)
                 except Exception:
                     df_struct = None
 
@@ -11463,19 +11572,24 @@ async def on_ready():
                     df_struct = df.copy()
 
                 struct_info = None
-                struct_imgs = None
-                struct_img = None
                 try:
                     if df_struct is not None:
+                        log(f"[PANEL_SOURCE] {symbol_eth} {tf} len={len(df_struct)} first={df_struct.index[0]} last={df_struct.index[-1]}")
                         struct_info = build_struct_context_basic(df_struct, tf)
-                        struct_imgs = render_struct_overlay_pair(symbol_eth, tf, df_struct, struct_info)
-                        if struct_imgs:
-                            struct_img = struct_imgs[0]
+                        lb = _tf_view_lookback(tf)
+                        near_img = render_struct_overlay(
+                            symbol_eth, tf, df_struct, struct_info,
+                            lookback_override=lb,
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR",0.68),
+                            title_suffix="· Near")
+                        macro_img = render_struct_overlay(
+                            symbol_eth, tf, df_struct, struct_info,
+                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                            title_suffix="· Macro")
                         if df_struct is not None and struct_info is not None:
-                            _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
-                        if struct_imgs:
-                            chart_files = list(struct_imgs) + list(chart_files)
-
+                            _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
+                        chart_files = [p for p in (near_img, macro_img) if p] + list(chart_files)
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A1-END]
@@ -11999,13 +12113,13 @@ async def on_ready():
 
 
                 async with RENDER_SEMA:
+                    log(f"[PANEL_SOURCE] {symbol_btc} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
 
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
-                    rows = _load_ohlcv(symbol_btc, tf, limit=400)
-                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                    df_struct = _load_ohlcv(symbol_btc, tf, limit=400)
                 except Exception:
                     df_struct = None
 
@@ -12013,19 +12127,24 @@ async def on_ready():
                     df_struct = df.copy()
 
                 struct_info = None
-                struct_imgs = None
-                struct_img = None
                 try:
                     if df_struct is not None:
+                        log(f"[PANEL_SOURCE] {symbol_btc} {tf} len={len(df_struct)} first={df_struct.index[0]} last={df_struct.index[-1]}")
                         struct_info = build_struct_context_basic(df_struct, tf)
-                        struct_imgs = render_struct_overlay_pair(symbol_btc, tf, df_struct, struct_info)
-                        if struct_imgs:
-                            struct_img = struct_imgs[0]
+                        lb = _tf_view_lookback(tf)
+                        near_img = render_struct_overlay(
+                            symbol_btc, tf, df_struct, struct_info,
+                            lookback_override=lb,
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR",0.68),
+                            title_suffix="· Near")
+                        macro_img = render_struct_overlay(
+                            symbol_btc, tf, df_struct, struct_info,
+                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                            title_suffix="· Macro")
                         if df_struct is not None and struct_info is not None:
-                            _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
-                        if struct_imgs:
-                            chart_files = list(struct_imgs) + list(chart_files)
-
+                            _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
+                        chart_files = [p for p in (near_img, macro_img) if p] + list(chart_files)
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A2-END]
@@ -12198,7 +12317,7 @@ async def on_message(message):
 
             # 3) 네트워크(워커 스레드) 최후 시도
             if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
-                rows = await asyncio.to_thread(_load_ohlcv, symbol, tf, 400)
+                rows = await asyncio.to_thread(_load_ohlcv_rows, symbol, tf, 400)
                 df = _sce_build_df_from_ohlcv(rows) if rows else None
 
             if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
@@ -12568,6 +12687,7 @@ async def on_message(message):
             )
         
         async with RENDER_SEMA:
+            log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={df.index[0]} last={df.index[-1]}")
             chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
 
 
