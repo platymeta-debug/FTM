@@ -539,20 +539,61 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
 # ==== Structure calc & draw helpers ==========================================
 # --- price scale transform ----------------------------------------------------
 def _choose_scale(tf:str=None):
-    """auto|linear|log 선택: .env에 따라 TF별로 결정"""
-    mode = (os.getenv("STRUCT_SCALE_MODE", "auto") or "auto").lower()
-    tf_l = str(tf or "").lower()
+
+    """calc mode: auto|linear|log (auto: 전체를 log로 쓰고 싶으면 .env에서 log로 강제)"""
+    mode = (os.getenv("STRUCT_SCALE_MODE", "log") or "log").lower()  # 기본 log
     if mode == "auto":
-        # 인트라데이는 선형, 1D 이상은 로그를 기본
+        tf_l = str(tf or "").lower()
         return "log" if tf_l in ("1d","d","1w","w","1m","m") else "linear"
-    return mode if mode in ("linear","log") else "linear"
+    return "log" if mode=="log" else "linear"
 
 def _y_transform(y: np.ndarray, mode: str):
-    """mode='linear' → (y, id), mode='log' → (log(y), exp)"""
+
     if mode == "log":
         y_safe = np.clip(y.astype(float), 1e-9, np.inf)
         return np.log(y_safe), np.exp
     return y.astype(float), (lambda z: z)
+
+
+def _fib_base_from_env(df: pd.DataFrame):
+    """
+    .env:
+      STRUCT_FIB_BASE_MODE=auto|manual
+      STRUCT_FIB_BASE=2024-10-13,2025-08-25   # ISO 날짜(시간 포함 가능) 또는 'idx:123,456'
+      STRUCT_FIB_BASE_KIND=bull|bear|close    # 기준 y: 저→고 / 고→저 / 종가
+    반환: (i0, i1) 또는 None
+    """
+    mode = (os.getenv("STRUCT_FIB_BASE_MODE","auto") or "auto").lower()
+    if mode != "manual":
+        return None
+    raw = os.getenv("STRUCT_FIB_BASE") or ""
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        if raw.lower().startswith("idx:"):
+            parts = [p.strip() for p in raw[4:].split(",")]
+            if len(parts) != 2:
+                return None
+            i0, i1 = int(parts[0]), int(parts[1])
+            n = len(df)
+            i0 = max(0, min(i0, n-1))
+            i1 = max(0, min(i1, n-1))
+            return (i0, i1)
+        parts = [p.strip() for p in raw.split(",")]
+        if len(parts) != 2:
+            return None
+        t0 = pd.to_datetime(parts[0])
+        t1 = pd.to_datetime(parts[1])
+        idx = df.index
+        if not isinstance(idx, pd.DatetimeIndex):
+            return None
+        i0 = int(idx.get_indexer([t0], method="nearest")[0])
+        i1 = int(idx.get_indexer([t1], method="nearest")[0])
+        return (i0, i1)
+    except Exception:
+        return None
+
 
 def ta_atr(high, low, close, n=14):
     h = pd.Series(high, dtype=float)
@@ -848,9 +889,11 @@ def _draw_reg_channel(ax, df, k=None, tf:str=None):
     x = np.arange(len(df))
     y = df["close"].values
 
+
     # === scale transform (linear/log)
     scale_mode = _choose_scale(tf=tf)
     y_t, inv = _y_transform(y, scale_mode)
+
 
     # slope/intercept in transformed space
     method = os.getenv("STRUCT_REGCH_METHOD","ols").lower()
@@ -906,14 +949,36 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
     y_t, inv = _y_transform(y, scale_mode)
 
     # 기준선: 변환공간에서 직선 적합
+
+    if base is None:
+        base = _fib_base_from_env(df)
+
     if not base:
         i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
         if i0 == i1: return
         if i0 > i1: i0, i1 = i1, i0
+        m = (y_t[i1]-y_t[i0])/((x[i1]-x[i0])+1e-9); b = y_t[i0] - m*x[i0]
     else:
         i0, i1 = base
 
-    m = (y_t[i1]-y_t[i0])/((x[i1]-x[i0])+1e-9); b = y_t[i0] - m*x[i0]
+        mode = (os.getenv("STRUCT_FIB_BASE_MODE","auto") or "auto").lower()
+        kind = (os.getenv("STRUCT_FIB_BASE_KIND","bull") or "bull").lower()
+        if mode == "manual":
+            def _yt_val(arr, idx):
+                return _y_transform(np.array([arr[idx]]), scale_mode)[0][0]
+            if kind == "bear":
+                y0_i0 = _yt_val(df["high"].values, i0)
+                y0_i1 = _yt_val(df["low"].values,  i1)
+            elif kind == "close":
+                y0_i0 = _yt_val(df["close"].values, i0)
+                y0_i1 = _yt_val(df["close"].values, i1)
+            else:  # bull
+                y0_i0 = _yt_val(df["low"].values,  i0)
+                y0_i1 = _yt_val(df["high"].values, i1)
+            m = (y0_i1 - y0_i0)/((x[i1]-x[i0])+1e-9); b = y0_i0 - m*x[i0]
+        else:
+            m = (y_t[i1]-y_t[i0])/((x[i1]-x[i0])+1e-9); b = y_t[i0] - m*x[i0]
+
     y0_t = m*x + b
 
     # 스케일: 변환공간의 잔차
@@ -10424,6 +10489,7 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         view = df.iloc[x_start:R+1]
 
         import matplotlib.dates as mdates
+        from matplotlib.ticker import LogLocator, LogFormatter, NullFormatter
         xs = [mdates.date2num(ts) for ts in view['timestamp']]
         o, h, l, c = view['open'].values, view['high'].values, view['low'].values, view['close'].values
 
@@ -10445,6 +10511,20 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         dpi = 100
         fig = plt.figure(figsize=(w_px/dpi, h_px/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
+
+        # === Y axis scale (visual) ====================================================
+        # visual: linear|log|match  (match = 계산 모드와 동일)
+        vis_scale = (os.getenv("STRUCT_AXIS_SCALE_VISUAL","match") or "match").lower()
+        calc_scale = _choose_scale(tf=tf)  # 아래 B-1에서 정의됨 (log/linear)
+        if vis_scale == "match":
+            vis_scale = calc_scale
+        ax.set_yscale("log" if vis_scale=="log" else "linear")
+
+        # 로그 축 tick (가독성)
+        if vis_scale == "log":
+            ax.yaxis.set_major_locator(LogLocator(base=10, numticks=8))
+            ax.yaxis.set_major_formatter(LogFormatter())
+            ax.yaxis.set_minor_formatter(NullFormatter())
 
         ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
 
@@ -10486,7 +10566,8 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         ax.xaxis_date()
 
         # ====== 축 포맷 ======
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
+        if vis_scale != "log":
+            ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
         ax.grid(True, axis='y', ls='--', alpha=0.25)
 
         # === 구조 계산/드로잉 토글 ===
