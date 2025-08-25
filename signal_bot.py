@@ -378,7 +378,9 @@ def _load_ohlcv(symbol: str, tf: str, limit: int = 240, since: int | None = None
         df = pd.DataFrame(arr, columns=["ts", "open", "high", "low", "close", "volume"])
         dt = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
         df.index = dt
+
         df["timestamp"] = dt
+
         df = df[~df.index.duplicated(keep="last")]
         for c in ("open", "high", "low", "close", "volume"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -456,6 +458,7 @@ def _row_to_ohlcv(row):
     )
 
 def _rows_to_df(rows):
+
     """
     list/tuple/dict/DataFrame -> DataFrame
     - time/ts 컬럼을 UTC DatetimeIndex로 강제
@@ -523,6 +526,7 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
         log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={fts} last={lts}")
     except Exception as e:
         log(f"[PANEL_SOURCE_WARN] {symbol} {tf} {type(e).__name__}: {e}")
+
 
 def candle_price(kl_last):
     """기존 dict 전용 → list/dict 겸용으로 교체."""
@@ -9984,11 +9988,13 @@ def render_struct_overlay(symbol: str, tf: str, rows, struct_info, *, mode: str 
                            facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA)
             ax.add_patch(rb)
 
+
         # ====== VIEW WINDOW (right = 실제 마지막 바) ======
         if len(df):
             right_dt = df.index[-1]
             left_dt = right_dt - pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * (90 if mode == 'near' else 480))
             ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=int(_TF_SEC.get(tf,900)*0.7)))
+
 
         # ====== Y RANGE ======
         y_min = float(df['low'].min()); y_max = float(df['high'].max())
@@ -11109,7 +11115,9 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
 
     # 차트/리포트 산출물
     async with RENDER_SEMA:
+
         _log_panel_source(symbol, tf, df)
+
         chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
@@ -11611,7 +11619,9 @@ async def on_ready():
 
                 chart_files = []
                 async with RENDER_SEMA:
+
                     _log_panel_source(symbol_eth, tf, df)
+
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
@@ -11619,8 +11629,10 @@ async def on_ready():
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
 
                 try:
+
                     rows_struct = _load_ohlcv_rows(symbol_eth, tf, limit=400)
                     df_struct = _rows_to_df(rows_struct)
+
                 except Exception:
                     rows_struct, df_struct = [], None
 
@@ -11631,6 +11643,7 @@ async def on_ready():
                 struct_imgs = []
                 struct_info = None
                 try:
+
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         _log_panel_source(symbol_eth, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
@@ -11641,6 +11654,7 @@ async def on_ready():
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
                         if struct_imgs:
                             chart_files = struct_imgs + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A1-END]
@@ -12165,14 +12179,18 @@ async def on_ready():
 
                 chart_files = []
                 async with RENDER_SEMA:
+
                     _log_panel_source(symbol_btc, tf, df)
+
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
 
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
+
                     rows_struct = _load_ohlcv_rows(symbol_btc, tf, limit=400)
                     df_struct = _rows_to_df(rows_struct)
+
                 except Exception:
                     rows_struct, df_struct = [], None
 
@@ -12183,6 +12201,7 @@ async def on_ready():
                 struct_imgs = []
                 struct_info = None
                 try:
+
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         _log_panel_source(symbol_btc, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
@@ -12193,6 +12212,7 @@ async def on_ready():
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
                         if struct_imgs:
                             chart_files = struct_imgs + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A2-END]
@@ -12735,7 +12755,9 @@ async def on_message(message):
             )
         
         async with RENDER_SEMA:
+
             _log_panel_source(symbol, tf, df)
+
             chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
 
 
