@@ -619,20 +619,42 @@ def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
     return out
 
 def _best_trendlines(df: pd.DataFrame):
-    """struct_info 없으면 최근 피벗 2점 조합으로 상/하향 추세선 후보 탐색."""
     pivH, pivL = _pivot_points(df)
     x = np.arange(len(df))
     up, dn = None, None
-    if len(pivL) >= 2:
-        i1, i2 = pivL[-2], pivL[-1]
-        m = (df["low"].iloc[i2]-df["low"].iloc[i1])/(x[i2]-x[i1]+1e-9)
-        b = df["low"].iloc[i2] - m*x[i2]
-        up = ("up", m, b)
-    if len(pivH) >= 2:
-        i1, i2 = pivH[-2], pivH[-1]
-        m = (df["high"].iloc[i2]-df["high"].iloc[i1])/(x[i2]-x[i1]+1e-9)
-        b = df["high"].iloc[i2] - m*x[i2]
-        dn = ("down", m, b)
+
+    # Helper: fit line & r2
+    def fit_line(ii, yvals):
+        xs = x[ii].astype(float); ys = yvals[ii].astype(float)
+        if len(xs) < 2: return None
+        m, b = np.polyfit(xs, ys, 1)
+        yhat = m*xs + b
+        ssr = np.sum((ys - yhat)**2); sst = np.sum((ys - ys.mean())**2) + 1e-9
+        r2 = 1.0 - (ssr/sst)
+        return m, b, r2
+
+    # 상향: 최근 저점 3~4개로 후보들 평가
+    if len(pivL) >= 3:
+        cand = []
+        ii = np.array(pivL[-4:], dtype=int)
+        for k in range(2, min(4, len(ii))+1):
+            res = fit_line(ii[-k:], df["low"].values)
+            if res: cand.append(("up",)+res)
+        if cand:
+            up = max(cand, key=lambda t: t[3])
+            up = ("up", up[1], up[2])
+
+    # 하향: 최근 고점 3~4개
+    if len(pivH) >= 3:
+        cand = []
+        ii = np.array(pivH[-4:], dtype=int)
+        for k in range(2, min(4, len(ii))+1):
+            res = fit_line(ii[-k:], df["high"].values)
+            if res: cand.append(("down",)+res)
+        if cand:
+            dn = max(cand, key=lambda t: t[3])
+            dn = ("down", dn[1], dn[2])
+
     return up, dn
 
 def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame):
@@ -675,21 +697,81 @@ def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame):
     if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
     return tls
 
-def _draw_levels(ax, df, levels, atr):
-    """R/S 수평선 + 라벨."""
-    if not levels: return
-    x0 = df.index[0]; x1 = df.index[-1]
+# === nearby level merge (R/S within eps*ATR) ================================
+def _merge_nearby_levels(levels, atr: float, eps_factor: float = 0.25):
+    if not levels or atr is None or atr <= 0:
+        return levels or []
+    eps = float(eps_factor) * float(atr)
+    by_type = {"R": [], "S": []}
     for lv in levels:
-        p = lv["price"]; tp = lv.get("type","R")
-        c = ("#d9534f" if tp=="R" else "#0275d8")
-        lw = 2.2 if (lv.get("dist_atr") or 9) < 0.5 else 1.4
-        ax.hlines(p, x0, x1, colors=c, linewidths=lw, linestyles="-")
+        tp = (lv.get("type") or "R").upper()
+        if tp not in by_type: tp = "R"
+        by_type[tp].append(lv)
+    out = []
+    for tp, arr in by_type.items():
+        arr = sorted(arr, key=lambda x: float(x.get("price", 0.0)))
+        merged = []
+        for lv in arr:
+            if not merged:
+                merged.append(dict(lv))
+                continue
+            prev = merged[-1]
+            if abs(float(prev["price"]) - float(lv["price"])) < eps:
+                prev["price"] = float((float(prev["price"]) + float(lv["price"])) / 2.0)
+                prev["name"]  = f'{prev.get("name","")}|{lv.get("name","")}'.strip("|")
+                if prev.get("dist_atr") is None or (lv.get("dist_atr") or 9e9) < (prev.get("dist_atr") or 9e9):
+                    prev["dist_atr"] = lv.get("dist_atr")
+            else:
+                merged.append(dict(lv))
+        out.extend(merged)
+    return out
+
+def _draw_levels(ax, df, levels, atr):
+    if not levels: return
+    col_r = os.getenv("STRUCT_COL_RES", "#d9534f")
+    col_s = os.getenv("STRUCT_COL_SUP", "#0275d8")
+    lw_rs = env_float("STRUCT_LW_RS", 1.6)
+    alpha_rs = env_float("STRUCT_RS_ALPHA", 0.5)
+
+    levels = _merge_nearby_levels(levels, atr, eps_factor=env_float("STRUCT_LEVEL_MERGE_ATR", 0.25))
+
+    x0 = df.index[0]; x1 = df.index[-1]
+
+    try:
+        close = float(df["close"].iloc[-1])
+        rs = {"R": [], "S": []}
+        for lv in levels:
+            rs[(lv.get("type") or "R").upper()].append(lv)
+        def nearest(tp):
+            cand = rs.get(tp, [])
+            if not cand: return None
+            if tp == "R":
+                cand = [lv for lv in cand if float(lv["price"]) >= close] or cand
+                return min(cand, key=lambda x: abs(float(x["price"]) - close))
+            else:
+                cand = [lv for lv in cand if float(lv["price"]) <= close] or cand
+                return min(cand, key=lambda x: abs(float(x["price"]) - close))
+        r1, s1 = nearest("R"), nearest("S")
+    except Exception:
+        r1 = s1 = None
+
+    for lv in levels:
+        p = float(lv["price"]); tp = lv.get("type","R").upper()
+        c = (col_r if tp=="R" else col_s)
+        is_key = (lv is r1) or (lv is s1)
+        ax.hlines(p, x0, x1, colors=c,
+                  linewidths=(lw_rs*1.4 if is_key else lw_rs),
+                  linestyles="-",
+                  alpha=(min(1.0, alpha_rs*1.1) if is_key else alpha_rs),
+                  zorder=2)
         if env_bool("STRUCT_LABELS_ON", True):
             txt = f'{tp} {p:,.2f}'
             if lv.get("dist_atr") is not None:
                 txt += f' ({lv["dist_atr"]:.2f}×ATR)'
-            ax.text(x0, p, txt, fontsize=9, color=c, va="bottom", ha="left",
-                    bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"))
+            ax.annotate(txt, xy=(-0.02, p), xycoords=('axes fraction','data'),
+                        fontsize=9, color=c, va="bottom", ha="right",
+                        bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"),
+                        clip_on=False, zorder=2)
 
 def _draw_tls(ax, df, tls):
     if not tls: return
@@ -712,82 +794,85 @@ def _draw_tls(ax, df, tls):
             continue
 
         y = m*x + b
+
+        col_up = os.getenv("STRUCT_COL_TL_UP", "#28a745")
+        col_dn = os.getenv("STRUCT_COL_TL_DN", "#dc3545")
+        lw_tl  = env_float("STRUCT_LW_TL", 1.6)
         if dirv == "up":
-            ax.plot(xdt, y, linestyle="--", color="#28a745", linewidth=1.6, label="up TL")
+            ax.plot(xdt, y, linestyle="--", color=col_up, linewidth=lw_tl, label="up TL", zorder=1)
+
         else:
-            ax.plot(xdt, y, linestyle="--", color="#dc3545", linewidth=1.6, label="down TL")
+            ax.plot(xdt, y, linestyle="--", color=col_dn, linewidth=lw_tl, label="down TL", zorder=1)
 
 def _draw_reg_channel(ax, df, k=None):
     if k is None: k = env_float("STRUCT_REGCH_K", 1.0)
     if k <= 0 or len(df) < 20: return
     x = np.arange(len(df)); y = df["close"].values
-    a, b = np.polyfit(x, y, 1)
-    yhat = a*x + b
+
+    method = os.getenv("STRUCT_REGCH_METHOD","ols").lower()
+    if method == "theilsen" and len(x) >= 3:
+        slopes = np.diff(y) / np.clip(np.diff(x), 1e-9, None)
+        m = float(np.median(slopes))
+        b = float(np.median(y - m*x))
+    else:
+        m, b = np.polyfit(x, y, 1)
+
+    yhat = m*x + b
     resid = y - yhat
-    sigma = np.std(resid)
-    ax.plot(df.index, yhat, color="#6f42c1", linewidth=1.6, label="Reg μ")
-    ax.plot(df.index, yhat + k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"+{k}σ")
-    ax.plot(df.index, yhat - k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"-{k}σ")
+    sigma = np.std(resid) if np.std(resid) > 0 else 1e-6
+
+
+    col_reg = os.getenv("STRUCT_COL_REG", "#6f42c1")
+    lw_reg  = env_float("STRUCT_LW_REG", 1.4)
+    ax.plot(df.index, yhat, color=col_reg, linewidth=lw_reg, label="Reg μ", zorder=1)
+    ax.plot(df.index, yhat + k*sigma, color=col_reg, linewidth=1.0, linestyle=":", label=f"+{k}σ", zorder=1)
+    ax.plot(df.index, yhat - k*sigma, color=col_reg, linewidth=1.0, linestyle=":", label=f"-{k}σ", zorder=1)
 
 def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
-    """
-    Draw Fib parallel channel:
-      - base: (i0, i1) index pair (optional; auto if None)
-      - levels: list of floats like [0.382, 0.618, 1.0]
-      - tf: current timeframe string (e.g., "15m","1h","4h","1d") for density rules
-    Adds "midlines" at midpoint of every adjacent level pair when enabled.
-    """
-    # ---- config & guards
-    if len(df) < 30:
-        return
-    fib_mid_on = env_bool("STRUCT_FIB_MIDLINES", True)
-    # density by TF (swing-friendly)
-    lv_1d = os.getenv("STRUCT_FIB_LEVELS_1D", "").strip()
-    lv_intra = os.getenv("STRUCT_FIB_LEVELS_INTRADAY", "").strip()
+    if len(df) < 30: return
+    lv_1d   = os.getenv("STRUCT_FIB_LEVELS_1D", "0.382,0.618,1.0").strip()
+    lv_intr = os.getenv("STRUCT_FIB_LEVELS_INTRADAY", "0.382,0.618").strip()
     if levels is None:
-        if (tf or "").lower() in ("1d","1w","1m","1M","d","D"):
-            levels = [float(x) for x in (lv_1d or "0.382,0.618,1.0").split(",") if x]
+        if (str(tf or "")).lower() in ("1d","1w","1m","d"):
+            levels = [float(x) for x in lv_1d.split(",") if x]
         else:
-            levels = [float(x) for x in (lv_intra or "0.382,0.618").split(",") if x]
-    # style
+            levels = [float(x) for x in lv_intr.split(",") if x]
     clr = os.getenv("STRUCT_COL_FIB", "#20c997")
-    lw_main = env_float("STRUCT_LW_FIB", 1.0)
-    alpha_main = env_float("STRUCT_FIB_ALPHA", 0.9)
-    lw_mid = env_float("STRUCT_LW_FIB_MID", 0.9)
-    alpha_mid = env_float("STRUCT_FIB_ALPHA_MID", 0.6)
+    lw_main  = env_float("STRUCT_LW_FIB", 1.0)
+    alpha_m  = env_float("STRUCT_FIB_ALPHA", 0.9)
+    mid_on   = env_bool("STRUCT_FIB_MIDLINES", True)
+    lw_mid   = env_float("STRUCT_LW_FIB_MID", 0.9)
+    alpha_mid= env_float("STRUCT_FIB_ALPHA_MID", 0.6)
 
-    # ---- fit base line
+
     x = np.arange(len(df)); y = df["close"].values
     if not base:  # auto: recent swing pair
         i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
-        if i0 == i1:
-            return
-        if i0 > i1:  # ensure chronological order
-            i0, i1 = i1, i0
-        base = (i0, i1)
-    i0, i1 = base
+
+        if i0 == i1: return
+        if i0 > i1: i0, i1 = i1, i0
+    else:
+        i0, i1 = base
     m = (y[i1]-y[i0])/(x[i1]-x[i0] + 1e-9); b = y[i0] - m*x[i0]
     y0 = m*x + b
 
-    # ---- scale (MAD -> σ fallback)
+
     resid = y - y0
     mad = np.median(np.abs(resid - np.median(resid)))
     scale = (1.4826*mad) if mad>0 else np.std(resid)
     if not np.isfinite(scale) or scale <= 0:
         scale = max(1e-6, np.std(resid))
 
-    # ---- draw
-    ax.plot(df.index, y0, color=clr, linewidth=lw_main, alpha=alpha_main, label="Fib base", zorder=1)
-    # sort & unique levels
+
+    ax.plot(df.index, y0, color=clr, linewidth=lw_main, alpha=alpha_m, label="Fib base", zorder=1)
     levels = sorted({float(abs(v)) for v in levels})
-    # main levels
     for lv in levels:
         ax.plot(df.index, y0 + lv*scale, color=clr, linewidth=lw_main, linestyle="--",
-                alpha=alpha_main, label=(f"Fib {lv}" if lv != 0 else "Fib 0"), zorder=1)
+                alpha=alpha_m, label=(f"Fib {lv}" if lv != 0 else "Fib 0"), zorder=1)
         ax.plot(df.index, y0 - lv*scale, color=clr, linewidth=lw_main, linestyle="--",
-                alpha=alpha_main, zorder=1)
-    # midlines between adjacent pairs (including 0 and last level)
-    if fib_mid_on:
+                alpha=alpha_m, zorder=1)
+    if mid_on:
+
         pairs = [0.0] + levels
         for a, b_ in zip(pairs[:-1], pairs[1:]):
             mid = 0.5*(a + b_)
@@ -10239,28 +10324,60 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
 
         df = _rows_to_df(rows_or_df)
         if df is None or len(df) < 60:
-
             return None
 
         N = len(df)
         right = max(0, N - 1)
-        look = int(lookback_override or _tf_view_lookback(tf))
-        look = min(look, N) if N else look
-        anchor = float(anchor_override if anchor_override is not None else env_float("STRUCT_VIEW_ANCHOR", 0.68))
-        anchor = min(0.9, max(0.5, anchor))
-        left = max(0, right - int(look * anchor))
-        pad_l = env_int("STRUCT_VIEW_LEFT_PAD_BARS", 1)
-        pad_r = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
-        x_start = max(0, left - pad_l)
-        view = df.iloc[x_start:right+1]
+        if N:
+            def _lb(tf:str)->int:
+                return _tf_view_lookback(tf)
+            look = int(lookback_override if lookback_override else _lb(tf))
+            look = max(60, min(look, N))
+            anc = 0.68 if anchor_override is None else float(anchor_override)
+            anc = max(0.05, min(0.95, anc))
+            R = right
+            L = max(0, N - look)
+            shift = int(look * (anc - 0.5) * 2.0)
+            L = max(0, min(L + shift, N - look))
+            R = min(N - 1, L + look - 1)
+            pad_l = env_int("STRUCT_VIEW_LEFT_PAD_BARS", 1)
+            pad_r = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
+            if L >= R - 10:
+                L = max(0, R - 120)
+            x_start = max(0, L - pad_l)
+            right_dt = df.index[R]
+            left_dt  = df.index[x_start]
+        else:
+            R = max(0, N-1)
+            L = max(0, R-120)
+            pad_r = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
+            x_start = L
+            right_dt = df.index[R]
+            left_dt  = df.index[x_start]
+
+        view = df.iloc[x_start:R+1]
 
         import matplotlib.dates as mdates
         xs = [mdates.date2num(ts) for ts in view['timestamp']]
         o, h, l, c = view['open'].values, view['high'].values, view['low'].values, view['close'].values
 
+        name_hint = ("near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view"))
+        def _parse_size(s, default_w, default_h):
+            try:
+                w,h = [int(x.strip()) for x in str(s).lower().replace("x",",").split(",")[:2]]
+                return max(600,w), max(400,h)
+            except Exception:
+                return default_w, default_h
+
+        if name_hint == "near":
+            w_px, h_px = _parse_size(os.getenv("STRUCT_SIZE_NEAR","900x1600"), 900, 1600)
+        elif name_hint == "macro":
+            w_px, h_px = _parse_size(os.getenv("STRUCT_SIZE_MACRO","1600x900"), 1600, 900)
+        else:
+            w_px, h_px = width, height
 
         dpi = 100
-        fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
+        fig = plt.figure(figsize=(w_px/dpi, h_px/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
 
         ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
@@ -10271,19 +10388,14 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         w = (_TF_SEC.get(tf, 900) / 86400.0) * CANDLE_W
 
         for i in range(len(view)):
-
             color = '#2ca02c' if c[i] >= o[i] else '#d62728'
-            ax.vlines(xs[i], l[i], h[i], linewidth=1, color=color, alpha=CANDLE_ALPHA)
+            ax.vlines(xs[i], l[i], h[i], linewidth=1, color=color,
+                      alpha=CANDLE_ALPHA, zorder=3)
             rb = Rectangle((xs[i] - w/2, min(o[i], c[i])), w, abs(c[i]-o[i]),
-                           facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA)
+                           facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA, zorder=3)
             ax.add_patch(rb)
 
-
-        # ====== VIEW WINDOW (right = 실제 마지막 바) ======
-        if N:
-            right_dt = df.index[right]
-            left_dt = df.index[x_start]
-            ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * pad_r))
+        ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * pad_r))
 
 
         # ====== Y RANGE ======
@@ -10323,6 +10435,13 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         else:
             atr = max(1.0, (df["high"]-df["low"]).tail(atr_n).mean())
 
+        try:
+            info_txt = f"Close {df['close'].iloc[-1]:,.2f}  |  ATR({atr_n}) {atr:,.2f}"
+            ax.text(0.02, 0.98, info_txt, transform=ax.transAxes, ha="left", va="top",
+                    fontsize=9, bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"))
+        except Exception:
+            pass
+
         if draw_sr:
             levels = _levels_from_info_or_df(struct_info, df, atr)
             _draw_levels(ax, df, levels, atr)
@@ -10341,10 +10460,18 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
             _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
 
+
+        locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
+        formatter = mdates.ConciseDateFormatter(locator)
+        ax.xaxis.set_major_locator(locator)
+        ax.xaxis.set_major_formatter(formatter)
+
+
         handles, labels = ax.get_legend_handles_labels()
         if labels:
-            leg = ax.legend(loc='upper left', fontsize=9, frameon=True)
-            leg.get_frame().set_alpha(0.85)
+            leg = ax.legend(loc='lower left', fontsize=8, frameon=True, ncol=2,
+                            bbox_to_anchor=(0.02, 0.02))
+            leg.get_frame().set_alpha(0.7)
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
         name = "near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view")
@@ -11475,6 +11602,15 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
 
     # 첨부 파일 구성 (존재 파일만)
     files_list = [*chart_files, score_file, perf_file, performance_file]
+    # [ATTACH_CNT] 이미지/문서 개수 로깅
+    try:
+        imgs = [p for p in files_list if p and str(p).lower().endswith('.png')]
+        n_struct = sum(1 for p in imgs if os.path.basename(p).startswith('struct_'))
+        n_base   = len(imgs) - n_struct
+        others   = [p for p in files_list if p and not str(p).lower().endswith('.png')]
+        log(f"[ATTACH_CNT] {len(imgs)} images ({n_struct} struct + {n_base} base), {len(others)} docs")
+    except Exception:
+        pass
     pdf_path = None
     if os.getenv("PDF_REPORT_ENABLE", "1") == "1":
         try:
