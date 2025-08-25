@@ -378,7 +378,9 @@ def _load_ohlcv(symbol: str, tf: str, limit: int = 240, since: int | None = None
         df = pd.DataFrame(arr, columns=["ts", "open", "high", "low", "close", "volume"])
         dt = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
         df.index = dt
+
         df["timestamp"] = dt
+
         df = df[~df.index.duplicated(keep="last")]
         for c in ("open", "high", "low", "close", "volume"):
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -497,11 +499,13 @@ def _rows_to_df(rows):
             else:
                 df["timestamp"] = df.index
 
+
     for c in ("open","high","low","close","volume"):
         if c in df.columns:
             df[c] = _pd.to_numeric(df[c], errors="coerce")
         else:
             df[c] = _pd.NA
+
 
     cols = [c for c in ["ts","time","open","high","low","close","volume","timestamp"] if c in df.columns]
     return df[cols]
@@ -510,6 +514,7 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
     try:
         df = _rows_to_df(rows_or_df)
         df = df.sort_values('timestamp') if 'timestamp' in df.columns else df
+
         if len(df) == 0:
             log(f"[PANEL_SOURCE] {symbol} {tf} len=0")
             return
@@ -518,6 +523,7 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
         log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={fts} last={lts}")
     except Exception as e:
         log(f"[PANEL_SOURCE_WARN] {symbol} {tf} {type(e).__name__}: {e}")
+
 
 # ==== Structure calc & draw helpers ==========================================
 def ta_atr(high, low, close, n=14):
@@ -653,6 +659,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None):
         ax.plot(df.index, y0 + lv*scale, color=clr, linewidth=1.0, linestyle="--", label=f"Fib {lv}")
         ax.plot(df.index, y0 - lv*scale, color=clr, linewidth=1.0, linestyle="--")
 # =============================================================================
+
 
 def candle_price(kl_last):
     """기존 dict 전용 → list/dict 겸용으로 교체."""
@@ -3041,6 +3048,7 @@ async def _refresh_struct_cache(symbol: str, tf: str):
         if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
             return
         ctx = build_struct_context_basic(df, tf)
+
         lb = _tf_view_lookback(tf)
         _log_panel_source(symbol, tf, df)
         img = render_struct_overlay(
@@ -3052,6 +3060,7 @@ async def _refresh_struct_cache(symbol: str, tf: str):
             anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
             title_suffix="· Near",
         )
+
         _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, img)
         try:
             _LAST_DF_CACHE[(symbol, tf)] = df
@@ -10090,8 +10099,10 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
 
     try:
         os.makedirs(save_dir, exist_ok=True)
+
         df = _rows_to_df(rows_or_df)
         if df is None or len(df) < 60:
+
             return None
 
         N = len(df)
@@ -10110,21 +10121,26 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         xs = [mdates.date2num(ts) for ts in view['timestamp']]
         o, h, l, c = view['open'].values, view['high'].values, view['low'].values, view['close'].values
 
+
         dpi = 100
         fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
 
         ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
 
+
         CANDLE_ALPHA = env_float('STRUCT_CANDLE_ALPHA', 0.95)
         CANDLE_W     = env_float('STRUCT_CANDLE_WIDTH', 0.7)
         w = (_TF_SEC.get(tf, 900) / 86400.0) * CANDLE_W
+
         for i in range(len(view)):
+
             color = '#2ca02c' if c[i] >= o[i] else '#d62728'
             ax.vlines(xs[i], l[i], h[i], linewidth=1, color=color, alpha=CANDLE_ALPHA)
             rb = Rectangle((xs[i] - w/2, min(o[i], c[i])), w, abs(c[i]-o[i]),
                            facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA)
             ax.add_patch(rb)
+
 
         # ====== VIEW WINDOW (right = 실제 마지막 바) ======
         if N:
@@ -10132,8 +10148,9 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             left_dt = df.index[x_start]
             ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * pad_r))
 
+
         # ====== Y RANGE ======
-        y_min = float(view['low'].min()); y_max = float(view['high'].max())
+        y_min = float(df['low'].min()); y_max = float(df['high'].max())
         try:
             lv = []
             if struct_info:
@@ -10195,6 +10212,7 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
         name = "near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view")
         out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{name}_{int(time.time())}.png")
+
         fig.savefig(out, dpi=140, bbox_inches='tight', pad_inches=0.1)
 
         plt.close(fig)
@@ -10226,6 +10244,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
         # SCE 컨텍스트/오버레이
         _log_panel_source(symbol, tf, df)
         struct_info = build_struct_context_basic(df, tf)
+        rows_struct = df[['ts','open','high','low','close','volume']].values.tolist()
 
         async with RENDER_SEMA:
             lb = _tf_view_lookback(tf)
@@ -10239,6 +10258,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
                 title_suffix="· Near",
             )
+
             macro_img = await asyncio.to_thread(
                 render_struct_overlay,
                 symbol,
@@ -10249,6 +10269,7 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
                 title_suffix="· Macro",
             )
+
 
 
         # 기본 값들(필요 최소치만)
@@ -11785,7 +11806,9 @@ async def on_ready():
 
                 chart_files = []
                 async with RENDER_SEMA:
+
                     _log_panel_source(symbol_eth, tf, df)
+
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
@@ -11795,6 +11818,7 @@ async def on_ready():
                 try:
                     rows_struct = _load_ohlcv_rows(symbol_eth, tf, limit=400)
                     df_struct = _rows_to_df(rows_struct)
+
                 except Exception:
                     rows_struct, df_struct = [], None
 
@@ -11805,6 +11829,7 @@ async def on_ready():
                 struct_imgs = []
                 struct_info = None
                 try:
+
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         _log_panel_source(symbol_eth, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
@@ -11827,11 +11852,13 @@ async def on_ready():
                             anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
                             title_suffix="· Macro",
                         )
+
                         struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
                         if struct_imgs:
                             chart_files = struct_imgs + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A1-END]
@@ -12356,14 +12383,18 @@ async def on_ready():
 
                 chart_files = []
                 async with RENDER_SEMA:
+
                     _log_panel_source(symbol_btc, tf, df)
+
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
 
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
+
                     rows_struct = _load_ohlcv_rows(symbol_btc, tf, limit=400)
                     df_struct = _rows_to_df(rows_struct)
+
                 except Exception:
                     rows_struct, df_struct = [], None
 
@@ -12374,6 +12405,7 @@ async def on_ready():
                 struct_imgs = []
                 struct_info = None
                 try:
+
                     if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
                         _log_panel_source(symbol_btc, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
@@ -12396,11 +12428,13 @@ async def on_ready():
                             anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
                             title_suffix="· Macro",
                         )
+
                         struct_imgs = [p for p in (near_img, macro_img) if p]
                         if struct_info is not None:
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
                         if struct_imgs:
                             chart_files = struct_imgs + list(chart_files)
+
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A2-END]
@@ -12944,6 +12978,7 @@ async def on_message(message):
         
         async with RENDER_SEMA:
             _log_panel_source(symbol, tf, df)
+
             chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
 
 
@@ -12969,10 +13004,12 @@ async def on_message(message):
                     near_img = await asyncio.to_thread(
                         render_struct_overlay,
                         symbol, tf, df_struct, struct_info,
+
                         lookback_override=lb,
                         anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
                         title_suffix="· Near",
                     )
+
 
                     # Macro (Near 대비 더 넓은 구간)
                     macro_img = await asyncio.to_thread(
@@ -12988,6 +13025,7 @@ async def on_message(message):
             # 항상: 구조 이미지가 있으면 분할 4장 앞에 붙여 총 6장(=2+4)
             if struct_imgs:
                 chart_files = list(struct_imgs) + list(chart_files)
+
 
         except Exception as _e:
             log(f"[STRUCT_CMD_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
