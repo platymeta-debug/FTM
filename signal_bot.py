@@ -140,6 +140,74 @@ def env_bool(key: str, default: bool=False) -> bool:
     if v is None or v == "":
         return bool(default)
     return v.lower() in ("1","true","on","yes","y")
+# ==== Safe tuple/array parsers ===============================================
+def _env_xy(key: str, default=(0.66, 0.66)):
+    """
+    Parse 'x,y' like ENV into a 2-float tuple.
+    - Accepts separators: ',', ';', ' '.
+    - Ignores extra tokens (takes first 2).
+    - Falls back to default if invalid.
+    """
+    raw = os.getenv(key, f"{default[0]},{default[1]}") or ""
+    raw = raw.replace(";", ",").replace(" ", ",")
+    parts = [p for p in raw.split(",") if p != ""]
+    vals = []
+    for p in parts:
+        try:
+            vals.append(float(p))
+        except Exception:
+            pass
+    while len(vals) < 2:
+        vals.append(float(default[len(vals)]))
+    # Only first two matter; silently drop extras
+    return float(vals[0]), float(vals[1])
+
+def _env_idxpair(key: str, default=(0, 1)):
+    """
+    Parse 'i0,i1' to 2-int tuple for index pairs (e.g., Fib base).
+    Extra tokens ignored.
+    """
+    raw = os.getenv(key, f"{default[0]},{default[1]}") or ""
+    raw = raw.replace(";", ",").replace(" ", ",")
+    parts = [p for p in raw.split(",") if p != ""]
+    out = []
+    for p in parts:
+        try:
+            out.append(int(float(p)))
+        except Exception:
+            pass
+    while len(out) < 2:
+        out.append(default[len(out)])
+    return int(out[0]), int(out[1])
+
+def _ensure_xy(ret):
+    """
+    Normalize various return shapes to (x, y).
+    Accepts:
+      - (x, y)
+      - (x, y, *rest)  -> first two
+      - {'x':..., 'y':...}
+      - pandas Series/ndarray y only -> x = range(len(y))
+    """
+    import numpy as np
+    if isinstance(ret, dict) and 'x' in ret and 'y' in ret:
+        return ret['x'], ret['y']
+    if isinstance(ret, (tuple, list)):
+        if len(ret) >= 2:
+            return ret[0], ret[1]
+        if len(ret) == 1:
+            y = ret[0]
+            x = np.arange(len(y))
+            return x, y
+    # assume it's y-like
+    y = ret
+    try:
+        n = len(y)
+    except Exception:
+        n = 0
+    x = np.arange(n)
+    return x, y
+# ==============================================================================
 # ======================================================================
 
 # [ANCHOR: LOCKS_BEGIN]
@@ -921,7 +989,6 @@ def _draw_reg_channel(ax, df, k=None, tf: str=None):
     calc = _calc_scale() or _decide_scale(tf)
     y_t = _to_scale(y, calc)
 
-
     # robust OLS (keep ols as requested)
     a, b = np.polyfit(x, y_t, 1)
     yhat_t = a*x + b
@@ -944,7 +1011,14 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
     Base trend (two points) + parallel offsets measured in transformed space (log-safe).
     """
     if len(df) < 30: return
-    if levels is None:
+
+    # Normalize levels (strings, extra tokens tolerated)
+    levels = [float(x) for x in map(str, levels or []) if x not in ("", None)]
+    # Normalize base to (i0,i1)
+    if base and isinstance(base, (list, tuple)) and len(base) >= 2:
+        base = (int(base[0]), int(base[1]))
+    if not levels:
+
         tf_l = str(tf).lower()
         if tf_l.endswith("d"):
             lv_s = os.getenv("STRUCT_FIB_LEVELS_1D","0.382,0.5,0.618,1.0")
@@ -955,7 +1029,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
         levels = [float(x) for x in lv_s.split(",") if x]
     else:
 
-        levels = [p for p,_ in _norm_levels(levels)]
+        mid_on = False
 
 
     x = np.arange(len(df)); y = df["close"].values.astype(float)
@@ -1058,6 +1132,25 @@ def _avwap_series(df: pd.DataFrame, start_idx: int, price_src: str = None):
     return avwap
 
 
+def _calc_avwap_xy(df, anchor_idx: int, price_src: str = None):
+    """
+    Returns (x, y) for plotting. Safe against any previous variants.
+    """
+    y_line = _avwap_series(df, anchor_idx, price_src=price_src)
+    if y_line is None:
+        return None
+    x = df.index
+    return x, y_line
+
+
+def _draw_avwap(ax, df, anchor_idx, color, label, price_src=None):
+    ret = _calc_avwap_xy(df, anchor_idx, price_src=price_src)
+    if ret is None:
+        return
+    x, y = _ensure_xy(ret)  # <- robust
+    ax.plot(x, y, color=color, linewidth=1.4, label=label)
+
+
 def _ytd_anchor_idx(df: pd.DataFrame):
     """올해 1월 1일(또는 데이터 시작일 이후 첫 캔들) 인덱스 반환."""
     if not isinstance(df.index, pd.DatetimeIndex) or len(df) == 0:
@@ -1089,10 +1182,13 @@ def _draw_avwap_items(ax, df):
 
     if draw_ytd:
         i0 = _ytd_anchor_idx(df)
-        s  = _avwap_series(df, i0, price_src=px_src)
-        if s is not None:
+
+        ret = _calc_avwap_xy(df, i0, price_src=px_src)
+        if ret is not None:
+            x, s = _ensure_xy(ret)
             if style == "series":
-                ax.plot(df.index, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
+                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
+
                         linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
             else:
                 _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
@@ -1100,10 +1196,13 @@ def _draw_avwap_items(ax, df):
 
     if draw_ath:
         i1 = _ath_anchor_idx(df)
-        s  = _avwap_series(df, i1, price_src=px_src)
-        if s is not None:
+
+        ret = _calc_avwap_xy(df, i1, price_src=px_src)
+        if ret is not None:
+            x, s = _ensure_xy(ret)
             if style == "series":
-                ax.plot(df.index, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
+                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
+
                         linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
             else:
                 _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
@@ -3524,12 +3623,26 @@ def _sce_horizontal_levels(df, tf, atr_len, max_levels=6):
         levels.append(('ATH', ath)); levels.append(('ATL', atl))
         hp, lp = _sce_pivots(df, left=2, right=2)
         for t, piv in [('PH', hp), ('PL', lp)]:
-            for idx, pr in piv[-3:]:
+            for item in piv[-3:]:
+                try:
+                    idx, pr = item
+                except Exception:
+                    if isinstance(item, dict) and 'x' in item and 'y' in item:
+                        idx, pr = item['x'], item['y']
+                    else:
+                        idx, pr = _ensure_xy(item)
                 levels.append((t, float(pr)))
         # 0.1 ATR 이내 중복 레벨 제거
         uniq, used = [], []
         tol = _sce_atr(df, atr_len) * 0.1
-        for t, lv in levels:
+        for item in levels:
+            try:
+                t, lv = item
+            except Exception:
+                if isinstance(item, dict) and 'x' in item and 'y' in item:
+                    t, lv = item['x'], item['y']
+                else:
+                    t, lv = _ensure_xy(item)
             if any(abs(lv-u) <= tol for u in used):
                 continue
             uniq.append((t, lv)); used.append(lv)
@@ -10705,7 +10818,22 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         err_flags.append(("reg", e))
     try:
         if env_bool("STRUCT_DRAW_FIBCH", True):
-            base = struct_info.get("fib_base") if isinstance(struct_info, dict) else None
+            base = None
+            if struct_info and isinstance(struct_info, dict):
+                base = struct_info.get("fib_base")
+
+            if base is None:
+                # allow ENV override: e.g., STRUCT_FIB_BASE="120,260"
+                if os.getenv("STRUCT_FIB_BASE"):
+                    base = _env_idxpair("STRUCT_FIB_BASE", (0, 1))
+
+            # normalize shape (may be list/tuple/with extras)
+            if isinstance(base, (list, tuple)) and len(base) >= 2:
+                i0, i1 = int(base[0]), int(base[1])
+                base = (i0, i1)
+            else:
+                base = None
+
             fib_levels = _resolve_fib_levels(tf)
             _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
 
@@ -10723,10 +10851,13 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
     atr_n = env_int("STRUCT_ATR_N", 14)
     atr = _safe_atr(df, atr_n)
-    ix, iy = (os.getenv("STRUCT_INFO_POS","0.02,0.98").split(","))
-    ix = float(ix); iy = float(iy)
-    ax.text(ix, iy, f"Close {df['close'].iloc[-1]:,.2f} | ATR({atr_n}) {atr:.2f}",
-            transform=ax.transAxes, ha="left", va="top", fontsize=10, bbox=dict(facecolor="white", alpha=0.65, edgecolor="none"), zorder=3)
+
+    info_line = f"Close {df['close'].iloc[-1]:,.2f} | ATR({atr_n}) {atr:.2f}"
+    pos_x, pos_y = _env_xy("STRUCT_INFO_POS", (0.66, 0.66))
+    ax.text(pos_x, pos_y, info_line,
+            transform=ax.transAxes, ha="left", va="top",
+            fontsize=9, bbox=dict(facecolor="white", alpha=0.65, edgecolor="none"))
+
     try:
         _safe_legend(ax)
     except Exception as e:
@@ -11813,14 +11944,26 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
                 struct_imgs = [p for p in (near_img, macro_img) if p]
                 if struct_info is not None:
                     _struct_cache_put(symbol, tf, _df_last_ts(df_struct), struct_info, near_img)
+        except ValueError as e:
+            logger.info(f"[STRUCT_IMG_WARN] {symbol} {tf} ValueError: {e} | hint: check ENV tuples (STRUCT_INFO_POS, STRUCT_FIB_BASE) & AVWAP returns")
+            raise
         except Exception as _e:
             log(f"[STRUCT_IMG_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
         if not struct_imgs or len(struct_imgs) < 2:
             for mode in ("near","macro"):
                 p = render_struct_overlay(symbol, tf, df, struct_info={}, mode=mode)
                 if p: struct_imgs.append(p)
-        files_to_send = struct_imgs + chart_files
-        logger.info(f"[ATTACH_CNT] {len(files_to_send)} files (struct={len(struct_imgs)}, base={len(files_to_send)-len(struct_imgs)})")
+
+        # === Attach bundle guard ===
+        bundle = []
+        bundle += struct_imgs or []
+        bundle += chart_files or []
+        # keep exactly 6 if possible (2 struct + 4 base)
+        if len(bundle) >= 6:
+            bundle = bundle[:6]
+        logger.info(f"[ATTACH_CNT] {len(bundle)} files (struct={len(struct_imgs or [])}, base={len(chart_files or [])})")
+        files_to_send = bundle
+
         # === [/STRUCT_OVERLAY_FOR_OLDSTYLE] ===
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
@@ -12366,14 +12509,26 @@ async def on_ready():
                         if struct_info is not None:
                             _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
 
+                except ValueError as e:
+                    logger.info(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} ValueError: {e} | hint: check ENV tuples (STRUCT_INFO_POS, STRUCT_FIB_BASE) & AVWAP returns")
+                    raise
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
                 if not struct_imgs or len(struct_imgs) < 2:
                     for mode in ("near","macro"):
                         p = render_struct_overlay(symbol_eth, tf, df, struct_info={}, mode=mode)
                         if p: struct_imgs.append(p)
-                files_to_send = struct_imgs + chart_files
-                logger.info(f"[ATTACH_CNT] {len(files_to_send)} files (struct={len(struct_imgs)}, base={len(files_to_send)-len(struct_imgs)})")
+
+                # === Attach bundle guard ===
+                bundle = []
+                bundle += struct_imgs or []
+                bundle += chart_files or []
+                # keep exactly 6 if possible (2 struct + 4 base)
+                if len(bundle) >= 6:
+                    bundle = bundle[:6]
+                logger.info(f"[ATTACH_CNT] {len(bundle)} files (struct={len(struct_imgs or [])}, base={len(chart_files or [])})")
+                files_to_send = bundle
+
                 # [PATCH A1-END]
 
                 # ✅ entry_data가 없을 경우 None으로 초기화
@@ -12929,14 +13084,26 @@ async def on_ready():
                         if struct_info is not None:
                             _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
 
+                except ValueError as e:
+                    logger.info(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} ValueError: {e} | hint: check ENV tuples (STRUCT_INFO_POS, STRUCT_FIB_BASE) & AVWAP returns")
+                    raise
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 if not struct_imgs or len(struct_imgs) < 2:
                     for mode in ("near","macro"):
                         p = render_struct_overlay(symbol_btc, tf, df, struct_info={}, mode=mode)
                         if p: struct_imgs.append(p)
-                files_to_send = struct_imgs + chart_files
-                logger.info(f"[ATTACH_CNT] {len(files_to_send)} files (struct={len(struct_imgs)}, base={len(files_to_send)-len(struct_imgs)})")
+
+                # === Attach bundle guard ===
+                bundle = []
+                bundle += struct_imgs or []
+                bundle += chart_files or []
+                # keep exactly 6 if possible (2 struct + 4 base)
+                if len(bundle) >= 6:
+                    bundle = bundle[:6]
+                logger.info(f"[ATTACH_CNT] {len(bundle)} files (struct={len(struct_imgs or [])}, base={len(chart_files or [])})")
+                files_to_send = bundle
+
                 # [PATCH A2-END]
 
                 struct_block = None
@@ -13519,10 +13686,21 @@ async def on_message(message):
                 for mode in ("near","macro"):
                     p = render_struct_overlay(symbol, tf, df, struct_info={}, mode=mode)
                     if p: struct_imgs.append(p)
-            files_to_send = struct_imgs + chart_files
-            logger.info(f"[ATTACH_CNT] {len(files_to_send)} files (struct={len(struct_imgs)}, base={len(files_to_send)-len(struct_imgs)})")
+
+            # === Attach bundle guard ===
+            bundle = []
+            bundle += struct_imgs or []
+            bundle += chart_files or []
+            # keep exactly 6 if possible (2 struct + 4 base)
+            if len(bundle) >= 6:
+                bundle = bundle[:6]
+            logger.info(f"[ATTACH_CNT] {len(bundle)} files (struct={len(struct_imgs or [])}, base={len(chart_files or [])})")
+            files_to_send = bundle
 
 
+        except ValueError as e:
+            logger.info(f"[STRUCT_CMD_WARN] {symbol} {tf} ValueError: {e} | hint: check ENV tuples (STRUCT_INFO_POS, STRUCT_FIB_BASE) & AVWAP returns")
+            raise
         except Exception as _e:
             log(f"[STRUCT_CMD_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
 
