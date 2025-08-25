@@ -917,8 +917,10 @@ def _draw_reg_channel(ax, df, k=None, tf: str=None):
     x = np.arange(len(df))
     y = df["close"].values.astype(float)
 
+
     calc = _calc_scale() or _decide_scale(tf)
     y_t = _to_scale(y, calc)
+
 
     # robust OLS (keep ols as requested)
     a, b = np.polyfit(x, y_t, 1)
@@ -952,8 +954,9 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
             mid_on = env_bool("STRUCT_FIB_MIDLINES_INTRADAY", False)
         levels = [float(x) for x in lv_s.split(",") if x]
     else:
+
         levels = [p for p,_ in _norm_levels(levels)]
-        mid_on = False
+
 
     x = np.arange(len(df)); y = df["close"].values.astype(float)
     calc = _calc_scale() or _decide_scale(tf)
