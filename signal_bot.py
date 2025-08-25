@@ -557,10 +557,46 @@ def _pivot_points(df: pd.DataFrame, w: int = None):
     return pivH, pivL
 
 def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
-    """struct_info에 레벨이 없으면 DF 기반으로 자동 생성(ATH/ATL/최근 피벗)."""
+    """
+    Accept both:
+      - dict format: [{"type":"R|S","price":float,"name":"ATH|PH|..."}]
+      - tuple format: [("ATH", 1234.5), ("PL", 987.6), ...]
+    Fallback to auto-detection (ATH/ATL + recent pivots) when empty.
+    """
+    def _norm_one(lv, close_val):
+        # already dict → shallow normalize
+        if isinstance(lv, dict):
+            p = float(lv.get("price") or lv.get("p") or 0.0)
+            tp = (lv.get("type") or lv.get("tp") or "").upper()
+            nm = (lv.get("name") or lv.get("label") or "").upper()
+            if not tp:
+                if nm in ("ATH","PH","R","RES","RESISTANCE"): tp = "R"
+                elif nm in ("ATL","PL","S","SUP","SUPPORT"): tp = "S"
+            if not tp:
+                tp = "R" if (close_val is not None and p >= close_val) else "S"
+            return {"type": tp, "price": p, "name": (nm or tp)}
+        # tuple/list → ("TAG", price) or ("R", price) ...
+        if isinstance(lv, (list, tuple)) and len(lv) >= 2:
+            tag = str(lv[0]).upper()
+            p   = float(lv[1])
+            if tag in ("ATH","PH","R","RES","RESISTANCE"):
+                tp = "R"
+            elif tag in ("ATL","PL","S","SUP","SUPPORT"):
+                tp = "S"
+            else:
+                tp = "R" if (close_val is not None and p >= close_val) else "S"
+            return {"type": tp, "price": p, "name": tag}
+        return None
+
+    close = float(df["close"].iloc[-1]) if len(df) else None
+
+    # 1) read from struct_info if provided
     levels = []
     if struct_info and isinstance(struct_info, dict):
-        levels = struct_info.get("levels", []) or []
+        raw = struct_info.get("levels", []) or []
+        levels = [x for x in (_norm_one(lv, close) for lv in raw) if x]
+
+    # 2) auto-build if empty
     if not levels:
         pivH, pivL = _pivot_points(df)
         selH = sorted(pivH[-8:], key=lambda i: df["high"].iloc[i], reverse=True)[:2]
@@ -572,11 +608,12 @@ def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
             levels.append({"type":"R","price": float(df["high"].iloc[i]), "name":"PH"})
         for i in selL:
             levels.append({"type":"S","price": float(df["low"].iloc[i]),  "name":"PL"})
-    close = float(df["close"].iloc[-1]) if len(df) else None
+
+    # 3) distance in ATR + sort & cap
     out = []
     for lv in levels:
         p = float(lv.get("price", 0.0))
-        d_atr = abs((close - p))/atr if close and atr>0 else None
+        d_atr = (abs((close - p))/atr) if (close is not None and atr and atr > 0) else None
         out.append({**lv, "dist_atr": d_atr})
     out = sorted(out, key=lambda x: (x["dist_atr"] if x["dist_atr"] is not None else 9e9))[:env_int("STRUCT_MAX_LEVELS", 6)]
     return out
@@ -599,12 +636,41 @@ def _best_trendlines(df: pd.DataFrame):
     return up, dn
 
 def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame):
-    tls = []
+    """
+    Accept:
+      - [{"dir":"up|down","m":float,"b":float}, ...]
+      - [("up", m, b), (m, b, "down"), ...]
+    Fallback to _best_trendlines when nothing usable.
+    """
+    def _norm_tl(t):
+        if isinstance(t, dict):
+            d = t
+            return {
+                "dir":  (str(d.get("dir") or d.get("direction") or "") or "").lower(),
+                "m":    float(d.get("m") or d.get("slope") or 0.0),
+                "b":    float(d.get("b") or d.get("intercept") or 0.0),
+            }
+        if isinstance(t, (list, tuple)):
+            if len(t) >= 3:
+                if isinstance(t[0], str):
+                    dirv, m, b = t[0], float(t[1]), float(t[2])
+                elif isinstance(t[2], str):
+                    m, b, dirv = float(t[0]), float(t[1]), t[2]
+                else:
+                    return None
+                return {"dir": str(dirv).lower(), "m": m, "b": b}
+        return None
+
+    # 1) try struct_info
     if struct_info and isinstance(struct_info, dict):
-        tls = struct_info.get("trendlines", []) or []
+        raw = struct_info.get("trendlines", []) or []
+        tls = [x for x in (_norm_tl(t) for t in raw) if x and x.get("dir") in ("up","down")]
         if tls:
             return tls
+
+    # 2) fallback auto
     up, dn = _best_trendlines(df)
+    tls = []
     if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
     if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
     return tls
@@ -629,9 +695,24 @@ def _draw_tls(ax, df, tls):
     if not tls: return
     x = np.arange(len(df)); xdt = df.index
     for t in tls:
-        m = float(t["m"]); b = float(t["b"])
+        try:
+            if isinstance(t, dict):
+                dirv = (t.get("dir") or "").lower()
+                m = float(t.get("m")); b = float(t.get("b"))
+            elif isinstance(t, (list, tuple)) and len(t) >= 3:
+                if isinstance(t[0], str):
+                    dirv, m, b = str(t[0]).lower(), float(t[1]), float(t[2])
+                elif isinstance(t[2], str):
+                    dirv, m, b = str(t[2]).lower(), float(t[0]), float(t[1])
+                else:
+                    continue
+            else:
+                continue
+        except Exception:
+            continue
+
         y = m*x + b
-        if t.get("dir")=="up":
+        if dirv == "up":
             ax.plot(xdt, y, linestyle="--", color="#28a745", linewidth=1.6, label="up TL")
         else:
             ax.plot(xdt, y, linestyle="--", color="#dc3545", linewidth=1.6, label="down TL")
