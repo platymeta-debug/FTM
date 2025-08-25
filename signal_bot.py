@@ -729,27 +729,72 @@ def _draw_reg_channel(ax, df, k=None):
     ax.plot(df.index, yhat + k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"+{k}σ")
     ax.plot(df.index, yhat - k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"-{k}σ")
 
-def _draw_fib_channel(ax, df, base=None, levels=None):
-    """기준 추세선(두 점) + MAD/σ 스케일로 평행선."""
+def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
+    """
+    Draw Fib parallel channel:
+      - base: (i0, i1) index pair (optional; auto if None)
+      - levels: list of floats like [0.382, 0.618, 1.0]
+      - tf: current timeframe string (e.g., "15m","1h","4h","1d") for density rules
+    Adds "midlines" at midpoint of every adjacent level pair when enabled.
+    """
+    # ---- config & guards
+    if len(df) < 30:
+        return
+    fib_mid_on = env_bool("STRUCT_FIB_MIDLINES", True)
+    # density by TF (swing-friendly)
+    lv_1d = os.getenv("STRUCT_FIB_LEVELS_1D", "").strip()
+    lv_intra = os.getenv("STRUCT_FIB_LEVELS_INTRADAY", "").strip()
     if levels is None:
-        levels = [0.382, 0.5, 0.618, 1.0]
-    if len(df) < 30: return
+        if (tf or "").lower() in ("1d","1w","1m","1M","d","D"):
+            levels = [float(x) for x in (lv_1d or "0.382,0.618,1.0").split(",") if x]
+        else:
+            levels = [float(x) for x in (lv_intra or "0.382,0.618").split(",") if x]
+    # style
+    clr = os.getenv("STRUCT_COL_FIB", "#20c997")
+    lw_main = env_float("STRUCT_LW_FIB", 1.0)
+    alpha_main = env_float("STRUCT_FIB_ALPHA", 0.9)
+    lw_mid = env_float("STRUCT_LW_FIB_MID", 0.9)
+    alpha_mid = env_float("STRUCT_FIB_ALPHA_MID", 0.6)
+
+    # ---- fit base line
     x = np.arange(len(df)); y = df["close"].values
-    if not base:
+    if not base:  # auto: recent swing pair
         i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
-        if i0 == i1: return
+        if i0 == i1:
+            return
+        if i0 > i1:  # ensure chronological order
+            i0, i1 = i1, i0
         base = (i0, i1)
     i0, i1 = base
     m = (y[i1]-y[i0])/(x[i1]-x[i0] + 1e-9); b = y[i0] - m*x[i0]
     y0 = m*x + b
+
+    # ---- scale (MAD -> σ fallback)
     resid = y - y0
     mad = np.median(np.abs(resid - np.median(resid)))
     scale = (1.4826*mad) if mad>0 else np.std(resid)
-    clr = "#20c997"
-    ax.plot(df.index, y0, color=clr, linewidth=1.4, label="Fib base")
+    if not np.isfinite(scale) or scale <= 0:
+        scale = max(1e-6, np.std(resid))
+
+    # ---- draw
+    ax.plot(df.index, y0, color=clr, linewidth=lw_main, alpha=alpha_main, label="Fib base", zorder=1)
+    # sort & unique levels
+    levels = sorted({float(abs(v)) for v in levels})
+    # main levels
     for lv in levels:
-        ax.plot(df.index, y0 + lv*scale, color=clr, linewidth=1.0, linestyle="--", label=f"Fib {lv}")
-        ax.plot(df.index, y0 - lv*scale, color=clr, linewidth=1.0, linestyle="--")
+        ax.plot(df.index, y0 + lv*scale, color=clr, linewidth=lw_main, linestyle="--",
+                alpha=alpha_main, label=(f"Fib {lv}" if lv != 0 else "Fib 0"), zorder=1)
+        ax.plot(df.index, y0 - lv*scale, color=clr, linewidth=lw_main, linestyle="--",
+                alpha=alpha_main, zorder=1)
+    # midlines between adjacent pairs (including 0 and last level)
+    if fib_mid_on:
+        pairs = [0.0] + levels
+        for a, b_ in zip(pairs[:-1], pairs[1:]):
+            mid = 0.5*(a + b_)
+            ax.plot(df.index, y0 + mid*scale, color=clr, linewidth=lw_mid, linestyle=":",
+                    alpha=alpha_mid, label=("Fib mid" if a==0.0 else None), zorder=1)
+            ax.plot(df.index, y0 - mid*scale, color=clr, linewidth=lw_mid, linestyle=":",
+                    alpha=alpha_mid, zorder=1)
 # =============================================================================
 
 
@@ -10294,7 +10339,7 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             if struct_info and isinstance(struct_info, dict):
                 base = struct_info.get("fib_base")
             fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
-            _draw_fib_channel(ax, df, base=base, levels=fib_levels)
+            _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
 
         handles, labels = ax.get_legend_handles_labels()
         if labels:
