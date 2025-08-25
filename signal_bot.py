@@ -10090,12 +10090,10 @@ def _num(x, default=None):
 # ============================================================================
 
 # === Structure overlay renderer (matplotlib) ==================================
-
 def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
                           lookback_override: int | None = None,
                           anchor_override: float | None = None,
                           title_suffix: str = "",
-
                           save_dir: str = './charts', width: int = 1600, height: int = 900) -> str | None:
     """캔들 + 수평 레벨 + 추세선 + 채널을 그려 저장."""
 
@@ -11818,7 +11816,6 @@ async def on_ready():
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
 
                 try:
-
                     rows_struct = _load_ohlcv_rows(symbol_eth, tf, limit=400)
                     df_struct = _rows_to_df(rows_struct)
 
@@ -12988,7 +12985,7 @@ async def on_message(message):
         # [SCE] 수동 명령에도 구조 컨텍스트/오버레이 적용
         df_struct = None
         struct_info = None
-        struct_img = None
+        struct_imgs = []
         try:
             # 기존 OHLCV df를 SCE 입력형식으로 변환 후 컨텍스트 구축
             df_struct = _sce_build_df_from_ohlcv(df)
@@ -12997,23 +12994,39 @@ async def on_message(message):
                 atr_mult_near=env_float("STRUCT_ATR_NEAR", 0.8),
                 confluence_eps=env_float("STRUCT_EPS", 0.4),
             )
+
             if os.getenv("STRUCT_OVERLAY_IMAGE", "1") == "1":
                 async with RENDER_SEMA:
                     lb = _tf_view_lookback(tf)
                     _log_panel_source(symbol, tf, df_struct)
-                    struct_img = await asyncio.to_thread(
+
+                    # Near
+                    near_img = await asyncio.to_thread(
                         render_struct_overlay,
-                        symbol,
-                        tf,
-                        df_struct,
-                        struct_info,
+                        symbol, tf, df_struct, struct_info,
+
                         lookback_override=lb,
                         anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
                         title_suffix="· Near",
                     )
 
-                if struct_img:
-                    chart_files = [struct_img] + list(chart_files)
+
+                    # Macro (Near 대비 더 넓은 구간)
+                    macro_img = await asyncio.to_thread(
+                        render_struct_overlay,
+                        symbol, tf, df_struct, struct_info,
+                        lookback_override=int(lb * env_float("STRUCT_VIEW_MACRO_MULT", 3.0)),
+                        anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO", 0.85),
+                        title_suffix="· Macro",
+                    )
+
+                struct_imgs = [p for p in (near_img, macro_img) if p]
+
+            # 항상: 구조 이미지가 있으면 분할 4장 앞에 붙여 총 6장(=2+4)
+            if struct_imgs:
+                chart_files = list(struct_imgs) + list(chart_files)
+
+
         except Exception as _e:
             log(f"[STRUCT_CMD_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
 
