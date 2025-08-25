@@ -17,6 +17,8 @@ import asyncio  # ✅ 이 줄을 꼭 추가
 from zoneinfo import ZoneInfo
 import datetime as dt
 
+logger = logging.getLogger(__name__)
+
 
 # [ANCHOR: DEBUG_FLAG_BEGIN]
 def _env_on(k: str, default="0") -> bool:
@@ -738,17 +740,15 @@ def _best_trendlines(df: pd.DataFrame, tf:str=None):
 
 def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame, tf:str=None):
     tls = []
-
     if struct_info and isinstance(struct_info, dict):
-        raw = struct_info.get("trendlines", []) or []
-        tls = [x for x in (_norm_tl(t) for t in raw) if x and x.get("dir") in ("up","down")]
+        tls = struct_info.get("trendlines", []) or []
         if tls:
             return tls
-
+    # === 스케일 모드 (추세선 전용) ===
+    tl_scale = (os.getenv("STRUCT_TL_SCALE_MODE", os.getenv("STRUCT_SCALE_MODE", "log")) or "log").lower()
     up, dn = _best_trendlines(df, tf=tf)
-
-    if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
-    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
+    if up: tls.append({"dir":"up","m":up[1],"b":up[2], "scale": tl_scale})
+    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2], "scale": tl_scale})
     return tls
 
 # === nearby level merge (R/S within eps*ATR) ================================
@@ -848,38 +848,23 @@ def _draw_levels(ax, df, levels, atr):
 
                         clip_on=False, zorder=2)
 
-def _draw_tls(ax, df, tls):
+def _draw_tls(ax, df, tls, tf:str=None):
     if not tls: return
     x = np.arange(len(df)); xdt = df.index
-    lbl_up = os.getenv("STRUCT_LBL_TL_UP", "Trend ↑")
-    lbl_dn = os.getenv("STRUCT_LBL_TL_DN", "Trend ↓")
     for t in tls:
-        try:
-            if isinstance(t, dict):
-                dirv = (t.get("dir") or "").lower()
-                m = float(t.get("m")); b = float(t.get("b"))
-            elif isinstance(t, (list, tuple)) and len(t) >= 3:
-                if isinstance(t[0], str):
-                    dirv, m, b = str(t[0]).lower(), float(t[1]), float(t[2])
-                elif isinstance(t[2], str):
-                    dirv, m, b = str(t[2]).lower(), float(t[0]), float(t[1])
-                else:
-                    continue
-            else:
-                continue
-        except Exception:
-            continue
-
-        y = m*x + b
-
-        col_up = os.getenv("STRUCT_COL_TL_UP", "#28a745")
-        col_dn = os.getenv("STRUCT_COL_TL_DN", "#dc3545")
-        lw_tl  = env_float("STRUCT_LW_TL", 1.6)
-        if dirv == "up":
-            ax.plot(xdt, y, linestyle="--", color=col_up, linewidth=lw_tl, label=lbl_up, zorder=1)
-
+        m = float(t["m"]); b = float(t["b"])
+        scale_mode = (t.get("scale") or os.getenv("STRUCT_TL_SCALE_MODE","log")).lower()
+        if scale_mode == "log":
+            # y_t = m*x + b  → y = exp(y_t)
+            y = np.exp(m*x + b)
         else:
-            ax.plot(xdt, y, linestyle="--", color=col_dn, linewidth=lw_tl, label=lbl_dn, zorder=1)
+            y = m*x + b
+        if t.get("dir")=="up":
+            ax.plot(xdt, y, linestyle="--", color=os.getenv("STRUCT_COL_TL_UP","#28a745"),
+                    linewidth=env_float("STRUCT_LW_TL", 1.6), label=os.getenv("STRUCT_LBL_TL_UP","상승추세선"), zorder=1)
+        else:
+            ax.plot(xdt, y, linestyle="--", color=os.getenv("STRUCT_COL_TL_DN","#dc3545"),
+                    linewidth=env_float("STRUCT_LW_TL", 1.6), label=os.getenv("STRUCT_LBL_TL_DN","하락추세선"), zorder=1)
 
 def _draw_reg_channel(ax, df, k=None, tf:str=None):
     if len(df) < 20: return
@@ -1071,6 +1056,84 @@ def _draw_ath_lines(ax, df, ath, show_h=True, show_v=True):
                         clip_on=False, zorder=2)
     if show_v:
         ax.axvline(ath["time"], color=col, linestyle=(0,(4,3)), linewidth=lw, alpha=alpha*0.9, zorder=1)
+
+
+# === Anchored VWAP helpers ====================================================
+def _avwap_series(df: pd.DataFrame, start_idx: int, price_src: str = None):
+    """
+    df: columns need 'close' (+ 'high','low' for hlc3) and 'volume' (or 'vol').
+    start_idx: inclusive index (int) where AVWAP anchoring starts.
+    price_src: 'close'|'hlc3' (default from env).
+    returns: np.ndarray same length as df, values before start_idx set to np.nan
+    """
+    if len(df) == 0:
+        return None
+    vcol = "volume" if "volume" in df.columns else ("vol" if "vol" in df.columns else None)
+    if vcol is None or df[vcol].fillna(0).sum() == 0:
+        return None  # no volume → skip
+
+    price_src = (price_src or os.getenv("STRUCT_AVWAP_PRICE", "hlc3")).lower()
+    if price_src == "hlc3" and all(c in df.columns for c in ("high","low","close")):
+        px = (df["high"].values + df["low"].values + df["close"].values) / 3.0
+    else:
+        px = df["close"].values.astype(float)
+
+    v = df[vcol].values.astype(float)
+    pxv = px * v
+
+    # cumulative from anchor
+    avwap = np.full(len(df), np.nan, dtype="float64")
+    csum_v = np.cumsum(v[start_idx:])
+    csum_pv = np.cumsum(pxv[start_idx:])
+    av = csum_pv / np.maximum(csum_v, 1e-12)
+    avwap[start_idx:] = av
+    return avwap
+
+
+def _ytd_anchor_idx(df: pd.DataFrame):
+    """올해 1월 1일(또는 데이터 시작일 이후 첫 캔들) 인덱스 반환."""
+    if not isinstance(df.index, pd.DatetimeIndex) or len(df) == 0:
+        return 0
+    year = df.index[-1].year
+    y0 = pd.Timestamp(year=year, month=1, day=1, tz=df.index.tz)
+    left = df.index.searchsorted(y0, side="left")
+    left = int(np.clip(left, 0, len(df)-1))
+    return left
+
+
+def _ath_anchor_idx(df: pd.DataFrame):
+    """ATH 시점 인덱스 반환 (high 최대)."""
+    if len(df) == 0:
+        return 0
+    return int(np.argmax(df["high"].values))
+
+
+def _draw_avwap(ax, df, avwap, color, label, lw=1.6, alpha=0.9):
+    if avwap is None:
+        return
+    ax.plot(df.index, avwap, color=color, linewidth=lw, alpha=alpha, label=label, zorder=2)
+
+
+# === Big-figure levels (round numbers near price) =============================
+def _bigfig_levels(ax, df, k:int=6):
+    if len(df)==0: return
+    close = float(df["close"].iloc[-1])
+    # 자릿수 결정 (현재가 규모에 맞춰 1-2-5 스텝)
+    mag = 10 ** int(np.floor(np.log10(max(close,1e-9))))
+    step = mag
+    for m in (1,2,5,10):
+        if close / (mag*m) < 8:
+            step = mag*m
+            break
+    # 근처 수평선 k개
+    start = close - step * (k//2)
+    lvls = [round((start + i*step)/step)*step for i in range(k+1)]
+    col  = os.getenv("STRUCT_COL_BIGFIG","#9e9e9e")
+    lw   = env_float("STRUCT_LW_BIGFIG", 0.9)
+    alpha= env_float("STRUCT_BIGFIG_ALPHA", 0.35)
+    for p in lvls:
+        ax.hlines(p, df.index[0], df.index[-1], colors=col, linewidths=lw, linestyles=":",
+                  alpha=alpha, zorder=1)
 
 
 # =============================================================================
@@ -10674,6 +10737,10 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             levels = _levels_from_info_or_df(struct_info, df, atr)
             _draw_levels(ax, df, levels, atr)
 
+        # 빅피겨 라운드 넘버 (선택)
+        if env_bool("STRUCT_DRAW_BIGFIG", True):
+            _bigfig_levels(ax, df, k=env_int("STRUCT_BIGFIG_K", 6))
+
         if draw_tl:
             tls = _trendlines_from_info_or_df(struct_info, df, tf=tf)
             _draw_tls(ax, df, tls)
@@ -10728,6 +10795,36 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
 
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(formatter)
+
+        # 보강: 초근접 TF에선 분단위 고정 locator
+        if str(tf).lower()=="15m":
+            locator = mdates.MinuteLocator(interval=30)
+            formatter = mdates.ConciseDateFormatter(locator)
+            ax.xaxis.set_major_locator(locator)
+            ax.xaxis.set_major_formatter(formatter)
+            for lab in ax.get_xticklabels():
+                lab.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
+
+        # === AVWAP lines ==============================================================
+        try:
+            draw_ytd = env_bool("STRUCT_DRAW_AVWAP_YTD", True)
+            draw_ath = env_bool("STRUCT_DRAW_AVWAP_ATH", True)
+            lw_av    = env_float("STRUCT_LW_AVWAP", 1.6)
+            px_src   = os.getenv("STRUCT_AVWAP_PRICE", "hlc3")
+
+            if draw_ytd:
+                i0 = _ytd_anchor_idx(df)
+                s  = _avwap_series(df, i0, price_src=px_src)
+                _draw_avwap(ax, df, s, os.getenv("STRUCT_COL_AVWAP_YTD", "#ff7f0e"),
+                            os.getenv("STRUCT_LBL_AVWAP_YTD", "YTD AVWAP"), lw=lw_av, alpha=0.95)
+
+            if draw_ath:
+                i1 = _ath_anchor_idx(df)
+                s  = _avwap_series(df, i1, price_src=px_src)
+                _draw_avwap(ax, df, s, os.getenv("STRUCT_COL_AVWAP_ATH", "#8c564b"),
+                            os.getenv("STRUCT_LBL_AVWAP_ATH", "ATH AVWAP"), lw=lw_av, alpha=0.95)
+        except Exception as _e:
+            logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
 
         # === Legend (lean) ===
         handles, labels = ax.get_legend_handles_labels()
