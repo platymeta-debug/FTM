@@ -294,13 +294,124 @@ STRUCT_CACHE: dict = {}
 # 최근 분석에 사용된 DF 캐시 (대시보드/리포트 폴백용)
 _LAST_DF_CACHE: dict[tuple[str, str], pd.DataFrame] = {}
 
+# ==== OHLCV cache & time helpers =============================================
+OHLCV_CACHE = {}  # key: (symbol, tf) -> {"ts": int(last_bar_ms), "df": pd.DataFrame}
+
+def _now_ms():
+    return int(time.time() * 1000)
+
+def _cache_alive(key):
+    ent = OHLCV_CACHE.get(key)
+    if not ent:
+        return False
+    ttl_ms = env_int("OHLCV_TTL_SEC", 60) * 1000
+    return (_now_ms() - ent["ts"]) < ttl_ms
+
+_TF_SEC = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "8h": 28800,
+    "12h": 43200, "1d": 86400
+}
+
+def _tf_sec(tf: str) -> int:
+    return _TF_SEC.get(tf, 0)
+
+def _is_stale(df: "pd.DataFrame", tf: str) -> bool:
+    if df is None or len(df) == 0:
+        return True
+    last_ms = int(df["ts"].iloc[-1])
+    gap = (_now_ms() - last_ms) / 1000.0
+    fac = env_float("OHLCV_STALE_FACTOR", 2.2)  # 캔들 2.2개 이상 비면 stale
+    thr = max(120.0, _tf_sec(tf) * fac)
+    return gap > thr
+# ============================================================================
+
+def _get_ccxt():
+    return ccxt.binance({
+        'enableRateLimit': True,
+        'timeout': env_int('CCXT_TIMEOUT_MS', 5000),
+        'options': {
+            'defaultType': 'spot',
+            'adjustForTimeDifference': True
+        },
+    })
+
+def get_ohlcv(symbol: str, tf: str, limit: int = 240, since: int | None = None):
+    exchange = _get_ccxt()
+    exchange.load_markets()
+    market = symbol if symbol in exchange.markets else exchange.market(symbol)["id"]
+    rows = exchange.fetch_ohlcv(market, timeframe=tf, since=since, limit=limit)
+    return rows
+
+def _fetch_ohlcv_rest(symbol: str, tf: str, limit: int = 240):
+    """Binance Futures REST (testnet/live 자동 선택, env로 live 강제 가능)"""
+    import requests
+    sym = symbol.replace("/", "")
+    use_live = bool(env_int("OHLCV_FORCE_LIVE", 0)) or env_int("SANDBOX", 0) == 0
+    base = "https://fapi.binance.com" if use_live else "https://testnet.binancefuture.com"
+    url = f"{base}/fapi/v1/klines"
+    params = {"symbol": sym, "interval": tf, "limit": limit}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    rows = [[x[0], float(x[1]), float(x[2]), float(x[3]), float(x[4]), float(x[5])] for x in data]
+    return rows
+
+def _load_ohlcv(symbol: str, tf: str, limit: int = 240, since: int | None = None) -> pd.DataFrame:
+    key = (symbol, tf)
+    if _cache_alive(key):
+        return OHLCV_CACHE[key]["df"].copy()
+
+    # 1) CCXT 우선
+    rows = []
+    try:
+        rows = get_ohlcv(symbol, tf, limit=limit, since=since) or []
+    except Exception as e:
+        log(f"[OHLCV_CCXT_ERR] {symbol} {tf} {e}")
+
+    # 2) REST 폴백 (비어있거나 stale면)
+    def _to_df(_rows):
+        if not _rows:
+            return None
+        arr = np.array(_rows, dtype=float)
+        arr = arr[np.argsort(arr[:, 0])]
+        df = pd.DataFrame(arr, columns=["ts", "open", "high", "low", "close", "volume"])
+        dt = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+        df.index = dt
+        df["timestamp"] = dt
+        df = df[~df.index.duplicated(keep="last")]
+        for c in ("open", "high", "low", "close", "volume"):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        return df.dropna(subset=["open", "high", "low", "close"])
+
+    df = _to_df(rows)
+    if df is None or _is_stale(df, tf):
+        try:
+            rows2 = _fetch_ohlcv_rest(symbol, tf, limit=limit)
+            df2 = _to_df(rows2)
+            if df2 is not None:
+                log(
+                    f"[OHLCV_REST] {symbol} {tf} live={'Y' if env_int('OHLCV_FORCE_LIVE',0) or env_int('SANDBOX',0)==0 else 'N'} "
+                    f"first={df2.index[0]} last={df2.index[-1]}"
+                )
+                df = df2
+        except Exception as e:
+            log(f"[OHLCV_REST_ERR] {symbol} {tf} {e}")
+
+    if df is None or len(df) == 0:
+        raise RuntimeError(f"OHLCV empty: {symbol} {tf}")
+
+    OHLCV_CACHE[key] = {"ts": int(df['ts'].iloc[-1]), "df": df}
+    log(f"[OHLCV] {symbol} {tf} rows={len(df)} first={df.index[0]} last={df.index[-1]}")
+    return df.copy()
+
 # 상위TF 구조 알림/상태 저장
 STRUCT_ALERT_STATE: dict = {}
 
 # 차트/오버레이 렌더 동시성 제한
 RENDER_SEMA = asyncio.Semaphore(env_int("RENDER_MAX_CONCURRENCY", 1))
 
-def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
+def _load_ohlcv_rows(symbol: str, tf: str, limit: int = 300):
     """Try multiple loaders; ALWAYS return list of [ts, o, h, l, c, v]."""
     providers = []
     if 'get_ohlcv' in globals(): providers.append(lambda: get_ohlcv(symbol, tf, limit=limit))
@@ -314,6 +425,239 @@ def _load_ohlcv(symbol: str, tf: str, limit: int = 300):
         except Exception:
             continue
     return []
+
+# === OHLCV adapters (list/df/dict 모두 허용) ===
+def _row_to_ohlcv(row):
+    """
+    Accepts:
+      - list/tuple: [ts, o, h, l, c, v] or [o, h, l, c] (ts 없음)
+      - dict-like: {"ts":..., "open":..., "high":..., "low":..., "close":..., "volume":...}
+    Returns: (ts, o, h, l, c, v)  (ts/volume 없으면 None/0.0)
+    """
+    if row is None:
+        return (None, 0.0, 0.0, 0.0, 0.0, 0.0)
+    if isinstance(row, (list, tuple)):
+        if len(row) >= 6:
+            ts, o, h, l, c, v = row[:6]
+            return (ts, float(o), float(h), float(l), float(c), float(v))
+        elif len(row) >= 4:
+            o, h, l, c = row[:4]
+            return (None, float(o), float(h), float(l), float(c), 0.0)
+        raise ValueError(f"Bad OHLCV row len={len(row)}")
+    # dict-like
+    ts = row.get("ts")
+    return (
+        ts,
+        float(row.get("open", 0.0)),
+        float(row.get("high", 0.0)),
+        float(row.get("low", 0.0)),
+        float(row.get("close", 0.0)),
+        float(row.get("volume", 0.0)),
+    )
+
+def _rows_to_df(rows):
+    """list 기반 OHLCV를 pandas DataFrame으로 안전 변환."""
+    import pandas as _pd
+
+    if rows is None:
+        return _pd.DataFrame(columns=["ts","time","open","high","low","close","volume","timestamp"])
+
+    if hasattr(rows, "columns"):  # 이미 DataFrame
+        df = rows.copy()
+    else:
+        if not rows:
+            return _pd.DataFrame(columns=["ts","time","open","high","low","close","volume","timestamp"])
+        first = rows[0]
+        if isinstance(first, (list, tuple)):
+            if len(first) >= 6:
+                df = _pd.DataFrame(rows, columns=["ts","open","high","low","close","volume"])
+            elif len(first) >= 4:
+                df = _pd.DataFrame(rows, columns=["open","high","low","close"])
+                df["volume"] = 0.0
+                df["ts"] = _pd.NA
+            else:
+                raise ValueError(f"Bad OHLCV row len={len(first)}")
+        else:
+            df = _pd.DataFrame(rows)
+
+    if "ts" not in df.columns and "time" in df.columns:
+        df["ts"] = df["time"]
+    if "time" not in df.columns and "ts" in df.columns:
+        df["time"] = df["ts"]
+
+    if "timestamp" not in df:
+        base = "time" if "time" in df.columns else ("ts" if "ts" in df.columns else None)
+        if base is not None:
+            df["timestamp"] = _pd.to_datetime(df[base].astype("int64"), unit="ms", utc=True)
+            if not isinstance(df.index, _pd.DatetimeIndex):
+                df.index = df["timestamp"]
+        else:
+            if not isinstance(df.index, _pd.DatetimeIndex):
+                df["timestamp"] = _pd.to_datetime(df.index)
+            else:
+                df["timestamp"] = df.index
+
+    for c in ("open","high","low","close","volume"):
+        if c in df.columns:
+            df[c] = _pd.to_numeric(df[c], errors="coerce")
+        else:
+            df[c] = _pd.NA
+
+    cols = [c for c in ["ts","time","open","high","low","close","volume","timestamp"] if c in df.columns]
+    return df[cols]
+
+def _log_panel_source(symbol: str, tf: str, rows_or_df):
+    try:
+        df = _rows_to_df(rows_or_df)
+        df = df.sort_values('timestamp') if 'timestamp' in df.columns else df
+        if len(df) == 0:
+            log(f"[PANEL_SOURCE] {symbol} {tf} len=0")
+            return
+        fts = df.index[0].strftime("%Y-%m-%d %H:%M")
+        lts = df.index[-1].strftime("%Y-%m-%d %H:%M")
+        log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={fts} last={lts}")
+    except Exception as e:
+        log(f"[PANEL_SOURCE_WARN] {symbol} {tf} {type(e).__name__}: {e}")
+
+# ==== Structure calc & draw helpers ==========================================
+def ta_atr(high, low, close, n=14):
+    h = pd.Series(high, dtype=float)
+    l = pd.Series(low, dtype=float)
+    c = pd.Series(close, dtype=float)
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean().values
+
+def _pivot_points(df: pd.DataFrame, w: int = None):
+    """단순 피벗(high/low) 검출: 좌우 w 봉보다 높/낮으면 피벗."""
+    if w is None:
+        w = env_int("STRUCT_PIVOT_WINDOW", 3)
+    H = df["high"].values; L = df["low"].values
+    pivH, pivL = [], []
+    for i in range(w, len(df)-w):
+        if H[i] == max(H[i-w:i+w+1]): pivH.append(i)
+        if L[i] == min(L[i-w:i+w+1]): pivL.append(i)
+    return pivH, pivL
+
+def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
+    """struct_info에 레벨이 없으면 DF 기반으로 자동 생성(ATH/ATL/최근 피벗)."""
+    levels = []
+    if struct_info and isinstance(struct_info, dict):
+        levels = struct_info.get("levels", []) or []
+    if not levels:
+        pivH, pivL = _pivot_points(df)
+        selH = sorted(pivH[-8:], key=lambda i: df["high"].iloc[i], reverse=True)[:2]
+        selL = sorted(pivL[-8:], key=lambda i: df["low"].iloc[i])[:2]
+        if len(df):
+            levels.append({"type":"R","price": float(df["high"].max()), "name":"ATH"})
+            levels.append({"type":"S","price": float(df["low"].min()),  "name":"ATL"})
+        for i in selH:
+            levels.append({"type":"R","price": float(df["high"].iloc[i]), "name":"PH"})
+        for i in selL:
+            levels.append({"type":"S","price": float(df["low"].iloc[i]),  "name":"PL"})
+    close = float(df["close"].iloc[-1]) if len(df) else None
+    out = []
+    for lv in levels:
+        p = float(lv.get("price", 0.0))
+        d_atr = abs((close - p))/atr if close and atr>0 else None
+        out.append({**lv, "dist_atr": d_atr})
+    out = sorted(out, key=lambda x: (x["dist_atr"] if x["dist_atr"] is not None else 9e9))[:env_int("STRUCT_MAX_LEVELS", 6)]
+    return out
+
+def _best_trendlines(df: pd.DataFrame):
+    """struct_info 없으면 최근 피벗 2점 조합으로 상/하향 추세선 후보 탐색."""
+    pivH, pivL = _pivot_points(df)
+    x = np.arange(len(df))
+    up, dn = None, None
+    if len(pivL) >= 2:
+        i1, i2 = pivL[-2], pivL[-1]
+        m = (df["low"].iloc[i2]-df["low"].iloc[i1])/(x[i2]-x[i1]+1e-9)
+        b = df["low"].iloc[i2] - m*x[i2]
+        up = ("up", m, b)
+    if len(pivH) >= 2:
+        i1, i2 = pivH[-2], pivH[-1]
+        m = (df["high"].iloc[i2]-df["high"].iloc[i1])/(x[i2]-x[i1]+1e-9)
+        b = df["high"].iloc[i2] - m*x[i2]
+        dn = ("down", m, b)
+    return up, dn
+
+def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame):
+    tls = []
+    if struct_info and isinstance(struct_info, dict):
+        tls = struct_info.get("trendlines", []) or []
+        if tls:
+            return tls
+    up, dn = _best_trendlines(df)
+    if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
+    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
+    return tls
+
+def _draw_levels(ax, df, levels, atr):
+    """R/S 수평선 + 라벨."""
+    if not levels: return
+    x0 = df.index[0]; x1 = df.index[-1]
+    for lv in levels:
+        p = lv["price"]; tp = lv.get("type","R")
+        c = ("#d9534f" if tp=="R" else "#0275d8")
+        lw = 2.2 if (lv.get("dist_atr") or 9) < 0.5 else 1.4
+        ax.hlines(p, x0, x1, colors=c, linewidths=lw, linestyles="-")
+        if env_bool("STRUCT_LABELS_ON", True):
+            txt = f'{tp} {p:,.2f}'
+            if lv.get("dist_atr") is not None:
+                txt += f' ({lv["dist_atr"]:.2f}×ATR)'
+            ax.text(x0, p, txt, fontsize=9, color=c, va="bottom", ha="left",
+                    bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"))
+
+def _draw_tls(ax, df, tls):
+    if not tls: return
+    x = np.arange(len(df)); xdt = df.index
+    for t in tls:
+        m = float(t["m"]); b = float(t["b"])
+        y = m*x + b
+        if t.get("dir")=="up":
+            ax.plot(xdt, y, linestyle="--", color="#28a745", linewidth=1.6, label="up TL")
+        else:
+            ax.plot(xdt, y, linestyle="--", color="#dc3545", linewidth=1.6, label="down TL")
+
+def _draw_reg_channel(ax, df, k=None):
+    if k is None: k = env_float("STRUCT_REGCH_K", 1.0)
+    if k <= 0 or len(df) < 20: return
+    x = np.arange(len(df)); y = df["close"].values
+    a, b = np.polyfit(x, y, 1)
+    yhat = a*x + b
+    resid = y - yhat
+    sigma = np.std(resid)
+    ax.plot(df.index, yhat, color="#6f42c1", linewidth=1.6, label="Reg μ")
+    ax.plot(df.index, yhat + k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"+{k}σ")
+    ax.plot(df.index, yhat - k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"-{k}σ")
+
+def _draw_fib_channel(ax, df, base=None, levels=None):
+    """기준 추세선(두 점) + MAD/σ 스케일로 평행선."""
+    if levels is None:
+        levels = [0.382, 0.5, 0.618, 1.0]
+    if len(df) < 30: return
+    x = np.arange(len(df)); y = df["close"].values
+    if not base:
+        i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
+        if i0 == i1: return
+        base = (i0, i1)
+    i0, i1 = base
+    m = (y[i1]-y[i0])/(x[i1]-x[i0] + 1e-9); b = y[i0] - m*x[i0]
+    y0 = m*x + b
+    resid = y - y0
+    mad = np.median(np.abs(resid - np.median(resid)))
+    scale = (1.4826*mad) if mad>0 else np.std(resid)
+    clr = "#20c997"
+    ax.plot(df.index, y0, color=clr, linewidth=1.4, label="Fib base")
+    for lv in levels:
+        ax.plot(df.index, y0 + lv*scale, color=clr, linewidth=1.0, linestyle="--", label=f"Fib {lv}")
+        ax.plot(df.index, y0 - lv*scale, color=clr, linewidth=1.0, linestyle="--")
+# =============================================================================
+
+def candle_price(kl_last):
+    """기존 dict 전용 → list/dict 겸용으로 교체."""
+    _, o, h, l, c, _ = _row_to_ohlcv(kl_last)
+    return o, h, l, c
 
 # === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
 def _fetch_recent_bar_1m(symbol: str):
@@ -586,7 +930,7 @@ def _compute_context(symbol: str) -> dict|None:
         st = CTX_STATE.get(symbol)
         if st and (now - st.get("ts", 0) < CTX_TTL_SEC):
             return st
-        rows = _load_ohlcv(symbol, REGIME_TF, limit=max(200, REGIME_LOOKBACK+5))
+        rows = _load_ohlcv_rows(symbol, REGIME_TF, limit=max(200, REGIME_LOOKBACK+5))
         # rows must be list now; guard length only
         if len(rows) < max(60, REGIME_LOOKBACK//2):
             return None
@@ -1079,7 +1423,7 @@ async def get_daily_open(symbol: str) -> float | None:
         return rec.get("open")
 
     try:
-        df_1d = await safe_get_ohlcv(symbol, '1d', limit=1)
+        df_1d = _rows_to_df(await safe_get_ohlcv(symbol, '1d', limit=1))
         if _len(df_1d) >= 1:
             val = float(df_1d['open'].iloc[-1])
             DAILY_OPEN_CACHE[symbol] = {"open": val, "ts": now}
@@ -1558,16 +1902,6 @@ def should_process(symbol: str, tf: str, open_ms: int) -> bool:
     st.last_processed_open_ms = open_ms
     return True
 
-def candle_price(kl_last: dict) -> tuple[float, dict]:
-    # kl_last dict 구조 가정: keys: open_time, open, high, low, close
-    close = float(kl_last["close"])
-    high  = float(kl_last["high"])
-    low   = float(kl_last["low"])
-    meta = {"anomaly": False, "low": low, "high": high, "close": close}
-    if not (low <= close <= high):
-        meta["anomaly"] = True
-        # 이상치면 '주문 금지'를 위해 meta만 True로 반환
-    return close, meta
 
 def make_clid(symbol: str, tf: str, open_ms: int, side: str) -> str:
     base = f"bot1:{symbol}:{tf}:{open_ms}:{side}".lower()
@@ -1797,11 +2131,12 @@ def fetch_live_price(symbol: str) -> float | None:
 # [PATCH-④] 로그 기록 전 가격 위생 검사: 마지막 '닫힌' 캔들의 고/저 범위로 클램프
 def sanitize_price_for_tf(symbol: str, tf: str, price: float) -> float:
     try:
-        df_chk = get_ohlcv(symbol, tf, limit=2)
+        rows_chk = get_ohlcv(symbol, tf, limit=2)
+        df_chk = _rows_to_df(rows_chk)
         if len(df_chk) >= 2:
-            row = df_chk.iloc[-2]  # 닫힌 캔들
-            lo = float(row['low']); hi = float(row['high'])
-            p  = float(price)
+            row = df_chk.iloc[-2].to_dict()  # 닫힌 캔들
+            _, _, hi, lo, _, _ = _row_to_ohlcv(row)
+            p = float(price)
             if not (lo <= p <= hi):
                 return min(max(p, lo), hi)
     except Exception:
@@ -2307,7 +2642,7 @@ os.makedirs("logs", exist_ok=True)
 os.makedirs("images", exist_ok=True)
 
 
-def get_ohlcv(symbol='ETH/USDT', timeframe='1h', limit=300):
+def get_ohlcv_ccxt_df(symbol='ETH/USDT', timeframe='1h', limit=300):
     # CCXT 최신과 바이낸스 응답 포맷 이슈 회피
     exchange = ccxt.binance({
         'enableRateLimit': True,
@@ -2412,7 +2747,8 @@ def calc_daily_change_pct(symbol: str, current_price: float | None) -> float | N
     식: (현재가 - 전일 종가) / 전일 종가 * 100
     """
     try:
-        d1 = get_ohlcv(symbol, '1d', limit=3)
+        rows = get_ohlcv(symbol, '1d', limit=3)
+        d1 = _rows_to_df(rows)
         if d1 is None or len(d1) < 2:
             return None
         prev_close = float(d1['close'].iloc[-2])   # 전일 종가
@@ -2664,7 +3000,9 @@ def _sce_build_df_from_ohlcv(rows):
 
 def _df_last_ts(df) -> int:
     try:
-        return int(df['ts'].iloc[-1])
+        if 'ts' in df.columns:
+            return int(df['ts'].iloc[-1])
+        return int(df['time'].iloc[-1])
     except Exception:
         return int(time.time()*1000)
 
@@ -2698,12 +3036,22 @@ def _struct_cache_put(symbol: str, tf: str, ts: int, ctx: dict|None, img_path: s
 
 async def _refresh_struct_cache(symbol: str, tf: str):
     try:
-        rows = await asyncio.to_thread(_load_ohlcv, symbol, tf, 240)
+        rows = await asyncio.to_thread(_load_ohlcv_rows, symbol, tf, 240)
         df = _sce_build_df_from_ohlcv(rows) if rows else None
         if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
             return
         ctx = build_struct_context_basic(df, tf)
-        img = render_struct_overlay(symbol, tf, df, ctx)
+        lb = _tf_view_lookback(tf)
+        _log_panel_source(symbol, tf, df)
+        img = render_struct_overlay(
+            symbol,
+            tf,
+            df,
+            ctx,
+            lookback_override=lb,
+            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+            title_suffix="· Near",
+        )
         _struct_cache_put(symbol, tf, _df_last_ts(df), ctx, img)
         try:
             _LAST_DF_CACHE[(symbol, tf)] = df
@@ -2732,7 +3080,7 @@ def _mtf_struct_guard(symbol: str, tf: str, side_signal: str):
 
         # 상위TF들 검사
         for htf in higher_list:
-            rows = _load_ohlcv(symbol, htf, limit=400)
+            rows = _load_ohlcv_rows(symbol, htf, limit=400)
             if not rows or len(rows) < 50:
                 continue
             hdf = _sce_build_df_from_ohlcv(rows)
@@ -2854,12 +3202,10 @@ def calculate_signal(df, tf, symbol):
     # === [PATCH-②] 닫힌 캔들만 사용 ===
     # ccxt의 OHLCV는 맨 끝 행이 '진행 중' 캔들이라서 항상 -2(직전 캔들)를 본다.
     idx = -2 if len(df) >= 2 else -1
-    row = df.iloc[idx]
+    row = df.iloc[idx].to_dict()
 
     # 신호/로그용 가격은 닫힌 캔들의 종가로 고정
-    close_for_calc = float(row['close'])
-    hi_for_check   = float(row['high'])
-    lo_for_check   = float(row['low'])
+    _, _, hi_for_check, lo_for_check, close_for_calc, _ = _row_to_ohlcv(row)
 
     # (표시용 실시간 가격은 별도로 쓸 수 있지만, 신호·로그에는 close_for_calc만 사용)
     price_for_signal = close_for_calc
@@ -3395,15 +3741,16 @@ def build_performance_snapshot(
         return "-" if v is None else f"{v:+.2f}%"
 
     # 전일/주간/월간 변동률 계산(일봉 데이터 기준)
-    d1 = None
+    rows = None
     try:
-        d1 = get_ohlcv(symbol, '1d', limit=90)
+        rows = get_ohlcv(symbol, '1d', limit=90)
     except Exception:
-        d1 = None
+        rows = None
+    d1 = _rows_to_df(rows) if rows is not None else None
 
     def _chg_k_days_ago(k):
         try:
-            if d1 is None or len(d1) <= (k+1): 
+            if d1 is None or len(d1) <= (k+1):
                 return None
             prev = float(d1['close'].iloc[-(k+1)])
             curr = float(display_price) if isinstance(display_price, (int, float)) else float(d1['close'].iloc[-1])
@@ -5652,8 +5999,9 @@ async def safe_price_hint(symbol:str):
 
         if os.getenv("PRICE_FALLBACK_ON_NONE", "1") == "1":
             try:
-                df = get_ohlcv(symbol, "1m", limit=1)
-                last = float(df["close"].iloc[-1]) if hasattr(df, "iloc") and len(df) else 0.0
+                rows = get_ohlcv(symbol, "1m", limit=1)
+                df = _rows_to_df(rows)
+                last = float(df["close"].iloc[-1]) if len(df) else 0.0
             except Exception:
                 last = 0.0
 
@@ -9534,7 +9882,7 @@ async def _dash_struct_block():
             ent = STRUCT_CACHE.get((s, tf))
             if not ent or not ent.get("ctx"):
                 try:
-                    rows = _load_ohlcv(s, tf, limit=240)
+                    rows = _load_ohlcv_rows(s, tf, limit=240)
                     df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
                 except Exception:
                     df_struct = None
@@ -9599,14 +9947,14 @@ def _render_struct_context_text(symbol: str, tf: str, df=None, ctx=None) -> str:
         rows = None
         # 1) 입력 df 우선 사용, 없으면 로더
         if df is None:
-            rows = _load_ohlcv(symbol, tf, limit=LIMIT)
+            rows = _load_ohlcv_rows(symbol, tf, limit=LIMIT)
             df2  = _sce_build_df_from_ohlcv(rows) if rows else None
         else:
             df2 = df
         # 2) 폴백: 로더 부족 시 메인 분석 df를 강제 재사용
         if df2 is None or len(df2) < MIN_ROWS:
             try:
-                _rows_fb = _load_ohlcv(symbol, tf, limit=LIMIT)
+                _rows_fb = _load_ohlcv_rows(symbol, tf, limit=LIMIT)
                 _df_fb   = _sce_build_df_from_ohlcv(_rows_fb) if _rows_fb else None
                 if _df_fb is not None and len(_df_fb) >= MIN_ROWS:
                     df2 = _df_fb
@@ -9733,56 +10081,56 @@ def _num(x, default=None):
 # ============================================================================
 
 # === Structure overlay renderer (matplotlib) ==================================
-def render_struct_overlay(symbol: str, tf: str, df, struct_info, *,
-                          lookback_override: int|None=None,
-                          anchor_override: float|None=None,
-                          title_suffix: str|None=None,
+def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
+                          lookback_override: int | None = None,
+                          anchor_override: float | None = None,
+                          title_suffix: str = "",
                           save_dir: str = './charts', width: int = 1600, height: int = 900) -> str | None:
     """캔들 + 수평 레벨 + 추세선 + 채널을 그려 저장."""
 
     try:
         os.makedirs(save_dir, exist_ok=True)
-        if df is None or len(df) < 60 or struct_info is None:
+        df = _rows_to_df(rows_or_df)
+        if df is None or len(df) < 60:
             return None
 
-        o,h,l,c = df['open'].values, df['high'].values, df['low'].values, df['close'].values
+        N = len(df)
+        right = max(0, N - 1)
+        look = int(lookback_override or _tf_view_lookback(tf))
+        look = min(look, N) if N else look
+        anchor = float(anchor_override if anchor_override is not None else env_float("STRUCT_VIEW_ANCHOR", 0.68))
+        anchor = min(0.9, max(0.5, anchor))
+        left = max(0, right - int(look * anchor))
+        pad_l = env_int("STRUCT_VIEW_LEFT_PAD_BARS", 1)
+        pad_r = env_int("STRUCT_VIEW_RIGHT_PAD_BARS", 6)
+        x_start = max(0, left - pad_l)
+        view = df.iloc[x_start:right+1]
+
+        import matplotlib.dates as mdates
+        xs = [mdates.date2num(ts) for ts in view['timestamp']]
+        o, h, l, c = view['open'].values, view['high'].values, view['low'].values, view['close'].values
 
         dpi = 100
         fig = plt.figure(figsize=(width/dpi, height/dpi), dpi=dpi)
         ax = fig.add_subplot(111)
 
-        ax.set_title(f"{symbol} · {tf} · Structure Overlay", loc='left')
-
+        ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
 
         CANDLE_ALPHA = env_float('STRUCT_CANDLE_ALPHA', 0.95)
         CANDLE_W     = env_float('STRUCT_CANDLE_WIDTH', 0.7)
-        for i in range(len(df)):
+        w = (_TF_SEC.get(tf, 900) / 86400.0) * CANDLE_W
+        for i in range(len(view)):
             color = '#2ca02c' if c[i] >= o[i] else '#d62728'
-            ax.vlines(i, l[i], h[i], linewidth=1, color=color, alpha=CANDLE_ALPHA)
-            rb = Rectangle((i - CANDLE_W/2, min(o[i], c[i])),
-                           CANDLE_W, abs(c[i]-o[i]),
+            ax.vlines(xs[i], l[i], h[i], linewidth=1, color=color, alpha=CANDLE_ALPHA)
+            rb = Rectangle((xs[i] - w/2, min(o[i], c[i])), w, abs(c[i]-o[i]),
                            facecolor=color, edgecolor=color, alpha=CANDLE_ALPHA)
             ax.add_patch(rb)
 
-
-        # ====== VIEW WINDOW ======
-        N = len(df)
-        look = int(lookback_override or _tf_view_lookback(tf))
-        look = min(look, N) if N else look
-        anchor = float(anchor_override if anchor_override is not None else env_float('STRUCT_VIEW_ANCHOR', 0.68))
-        anchor = min(0.9, max(0.5, anchor))
-
-        cur = max(0, N-1)
-        left  = max(0, cur - int(look * anchor))
-        right_ix = left + look - 1
-        data_right = min(cur, right_ix)
-        pad_left  = env_int('STRUCT_VIEW_LEFT_PAD_BARS', 1)
-        pad_right = env_int('STRUCT_VIEW_RIGHT_PAD_BARS', 6)
-
-        x_min = max(0, left - pad_left)
-        x_max = right_ix + pad_right
-
-        view = df.iloc[left:data_right+1] if N else df
+        # ====== VIEW WINDOW (right = 실제 마지막 바) ======
+        if N:
+            right_dt = df.index[right]
+            left_dt = df.index[x_start]
+            ax.set_xlim(left_dt, right_dt + pd.Timedelta(seconds=_TF_SEC.get(tf, 900) * pad_r))
 
         # ====== Y RANGE ======
         y_min = float(view['low'].min()); y_max = float(view['high'].max())
@@ -9790,109 +10138,63 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info, *,
             lv = []
             if struct_info:
                 for it in (struct_info.get('levels') or []):
-                    if isinstance(it,(list,tuple)) and len(it)>=2:
+                    if isinstance(it, (list, tuple)) and len(it) >= 2:
                         v = _num(it[1]); lv.append(v)
             if lv:
                 y_min = min(y_min, min([v for v in lv if v is not None]))
                 y_max = max(y_max, max([v for v in lv if v is not None]))
         except Exception:
             pass
-        atr = _atr_fast(view)
+        atr = _atr_fast(df)
         y_pad = max((y_max - y_min) * 0.08, atr * env_float('STRUCT_VIEW_Y_PAD_ATR', 0.6))
 
-        ax = plt.gca()
-        ax.set_xlim(x_min, x_max)
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
         ax.margins(x=0.0, y=0.0)
         ax.autoscale(False)
+        ax.xaxis_date()
 
         # ====== 축 포맷 ======
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
         ax.grid(True, axis='y', ls='--', alpha=0.25)
 
-        dt = _idx_to_dt(df)
-        if dt is not None and N>0:
-            xt_count = max(2, env_int('STRUCT_XTICKS', 6))
-            step = max(1, (data_right - left + 1) // xt_count)
-            ticks = np.arange(left, data_right+1, step)
-            ax.set_xticks(ticks)
-            ax.set_xticklabels([dt[i].strftime(_tf_timefmt(tf)) for i in ticks], rotation=0, fontsize=8)
+        # === 구조 계산/드로잉 토글 ===
+        draw_sr   = env_bool("STRUCT_DRAW_SR", True)
+        draw_tl   = env_bool("STRUCT_DRAW_TL", True)
+        draw_reg  = env_bool("STRUCT_DRAW_REGCH", True)
+        draw_fib  = env_bool("STRUCT_DRAW_FIBCH", True)
 
-        # ====== R/S 라벨(왼쪽) ======
-        try:
-            if struct_info and struct_info.get('nearest'):
-                res = struct_info['nearest'].get('res')
-                sup = struct_info['nearest'].get('sup')
-                lx = x_min + 1
-                if res:
-                    level, dist = _num(res[1]), _num(res[2])
-                    ax.hlines(level, x_min, x_max, color='#d62728', lw=2, zorder=2)
-                    if level is not None:
-                        ax.text(lx, level, f"R {level:,.2f} ({dist:.2f}×ATR)",
-                                ha='left', va='bottom', fontsize=9, color='#d62728',
-                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#d62728', alpha=0.80))
-                if sup:
-                    level, dist = _num(sup[1]), _num(sup[2])
-                    ax.hlines(level, x_min, x_max, color='#1f77b4', lw=2, zorder=2)
-                    if level is not None:
-                        ax.text(lx, level, f"S {level:,.2f} ({dist:.2f}×ATR)",
-                                ha='left', va='top', fontsize=9, color='#1f77b4',
-                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#1f77b4', alpha=0.80))
-        except Exception as _e:
-            log(f"[STRUCT_RS_LABEL_WARN] {type(_e).__name__}: {_e}")
+        atr_n = env_int("STRUCT_ATR_N", 14)
+        if len(df) > atr_n + 2:
+            atr = float(ta_atr(df["high"], df["low"], df["close"], atr_n)[-1])
+        else:
+            atr = max(1.0, (df["high"]-df["low"]).tail(atr_n).mean())
 
-        # ====== 추세/채널 라벨 & 범례(핸들 존재 때만) ======
-        try:
-            if struct_info and struct_info.get('trend_lines'):
-                for tl in struct_info['trend_lines']:
-                    d = tl.get('dir',''); c = '#2ca02c' if d=='up' else '#ff7f0e'
-                    (x1,y1) = tl.get('p1',(left, view['close'].iloc[0]))
-                    (x2,y2) = tl.get('p2',(data_right, view['close'].iloc[-1]))
-                    x1,x2 = max(x_min,min(x1,x_max)), max(x_min,min(x2,x_max))
-                    ax.plot([x1,x2],[y1,y2], ls='--', lw=1.8, color=c, zorder=2, label=f"{'상승' if d=='up' else '하락'} TL")
-            if struct_info and struct_info.get('channels'):
-                for ch in struct_info['channels']:
-                    typ = ch.get('type','')
-                    if typ=='reg':
-                        top,bot = _num(ch.get('top')), _num(ch.get('bot'))
-                        if top: ax.hlines(top, x_min, x_max, colors='#9467bd', linestyles=':', lw=1.5, zorder=1)
-                        if bot: ax.hlines(bot, x_min, x_max, colors='#9467bd', linestyles=':', lw=1.5, zorder=1)
-                    elif typ=='fib':
-                        for r,p in ch.get('levels', []):
-                            p=_num(p)
-                            if p: ax.hlines(p, x_min, x_max, colors='#17becf', linestyles='--', lw=1.2, zorder=1)
-            handles, labels = ax.get_legend_handles_labels()
-            if labels:
-                leg = ax.legend(loc='upper left', fontsize=9, frameon=True)
-                leg.get_frame().set_alpha(0.85)
-        except Exception as _e:
-            log(f"[STRUCT_LABEL_WARN] {type(_e).__name__}: {_e}")
+        if draw_sr:
+            levels = _levels_from_info_or_df(struct_info, df, atr)
+            _draw_levels(ax, df, levels, atr)
 
-        # ====== 가격 윤곽(EMA20/50) + 최종가 보조선 ======
+        if draw_tl:
+            tls = _trendlines_from_info_or_df(struct_info, df)
+            _draw_tls(ax, df, tls)
 
-        if env_bool('STRUCT_BASELINES_ON', True):
-            try:
-                cvals = df['close'].values
-                s = pd.Series(cvals)
-                ema20 = s.ewm(span=20, adjust=False).mean().values
-                ema50 = s.ewm(span=50, adjust=False).mean().values
-                xs = np.arange(N)
+        if draw_reg:
+            _draw_reg_channel(ax, df, k=env_float("STRUCT_REGCH_K", 1.0))
 
-                ax.plot(xs, ema20, lw=1.1, alpha=0.8, color='#666666', label='_ema20')
-                ax.plot(xs, ema50, lw=1.1, alpha=0.6, color='#999999', label='_ema50')
-            except Exception as _e:
-                log(f"[STRUCT_BASELINES_WARN] {type(_e).__name__}: {_e}")
+        if draw_fib:
+            base = None
+            if struct_info and isinstance(struct_info, dict):
+                base = struct_info.get("fib_base")
+            fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
+            _draw_fib_channel(ax, df, base=base, levels=fib_levels)
 
-        if env_bool('STRUCT_LAST_PRICE_LINE', True) and N>0:
-            last = float(df['close'].iloc[-1])
-            ax.hlines(last, x_min, x_max, color='#666666', ls='--', lw=1, alpha=0.3)
-
-        if title_suffix:
-            ax.set_title(f"{symbol} · {tf} · Structure Overlay {title_suffix}", loc='left')
-
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            leg = ax.legend(loc='upper left', fontsize=9, frameon=True)
+            leg.get_frame().set_alpha(0.85)
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
-        out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{int(time.time())}.png")
+        name = "near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view")
+        out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{name}_{int(time.time())}.png")
         fig.savefig(out, dpi=140, bbox_inches='tight', pad_inches=0.1)
 
         plt.close(fig)
@@ -9907,46 +10209,46 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info, *,
 
 # ===========================================================================
 
-def render_struct_overlay_pair(symbol, tf, df, struct_info):
-    """근접(near) + 원경(macro) 두 장 생성 (서로 다른 lookback/anchor)."""
-    paths = []
-    lb_near = _tf_view_lookback(tf)
-    an_near = env_float('STRUCT_VIEW_ANCHOR', 0.68)
-    p1 = render_struct_overlay(symbol, tf, df, struct_info,
-                               lookback_override=lb_near,
-                               anchor_override=an_near,
-                               title_suffix='· Near')
-    if p1:
-        paths.append(p1)
-
-    lb_macro = int(lb_near * env_float('STRUCT_VIEW_MACRO_MULT', 3.0))
-    an_macro = env_float('STRUCT_VIEW_ANCHOR_MACRO', 0.85)
-    p2 = render_struct_overlay(symbol, tf, df, struct_info,
-                               lookback_override=lb_macro,
-                               anchor_override=an_macro,
-                               title_suffix='· Macro')
-    if p2:
-        paths.append(p2)
-
-    return paths
-
 
 
 
 async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
     """심볼/TF 한 쌍에 대한 PDF를 생성하고 첨부로 전송."""
     try:
-        rows = _load_ohlcv(symbol, tf, limit=400)
-        df = _sce_build_df_from_ohlcv(rows) if rows else None
+        try:
+            df = _load_ohlcv(symbol, tf, limit=400)
+        except Exception:
+            df = None
         if df is None or len(df) < 60:
             await channel.send(content=f"[REPORT] {symbol} {tf}: 데이터 부족으로 PDF 생략")
             return
 
         # SCE 컨텍스트/오버레이
+        _log_panel_source(symbol, tf, df)
         struct_info = build_struct_context_basic(df, tf)
 
         async with RENDER_SEMA:
-            struct_img  = await asyncio.to_thread(render_struct_overlay, symbol, tf, df, struct_info)
+            lb = _tf_view_lookback(tf)
+            struct_img = await asyncio.to_thread(
+                render_struct_overlay,
+                symbol,
+                tf,
+                df,
+                struct_info,
+                lookback_override=lb,
+                anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                title_suffix="· Near",
+            )
+            macro_img = await asyncio.to_thread(
+                render_struct_overlay,
+                symbol,
+                tf,
+                df,
+                struct_info,
+                lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                title_suffix="· Macro",
+            )
 
 
         # 기본 값들(필요 최소치만)
@@ -9970,7 +10272,8 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 df=df, tf=tf, signal=signal, price=price, score=score,
                 reasons=reasons, weights=weights,
                 agree_long=agree_long, agree_short=agree_short, now=now,
-                output_path=outfile, chart_imgs=[struct_img] if struct_img else None, chart_img=None, ichimoku_img=None,
+                output_path=outfile,
+                chart_imgs=[p for p in (struct_img, macro_img) if p], chart_img=None, ichimoku_img=None,
                 daily_change_pct=None, discord_message=None,
                 symbol=symbol, entry_price=None, entry_time=None,
                 struct_info=struct_info, struct_img=struct_img
@@ -10943,12 +11246,45 @@ async def generate_pnl_pdf():
 # [ANCHOR] OLDSTYLE_REPORT_BEGIN
 async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
     # 데이터/지표
-    df = get_ohlcv(symbol, tf, limit=300)
+    df = _load_ohlcv(symbol, tf, limit=300)
     df = add_indicators(df)
 
     # 차트/리포트 산출물
     async with RENDER_SEMA:
+        _log_panel_source(symbol, tf, df)
         chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
+        # === [PATCH] 구조 오버레이 near/macro 2장 생성 & 첨부(앞쪽) ===
+        try:
+            rows_struct = _load_ohlcv_rows(symbol, tf, limit=400)
+            df_struct   = _rows_to_df(rows_struct) if rows_struct else None
+        except Exception:
+            rows_struct, df_struct = [], None
+        if (not rows_struct) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
+            # 안전 폴백: 현재 df 사용
+            rows_struct = df[['ts','open','high','low','close','volume']].values.tolist() if hasattr(df, 'values') else []
+            df_struct   = _rows_to_df(rows_struct)
+        struct_imgs = []
+        try:
+            if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
+                struct_info = build_struct_context_basic(df_struct, tf)
+                lb = _tf_view_lookback(tf)
+                near_img  = render_struct_overlay(
+                    symbol, tf, df_struct, struct_info,
+                    lookback_override=lb,
+                    anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                    title_suffix="· Near",
+                )
+                macro_img = render_struct_overlay(
+                    symbol, tf, df_struct, struct_info,
+                    lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                    anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                    title_suffix="· Macro",
+                )
+                struct_imgs = [p for p in (near_img, macro_img) if p]
+                if struct_imgs:
+                    chart_files = struct_imgs + list(chart_files)  # 구조 2장을 앞에 PREPEND → 총 6장
+        except Exception as _e:
+            log(f"[STRUCT_IMG_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
     performance_file   = generate_performance_stats(tf, symbol=symbol)
@@ -11039,7 +11375,9 @@ async def safe_get_ohlcv(symbol, tf, **kwargs):
     return await asyncio.to_thread(get_ohlcv, symbol, tf, **kwargs)
 
 async def safe_add_indicators(df):
-    return await asyncio.to_thread(add_indicators, df)
+    df = _rows_to_df(df)
+    await asyncio.to_thread(add_indicators, df)
+    return df
 
 # ========== 비트 이더 구분 헬퍼 ==========
 def _get_channel_or_skip(asset: str, tf: str):
@@ -11445,7 +11783,9 @@ async def on_ready():
                         pnl = ((entry_price - price) / entry_price) * 100
 
 
+                chart_files = []
                 async with RENDER_SEMA:
+                    _log_panel_source(symbol_eth, tf, df)
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_eth, tf)
 
                 # [PATCH A1-BEGIN]  << ETH struct overlay fallback & attach-first >>
@@ -11453,29 +11793,45 @@ async def on_ready():
                 # 개선: rows 실패/부족 시 현재 df를 폴백으로 사용(컬럼 동일 가정)
 
                 try:
-                    rows = _load_ohlcv(symbol_eth, tf, limit=400)
-                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                    rows_struct = _load_ohlcv_rows(symbol_eth, tf, limit=400)
+                    df_struct = _rows_to_df(rows_struct)
                 except Exception:
-                    df_struct = None
+                    rows_struct, df_struct = [], None
 
-                # 폴백: 기존 분석에 사용된 df로 대체 (최소행수 만족 시)
-                if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
-                    df_struct = df.copy()
+                if (not rows_struct) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
+                    rows_struct = df[['ts','open','high','low','close','volume']].values.tolist() if hasattr(df, 'values') else []
+                    df_struct = _rows_to_df(rows_struct)
 
+                struct_imgs = []
                 struct_info = None
-                struct_imgs = None
-                struct_img = None
                 try:
-                    if df_struct is not None:
+                    if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
+                        _log_panel_source(symbol_eth, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
-                        struct_imgs = render_struct_overlay_pair(symbol_eth, tf, df_struct, struct_info)
+                        lb = _tf_view_lookback(tf)
+                        near_img  = render_struct_overlay(
+                            symbol_eth,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=lb,
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                            title_suffix="· Near",
+                        )
+                        macro_img = render_struct_overlay(
+                            symbol_eth,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                            title_suffix="· Macro",
+                        )
+                        struct_imgs = [p for p in (near_img, macro_img) if p]
+                        if struct_info is not None:
+                            _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, near_img)
                         if struct_imgs:
-                            struct_img = struct_imgs[0]
-                        if df_struct is not None and struct_info is not None:
-                            _struct_cache_put(symbol_eth, tf, _df_last_ts(df_struct), struct_info, struct_img)
-                        if struct_imgs:
-                            chart_files = list(struct_imgs) + list(chart_files)
-
+                            chart_files = struct_imgs + list(chart_files)
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_eth} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A1-END]
@@ -11585,11 +11941,11 @@ async def on_ready():
                 # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
                 final_files_paths = []
 
-                if 'struct_imgs' in locals() and struct_imgs:
+                if struct_imgs:
                     final_files_paths += [p for p in struct_imgs if p]
                 # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
-                if 'chart_files' in locals() and chart_files:
-                    final_files_paths += [p for p in chart_files if p and (p not in (struct_imgs or []))]
+                if chart_files:
+                    final_files_paths += [p for p in chart_files if p and (p not in struct_imgs)]
 
 
                 await _discord_send_chunked(
@@ -11678,7 +12034,7 @@ async def on_ready():
                 except Exception as e:
                     log(f"[CTX_PREFETCH_ERR] {symbol_btc} {e}")
 
-                df = await safe_get_ohlcv(symbol_btc, tf, limit=300)
+                df = _rows_to_df(await safe_get_ohlcv(symbol_btc, tf, limit=300))
                 # 신호 계산 후 즉시 닫힌 봉 값 확정
                 c_o, c_h, c_l, c_c = closed_ohlc(df)
                 c_ts = closed_ts(df)
@@ -11998,34 +12354,53 @@ async def on_ready():
                   )
 
 
+                chart_files = []
                 async with RENDER_SEMA:
+                    _log_panel_source(symbol_btc, tf, df)
                     chart_files = await asyncio.to_thread(save_chart_groups, df, symbol_btc, tf)
 
 
                 # [PATCH A2-BEGIN]  << BTC struct overlay fallback & attach-first >>
                 try:
-                    rows = _load_ohlcv(symbol_btc, tf, limit=400)
-                    df_struct = _sce_build_df_from_ohlcv(rows) if rows else None
+                    rows_struct = _load_ohlcv_rows(symbol_btc, tf, limit=400)
+                    df_struct = _rows_to_df(rows_struct)
                 except Exception:
-                    df_struct = None
+                    rows_struct, df_struct = [], None
 
-                if (df_struct is None) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
-                    df_struct = df.copy()
+                if (not rows_struct) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
+                    rows_struct = df[['ts','open','high','low','close','volume']].values.tolist() if hasattr(df, 'values') else []
+                    df_struct = _rows_to_df(rows_struct)
 
+                struct_imgs = []
                 struct_info = None
-                struct_imgs = None
-                struct_img = None
                 try:
-                    if df_struct is not None:
+                    if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
+                        _log_panel_source(symbol_btc, tf, df_struct)
                         struct_info = build_struct_context_basic(df_struct, tf)
-                        struct_imgs = render_struct_overlay_pair(symbol_btc, tf, df_struct, struct_info)
+                        lb = _tf_view_lookback(tf)
+                        near_img  = render_struct_overlay(
+                            symbol_btc,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=lb,
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                            title_suffix="· Near",
+                        )
+                        macro_img = render_struct_overlay(
+                            symbol_btc,
+                            tf,
+                            df_struct,
+                            struct_info,
+                            lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                            anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                            title_suffix="· Macro",
+                        )
+                        struct_imgs = [p for p in (near_img, macro_img) if p]
+                        if struct_info is not None:
+                            _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, near_img)
                         if struct_imgs:
-                            struct_img = struct_imgs[0]
-                        if df_struct is not None and struct_info is not None:
-                            _struct_cache_put(symbol_btc, tf, _df_last_ts(df_struct), struct_info, struct_img)
-                        if struct_imgs:
-                            chart_files = list(struct_imgs) + list(chart_files)
-
+                            chart_files = struct_imgs + list(chart_files)
                 except Exception as _e:
                     log(f"[STRUCT_IMG_WARN] {symbol_btc} {tf} {type(_e).__name__}: {_e}")
                 # [PATCH A2-END]
@@ -12070,11 +12445,11 @@ async def on_ready():
                 # [ATTACH_FIX] 오버레이가 None이 아니면 항상 첫 번째 첨부가 되도록 보정
                 final_files_paths = []
 
-                if 'struct_imgs' in locals() and struct_imgs:
+                if struct_imgs:
                     final_files_paths += [p for p in struct_imgs if p]
                 # chart_files가 다른 곳에서 재할당되었더라도 최종 병합
-                if 'chart_files' in locals() and chart_files:
-                    final_files_paths += [p for p in chart_files if p and (p not in (struct_imgs or []))]
+                if chart_files:
+                    final_files_paths += [p for p in chart_files if p and (p not in struct_imgs)]
 
 
                 await _discord_send_chunked(
@@ -12198,7 +12573,7 @@ async def on_message(message):
 
             # 3) 네트워크(워커 스레드) 최후 시도
             if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
-                rows = await asyncio.to_thread(_load_ohlcv, symbol, tf, 400)
+                rows = await asyncio.to_thread(_load_ohlcv_rows, symbol, tf, 400)
                 df = _sce_build_df_from_ohlcv(rows) if rows else None
 
             if df is None or len(df) < env_int("SCE_MIN_ROWS", 60):
@@ -12536,10 +12911,10 @@ async def on_message(message):
             await message.channel.send(f"❌ {ve}")
             return
 
-        df = get_ohlcv(symbol, tf, limit=300)
+        df = _rows_to_df(get_ohlcv(symbol, tf, limit=300))
         df = add_indicators(df)
 
-        df_1d = get_ohlcv(symbol, '1d', limit=300)
+        df_1d = _rows_to_df(get_ohlcv(symbol, '1d', limit=300))
         signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df,tf, symbol)
         now = datetime.now().strftime("%Y-%m-%d %H:%M")
 
@@ -12568,6 +12943,7 @@ async def on_message(message):
             )
         
         async with RENDER_SEMA:
+            _log_panel_source(symbol, tf, df)
             chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
 
 
@@ -12584,9 +12960,19 @@ async def on_message(message):
                 confluence_eps=env_float("STRUCT_EPS", 0.4),
             )
             if os.getenv("STRUCT_OVERLAY_IMAGE", "1") == "1":
-
                 async with RENDER_SEMA:
-                    struct_img = await asyncio.to_thread(render_struct_overlay, symbol, tf, df_struct, struct_info)
+                    lb = _tf_view_lookback(tf)
+                    _log_panel_source(symbol, tf, df_struct)
+                    struct_img = await asyncio.to_thread(
+                        render_struct_overlay,
+                        symbol,
+                        tf,
+                        df_struct,
+                        struct_info,
+                        lookback_override=lb,
+                        anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                        title_suffix="· Near",
+                    )
 
                 if struct_img:
                     chart_files = [struct_img] + list(chart_files)
@@ -12686,7 +13072,7 @@ async def on_message(message):
     elif message.content.startswith("!지표"):
         tf = parts[1] if len(parts) > 1 else "1h"
         symbol = 'ETH/USDT'  # 기본 심볼
-        df = get_ohlcv(symbol, tf)
+        df = _rows_to_df(get_ohlcv(symbol, tf))
         df = add_indicators(df)
         signal, price, rsi, macd, reasons, score, weights, agree_long, agree_short, weights_detail = calculate_signal(df, tf, symbol)
 
