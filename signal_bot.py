@@ -758,6 +758,38 @@ def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame, tf:str=None):
     if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2], "scale": tl_scale})
     return tls
 
+# === level normalizer =========================================
+def _norm_level_item(item):
+    """Return (price, label) from tuple/list/dict/scalar."""
+    if item is None:
+        raise ValueError("empty level")
+    if isinstance(item, (list, tuple)):
+        if len(item) == 0:
+            raise ValueError("bad level: empty tuple")
+        price = float(item[0])
+        label = ""
+        if len(item) >= 2 and isinstance(item[1], (str, int, float)):
+            label = str(item[1])
+        elif len(item) >= 3 and isinstance(item[2], (str, int, float)):
+            label = str(item[2])
+        return price, label
+    if isinstance(item, dict):
+        price = item.get("price") or item.get("p") or item.get("level")
+        label = item.get("label") or item.get("name") or item.get("tag") or ""
+        return float(price), str(label)
+    if isinstance(item, (int, float)):
+        return float(item), ""
+    raise ValueError(f"bad level type: {type(item)}")
+
+def _norm_levels(seq):
+    out = []
+    for it in (seq or []):
+        try:
+            out.append(_norm_level_item(it))
+        except Exception:
+            continue
+    return out
+
 # === nearby level merge (R/S within eps*ATR) ================================
 def _merge_nearby_levels(levels, atr: float, eps_factor: float = 0.25):
     if not levels or atr is None or atr <= 0:
@@ -790,10 +822,19 @@ def _merge_nearby_levels(levels, atr: float, eps_factor: float = 0.25):
 def _draw_levels(ax, df, levels, atr):
 
     """R/S 수평선 + 라벨 (근접 병합, R1/S1 강조, 거리기반 페이드)"""
-    if not levels: return
+    if not levels:
+        return
+    close = float(df["close"].iloc[-1]) if len(df) else None
+    if levels and not isinstance(levels[0], dict):
+        norm = _norm_levels(levels)
+        levels = [
+            {"type": "R" if (close is not None and price >= close) else "S",
+             "price": price,
+             "name": label}
+            for price, label in norm
+        ]
     levels = _merge_nearby_levels(levels, atr, eps_factor=env_float("STRUCT_LEVEL_MERGE_ATR", 0.25))
 
-    close = float(df["close"].iloc[-1]) if len(df) else None
     def _nearest(tp):
         cand = [lv for lv in levels if (lv.get("type","R")).upper()==tp]
         if not cand or close is None: return None
@@ -876,8 +917,10 @@ def _draw_reg_channel(ax, df, k=None, tf: str=None):
     x = np.arange(len(df))
     y = df["close"].values.astype(float)
 
+
     calc = _calc_scale() or _decide_scale(tf)
     y_t = _to_scale(y, calc)
+
 
     # robust OLS (keep ols as requested)
     a, b = np.polyfit(x, y_t, 1)
@@ -911,7 +954,9 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
             mid_on = env_bool("STRUCT_FIB_MIDLINES_INTRADAY", False)
         levels = [float(x) for x in lv_s.split(",") if x]
     else:
-        mid_on = False
+
+        levels = [p for p,_ in _norm_levels(levels)]
+
 
     x = np.arange(len(df)); y = df["close"].values.astype(float)
     calc = _calc_scale() or _decide_scale(tf)
