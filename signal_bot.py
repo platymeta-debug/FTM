@@ -10176,7 +10176,6 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
         ax.grid(True, axis='y', ls='--', alpha=0.25)
 
-
         # === 구조 계산/드로잉 토글 ===
         draw_sr   = env_bool("STRUCT_DRAW_SR", True)
         draw_tl   = env_bool("STRUCT_DRAW_TL", True)
@@ -10262,6 +10261,17 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 title_suffix="· Near",
             )
 
+            macro_img = await asyncio.to_thread(
+                render_struct_overlay,
+                symbol,
+                tf,
+                df,
+                struct_info,
+                lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                title_suffix="· Macro",
+            )
+
 
 
         # 기본 값들(필요 최소치만)
@@ -10285,7 +10295,8 @@ async def _make_and_send_pdf_report(symbol: str, tf: str, channel):
                 df=df, tf=tf, signal=signal, price=price, score=score,
                 reasons=reasons, weights=weights,
                 agree_long=agree_long, agree_short=agree_short, now=now,
-                output_path=outfile, chart_imgs=[struct_img] if struct_img else None, chart_img=None, ichimoku_img=None,
+                output_path=outfile,
+                chart_imgs=[p for p in (struct_img, macro_img) if p], chart_img=None, ichimoku_img=None,
                 daily_change_pct=None, discord_message=None,
                 symbol=symbol, entry_price=None, entry_time=None,
                 struct_info=struct_info, struct_img=struct_img
@@ -11265,6 +11276,38 @@ async def _send_report_oldstyle(client, channel, symbol: str, tf: str):
     async with RENDER_SEMA:
         _log_panel_source(symbol, tf, df)
         chart_files        = await asyncio.to_thread(save_chart_groups, df, symbol, tf)           # 4장
+        # === [PATCH] 구조 오버레이 near/macro 2장 생성 & 첨부(앞쪽) ===
+        try:
+            rows_struct = _load_ohlcv_rows(symbol, tf, limit=400)
+            df_struct   = _rows_to_df(rows_struct) if rows_struct else None
+        except Exception:
+            rows_struct, df_struct = [], None
+        if (not rows_struct) and (df is not None) and (len(df) >= env_int("SCE_MIN_ROWS", 60)):
+            # 안전 폴백: 현재 df 사용
+            rows_struct = df[['ts','open','high','low','close','volume']].values.tolist() if hasattr(df, 'values') else []
+            df_struct   = _rows_to_df(rows_struct)
+        struct_imgs = []
+        try:
+            if df_struct is not None and len(df_struct) >= env_int("SCE_MIN_ROWS",60):
+                struct_info = build_struct_context_basic(df_struct, tf)
+                lb = _tf_view_lookback(tf)
+                near_img  = render_struct_overlay(
+                    symbol, tf, df_struct, struct_info,
+                    lookback_override=lb,
+                    anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
+                    title_suffix="· Near",
+                )
+                macro_img = render_struct_overlay(
+                    symbol, tf, df_struct, struct_info,
+                    lookback_override=int(lb*env_float("STRUCT_VIEW_MACRO_MULT",3.0)),
+                    anchor_override=env_float("STRUCT_VIEW_ANCHOR_MACRO",0.85),
+                    title_suffix="· Macro",
+                )
+                struct_imgs = [p for p in (near_img, macro_img) if p]
+                if struct_imgs:
+                    chart_files = struct_imgs + list(chart_files)  # 구조 2장을 앞에 PREPEND → 총 6장
+        except Exception as _e:
+            log(f"[STRUCT_IMG_WARN] {symbol} {tf} {type(_e).__name__}: {_e}")
     score_file         = plot_score_history(symbol, tf)
     perf_file          = analyze_performance_for(symbol, tf)
     performance_file   = generate_performance_stats(tf, symbol=symbol)
