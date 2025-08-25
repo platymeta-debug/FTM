@@ -458,7 +458,6 @@ def _row_to_ohlcv(row):
     )
 
 def _rows_to_df(rows):
-
     """list 기반 OHLCV를 pandas DataFrame으로 안전 변환."""
     import pandas as _pd
 
@@ -511,11 +510,9 @@ def _rows_to_df(rows):
     cols = [c for c in ["ts","time","open","high","low","close","volume","timestamp"] if c in df.columns]
     return df[cols]
 
-
 def _log_panel_source(symbol: str, tf: str, rows_or_df):
     try:
         df = _rows_to_df(rows_or_df)
-
         df = df.sort_values('timestamp') if 'timestamp' in df.columns else df
 
         if len(df) == 0:
@@ -526,6 +523,142 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
         log(f"[PANEL_SOURCE] {symbol} {tf} len={len(df)} first={fts} last={lts}")
     except Exception as e:
         log(f"[PANEL_SOURCE_WARN] {symbol} {tf} {type(e).__name__}: {e}")
+
+
+# ==== Structure calc & draw helpers ==========================================
+def ta_atr(high, low, close, n=14):
+    h = pd.Series(high, dtype=float)
+    l = pd.Series(low, dtype=float)
+    c = pd.Series(close, dtype=float)
+    prev = c.shift(1)
+    tr = pd.concat([h - l, (h - prev).abs(), (l - prev).abs()], axis=1).max(axis=1)
+    return tr.rolling(n).mean().values
+
+def _pivot_points(df: pd.DataFrame, w: int = None):
+    """단순 피벗(high/low) 검출: 좌우 w 봉보다 높/낮으면 피벗."""
+    if w is None:
+        w = env_int("STRUCT_PIVOT_WINDOW", 3)
+    H = df["high"].values; L = df["low"].values
+    pivH, pivL = [], []
+    for i in range(w, len(df)-w):
+        if H[i] == max(H[i-w:i+w+1]): pivH.append(i)
+        if L[i] == min(L[i-w:i+w+1]): pivL.append(i)
+    return pivH, pivL
+
+def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
+    """struct_info에 레벨이 없으면 DF 기반으로 자동 생성(ATH/ATL/최근 피벗)."""
+    levels = []
+    if struct_info and isinstance(struct_info, dict):
+        levels = struct_info.get("levels", []) or []
+    if not levels:
+        pivH, pivL = _pivot_points(df)
+        selH = sorted(pivH[-8:], key=lambda i: df["high"].iloc[i], reverse=True)[:2]
+        selL = sorted(pivL[-8:], key=lambda i: df["low"].iloc[i])[:2]
+        if len(df):
+            levels.append({"type":"R","price": float(df["high"].max()), "name":"ATH"})
+            levels.append({"type":"S","price": float(df["low"].min()),  "name":"ATL"})
+        for i in selH:
+            levels.append({"type":"R","price": float(df["high"].iloc[i]), "name":"PH"})
+        for i in selL:
+            levels.append({"type":"S","price": float(df["low"].iloc[i]),  "name":"PL"})
+    close = float(df["close"].iloc[-1]) if len(df) else None
+    out = []
+    for lv in levels:
+        p = float(lv.get("price", 0.0))
+        d_atr = abs((close - p))/atr if close and atr>0 else None
+        out.append({**lv, "dist_atr": d_atr})
+    out = sorted(out, key=lambda x: (x["dist_atr"] if x["dist_atr"] is not None else 9e9))[:env_int("STRUCT_MAX_LEVELS", 6)]
+    return out
+
+def _best_trendlines(df: pd.DataFrame):
+    """struct_info 없으면 최근 피벗 2점 조합으로 상/하향 추세선 후보 탐색."""
+    pivH, pivL = _pivot_points(df)
+    x = np.arange(len(df))
+    up, dn = None, None
+    if len(pivL) >= 2:
+        i1, i2 = pivL[-2], pivL[-1]
+        m = (df["low"].iloc[i2]-df["low"].iloc[i1])/(x[i2]-x[i1]+1e-9)
+        b = df["low"].iloc[i2] - m*x[i2]
+        up = ("up", m, b)
+    if len(pivH) >= 2:
+        i1, i2 = pivH[-2], pivH[-1]
+        m = (df["high"].iloc[i2]-df["high"].iloc[i1])/(x[i2]-x[i1]+1e-9)
+        b = df["high"].iloc[i2] - m*x[i2]
+        dn = ("down", m, b)
+    return up, dn
+
+def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame):
+    tls = []
+    if struct_info and isinstance(struct_info, dict):
+        tls = struct_info.get("trendlines", []) or []
+        if tls:
+            return tls
+    up, dn = _best_trendlines(df)
+    if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
+    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
+    return tls
+
+def _draw_levels(ax, df, levels, atr):
+    """R/S 수평선 + 라벨."""
+    if not levels: return
+    x0 = df.index[0]; x1 = df.index[-1]
+    for lv in levels:
+        p = lv["price"]; tp = lv.get("type","R")
+        c = ("#d9534f" if tp=="R" else "#0275d8")
+        lw = 2.2 if (lv.get("dist_atr") or 9) < 0.5 else 1.4
+        ax.hlines(p, x0, x1, colors=c, linewidths=lw, linestyles="-")
+        if env_bool("STRUCT_LABELS_ON", True):
+            txt = f'{tp} {p:,.2f}'
+            if lv.get("dist_atr") is not None:
+                txt += f' ({lv["dist_atr"]:.2f}×ATR)'
+            ax.text(x0, p, txt, fontsize=9, color=c, va="bottom", ha="left",
+                    bbox=dict(facecolor="white", alpha=0.6, edgecolor="none"))
+
+def _draw_tls(ax, df, tls):
+    if not tls: return
+    x = np.arange(len(df)); xdt = df.index
+    for t in tls:
+        m = float(t["m"]); b = float(t["b"])
+        y = m*x + b
+        if t.get("dir")=="up":
+            ax.plot(xdt, y, linestyle="--", color="#28a745", linewidth=1.6, label="up TL")
+        else:
+            ax.plot(xdt, y, linestyle="--", color="#dc3545", linewidth=1.6, label="down TL")
+
+def _draw_reg_channel(ax, df, k=None):
+    if k is None: k = env_float("STRUCT_REGCH_K", 1.0)
+    if k <= 0 or len(df) < 20: return
+    x = np.arange(len(df)); y = df["close"].values
+    a, b = np.polyfit(x, y, 1)
+    yhat = a*x + b
+    resid = y - yhat
+    sigma = np.std(resid)
+    ax.plot(df.index, yhat, color="#6f42c1", linewidth=1.6, label="Reg μ")
+    ax.plot(df.index, yhat + k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"+{k}σ")
+    ax.plot(df.index, yhat - k*sigma, color="#6f42c1", linewidth=1.0, linestyle=":", label=f"-{k}σ")
+
+def _draw_fib_channel(ax, df, base=None, levels=None):
+    """기준 추세선(두 점) + MAD/σ 스케일로 평행선."""
+    if levels is None:
+        levels = [0.382, 0.5, 0.618, 1.0]
+    if len(df) < 30: return
+    x = np.arange(len(df)); y = df["close"].values
+    if not base:
+        i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
+        if i0 == i1: return
+        base = (i0, i1)
+    i0, i1 = base
+    m = (y[i1]-y[i0])/(x[i1]-x[i0] + 1e-9); b = y[i0] - m*x[i0]
+    y0 = m*x + b
+    resid = y - y0
+    mad = np.median(np.abs(resid - np.median(resid)))
+    scale = (1.4826*mad) if mad>0 else np.std(resid)
+    clr = "#20c997"
+    ax.plot(df.index, y0, color=clr, linewidth=1.4, label="Fib base")
+    for lv in levels:
+        ax.plot(df.index, y0 + lv*scale, color=clr, linewidth=1.0, linestyle="--", label=f"Fib {lv}")
+        ax.plot(df.index, y0 - lv*scale, color=clr, linewidth=1.0, linestyle="--")
+# =============================================================================
 
 
 def candle_price(kl_last):
@@ -9970,7 +10103,8 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         os.makedirs(save_dir, exist_ok=True)
 
         df = _rows_to_df(rows_or_df)
-        if df is None or len(df) < 60 or struct_info is None:
+        if df is None or len(df) < 60:
+
             return None
 
         N = len(df)
@@ -10042,68 +10176,43 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         ax.yaxis.set_major_formatter(FuncFormatter(lambda v,_: f"{v:,.0f}"))
         ax.grid(True, axis='y', ls='--', alpha=0.25)
 
-        # ====== R/S 라벨(왼쪽) ======
-        try:
-            if struct_info and struct_info.get('nearest'):
-                res = struct_info['nearest'].get('res')
-                sup = struct_info['nearest'].get('sup')
-                if res:
-                    level, dist = _num(res[1]), _num(res[2])
-                    ax.hlines(level, ax.get_xlim()[0], ax.get_xlim()[1], color='#d62728', lw=2, zorder=2)
-                    if level is not None:
 
-                        ax.text(ax.get_xlim()[0], level + atr*0.05,
-                                f"R {level:,.2f} ({dist:.2f}×ATR)",
-                                ha='left', va='bottom', fontsize=9, color='#d62728',
-                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#d62728', alpha=0.80),
-                                clip_on=False)
+        # === 구조 계산/드로잉 토글 ===
+        draw_sr   = env_bool("STRUCT_DRAW_SR", True)
+        draw_tl   = env_bool("STRUCT_DRAW_TL", True)
+        draw_reg  = env_bool("STRUCT_DRAW_REGCH", True)
+        draw_fib  = env_bool("STRUCT_DRAW_FIBCH", True)
 
-                if sup:
-                    level, dist = _num(sup[1]), _num(sup[2])
-                    ax.hlines(level, ax.get_xlim()[0], ax.get_xlim()[1], color='#1f77b4', lw=2, zorder=2)
-                    if level is not None:
+        atr_n = env_int("STRUCT_ATR_N", 14)
+        if len(df) > atr_n + 2:
+            atr = float(ta_atr(df["high"], df["low"], df["close"], atr_n)[-1])
+        else:
+            atr = max(1.0, (df["high"]-df["low"]).tail(atr_n).mean())
 
-                        ax.text(ax.get_xlim()[0], level - atr*0.05,
-                                f"S {level:,.2f} ({dist:.2f}×ATR)",
-                                ha='left', va='top', fontsize=9, color='#1f77b4',
-                                bbox=dict(boxstyle='round,pad=0.25', fc='white', ec='#1f77b4', alpha=0.80),
-                                clip_on=False)
+        if draw_sr:
+            levels = _levels_from_info_or_df(struct_info, df, atr)
+            _draw_levels(ax, df, levels, atr)
 
-        except Exception as _e:
-            log(f"[STRUCT_RS_LABEL_WARN] {type(_e).__name__}: {_e}")
+        if draw_tl:
+            tls = _trendlines_from_info_or_df(struct_info, df)
+            _draw_tls(ax, df, tls)
 
-        # ====== 추세/채널 라벨 & 범례(핸들 존재 때만) ======
-        try:
-            handles_present = False
-            if struct_info and struct_info.get('trend_lines'):
-                for tl in struct_info['trend_lines']:
-                    d = tl.get('dir',''); c = '#2ca02c' if d=='up' else '#ff7f0e'
-                    (x1,y1) = tl.get('p1',(xs[0], df['close'].iloc[0]))
-                    (x2,y2) = tl.get('p2',(xs[-1], df['close'].iloc[-1]))
-                    ax.plot([x1,x2],[y1,y2], ls='--', lw=1.8, color=c, zorder=2, label=f"{'상승' if d=='up' else '하락'} TL")
-                    handles_present = True
-            if struct_info and struct_info.get('channels'):
-                for ch in struct_info['channels']:
-                    typ = ch.get('type','')
-                    if typ=='reg':
-                        top,bot = _num(ch.get('top')), _num(ch.get('bot'))
-                        if top: ax.hlines(top, ax.get_xlim()[0], ax.get_xlim()[1], colors='#9467bd', linestyles=':', lw=1.5, zorder=1)
-                        if bot: ax.hlines(bot, ax.get_xlim()[0], ax.get_xlim()[1], colors='#9467bd', linestyles=':', lw=1.5, zorder=1)
-                        handles_present = True
-                    elif typ=='fib':
-                        for r,p in ch.get('levels', []):
-                            p=_num(p)
-                            if p: ax.hlines(p, ax.get_xlim()[0], ax.get_xlim()[1], colors='#17becf', linestyles='--', lw=1.2, zorder=1)
-                            handles_present = True
-            handles, labels = ax.get_legend_handles_labels()
-            if labels:
-                leg = ax.legend(loc='upper left', fontsize=9, frameon=True)
-                leg.get_frame().set_alpha(0.85)
-        except Exception as _e:
-            log(f"[STRUCT_LABEL_WARN] {type(_e).__name__}: {_e}")
+        if draw_reg:
+            _draw_reg_channel(ax, df, k=env_float("STRUCT_REGCH_K", 1.0))
+
+        if draw_fib:
+            base = None
+            if struct_info and isinstance(struct_info, dict):
+                base = struct_info.get("fib_base")
+            fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
+            _draw_fib_channel(ax, df, base=base, levels=fib_levels)
+
+        handles, labels = ax.get_legend_handles_labels()
+        if labels:
+            leg = ax.legend(loc='upper left', fontsize=9, frameon=True)
+            leg.get_frame().set_alpha(0.85)
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
-
         name = "near" if "Near" in title_suffix else ("macro" if "Macro" in title_suffix else "view")
         out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{name}_{int(time.time())}.png")
 
@@ -12828,7 +12937,6 @@ async def on_message(message):
             )
         
         async with RENDER_SEMA:
-
             _log_panel_source(symbol, tf, df)
 
             chart_files = await asyncio.to_thread(save_chart_groups, df, symbol, tf)  # 분할 4장
@@ -12860,7 +12968,6 @@ async def on_message(message):
                         anchor_override=env_float("STRUCT_VIEW_ANCHOR", 0.68),
                         title_suffix="· Near",
                     )
-
 
                 if struct_img:
                     chart_files = [struct_img] + list(chart_files)
