@@ -539,6 +539,7 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
 # ==== Structure calc & draw helpers ==========================================
 # --- price scale transform ----------------------------------------------------
 def _choose_scale(tf:str=None):
+
     """calc mode: auto|linear|log (auto: 전체를 log로 쓰고 싶으면 .env에서 log로 강제)"""
     mode = (os.getenv("STRUCT_SCALE_MODE", "log") or "log").lower()  # 기본 log
     if mode == "auto":
@@ -547,10 +548,12 @@ def _choose_scale(tf:str=None):
     return "log" if mode=="log" else "linear"
 
 def _y_transform(y: np.ndarray, mode: str):
+
     if mode == "log":
         y_safe = np.clip(y.astype(float), 1e-9, np.inf)
         return np.log(y_safe), np.exp
     return y.astype(float), (lambda z: z)
+
 
 def _fib_base_from_env(df: pd.DataFrame):
     """
@@ -590,6 +593,7 @@ def _fib_base_from_env(df: pd.DataFrame):
         return (i0, i1)
     except Exception:
         return None
+
 
 def ta_atr(high, low, close, n=14):
     h = pd.Series(high, dtype=float)
@@ -885,9 +889,11 @@ def _draw_reg_channel(ax, df, k=None, tf:str=None):
     x = np.arange(len(df))
     y = df["close"].values
 
+
     # === scale transform (linear/log)
     scale_mode = _choose_scale(tf=tf)
     y_t, inv = _y_transform(y, scale_mode)
+
 
     # slope/intercept in transformed space
     method = os.getenv("STRUCT_REGCH_METHOD","ols").lower()
@@ -943,8 +949,10 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
     y_t, inv = _y_transform(y, scale_mode)
 
     # 기준선: 변환공간에서 직선 적합
+
     if base is None:
         base = _fib_base_from_env(df)
+
     if not base:
         i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
         if i0 == i1: return
@@ -952,6 +960,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
         m = (y_t[i1]-y_t[i0])/((x[i1]-x[i0])+1e-9); b = y_t[i0] - m*x[i0]
     else:
         i0, i1 = base
+
         mode = (os.getenv("STRUCT_FIB_BASE_MODE","auto") or "auto").lower()
         kind = (os.getenv("STRUCT_FIB_BASE_KIND","bull") or "bull").lower()
         if mode == "manual":
@@ -969,6 +978,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
             m = (y0_i1 - y0_i0)/((x[i1]-x[i0])+1e-9); b = y0_i0 - m*x[i0]
         else:
             m = (y_t[i1]-y_t[i0])/((x[i1]-x[i0])+1e-9); b = y_t[i0] - m*x[i0]
+
     y0_t = m*x + b
 
     # 스케일: 변환공간의 잔차
