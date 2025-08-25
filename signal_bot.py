@@ -682,59 +682,41 @@ def _levels_from_info_or_df(struct_info, df: pd.DataFrame, atr: float):
     return out
 
 
-def _best_trendlines(df: pd.DataFrame, tf:str=None):
-    pivH, pivL = _pivot_points(df)
-    x = np.arange(len(df))
-    tf_l = str(tf or "").lower()
-    is_daily = tf_l in ("1d","d","1w","w","1m","m")
 
-    # 변환 공간 (linear/log) — 일봉에서 로그 면 더 일관됨
-    scale_mode = _choose_scale(tf=tf)
-    y_low_t, inv = _y_transform(df["low"].values, scale_mode)
-    y_high_t, _ = _y_transform(df["high"].values, scale_mode)
+def _best_trendlines(df, tf:str=None):
+    """
+    상승=저가(밑꼬리) 지지선 / 하락=고가(위꼬리) 저항선.
+    STRUCT_TL_USE_CLOSED=1 이면 미완 봉 제외.
+    일봉/그 외 모두 '직선'으로 시각화하도록 linear 기반 기울기 계산.
+    """
+    # 닫힌 봉만 쓸지
+    use_closed = env_bool("STRUCT_TL_USE_CLOSED", True)
+    df_src = df.iloc[:-1] if (use_closed and len(df) >= 2) else df
 
-    def fit_line(ii, yvals_t):
-        xs = x[ii].astype(float); ys = yvals_t[ii].astype(float)
-        if len(xs) < 2: return None
-        m_t, b_t = np.polyfit(xs, ys, 1)
-        yhat_t = m_t*xs + b_t
-        ssr = np.sum((ys - yhat_t)**2); sst = np.sum((ys - ys.mean())**2) + 1e-9
-        r2 = 1.0 - (ssr/sst)
-        # convert line back to price space
-        y_line = inv(m_t*x + b_t)
-        m, b = np.polyfit(x, y_line, 1)
-        return m, b, r2
+    # 피벗
+    w = env_int("STRUCT_PIVOT_WINDOW", 3)
+    pivH, pivL = _pivot_points(df_src, w=w)
 
 
+    # 앵커 모드
+    anchor_up   = (os.getenv("STRUCT_TL_ANCHOR_UP","low")  or "low").lower()   # low
+    anchor_down = (os.getenv("STRUCT_TL_ANCHOR_DOWN","high") or "high").lower()# high
+
+    x = np.arange(len(df_src))
     up = dn = None
-    if is_daily:
-        if len(pivL) >= 3:
-            cand = []
-            ii = np.array(pivL[-4:], dtype=int)
-            for k in range(2, min(4, len(ii))+1):
-                res = fit_line(ii[-k:], y_low_t)
-                if res: cand.append(("up",)+res)
-            if cand:
-                c = max(cand, key=lambda t: t[3]); up = ("up", c[1], c[2])
-        if len(pivH) >= 3:
-            cand = []
-            ii = np.array(pivH[-4:], dtype=int)
-            for k in range(2, min(4, len(ii))+1):
-                res = fit_line(ii[-k:], y_high_t)
-                if res: cand.append(("down",)+res)
-            if cand:
-                c = max(cand, key=lambda t: t[3]); dn = ("down", c[1], c[2])
-    else:
-        if len(pivL) >= 2:
-            i1, i2 = pivL[-2], pivL[-1]
-            m = (df["low"].iloc[i2]-df["low"].iloc[i1])/((i2-i1)+1e-9)
-            b = df["low"].iloc[i2] - m*i2
-            up = ("up", m, b)
-        if len(pivH) >= 2:
-            i1, i2 = pivH[-2], pivH[-1]
-            m = (df["high"].iloc[i2]-df["high"].iloc[i1])/((i2-i1)+1e-9)
-            b = df["high"].iloc[i2] - m*i2
-            dn = ("down", m, b)
+
+    # 상승: 저가 피벗 2~3점으로 선형 회귀
+    if len(pivL) >= 2 and anchor_up == "low":
+        i1, i2 = pivL[-2], pivL[-1]
+        m = (df_src["low"].iloc[i2] - df_src["low"].iloc[i1]) / max((i2 - i1), 1e-9)
+        b = df_src["low"].iloc[i2] - m * i2
+        up = ("up", float(m), float(b))
+    # 하락: 고가 피벗 2~3점
+    if len(pivH) >= 2 and anchor_down == "high":
+        i1, i2 = pivH[-2], pivH[-1]
+        m = (df_src["high"].iloc[i2] - df_src["high"].iloc[i1]) / max((i2 - i1), 1e-9)
+        b = df_src["high"].iloc[i2] - m * i2
+        dn = ("down", float(m), float(b))
 
     return up, dn
 
@@ -1058,6 +1040,7 @@ def _draw_ath_lines(ax, df, ath, show_h=True, show_v=True):
         ax.axvline(ath["time"], color=col, linestyle=(0,(4,3)), linewidth=lw, alpha=alpha*0.9, zorder=1)
 
 
+
 # === Anchored VWAP helpers ====================================================
 def _avwap_series(df: pd.DataFrame, start_idx: int, price_src: str = None):
     """
@@ -1134,6 +1117,7 @@ def _bigfig_levels(ax, df, k:int=6):
     for p in lvls:
         ax.hlines(p, df.index[0], df.index[-1], colors=col, linewidths=lw, linestyles=":",
                   alpha=alpha, zorder=1)
+
 
 
 # =============================================================================
@@ -10733,18 +10717,29 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
         except Exception:
             pass
 
+        # (1) ATH — 수평만(세로 OFF는 env로 제어)
+        ath = _get_ath_info(df)
+        _draw_ath_lines(ax, df, ath, show_h=True, show_v=env_bool("STRUCT_SHOW_ATH_V", False))
+
+        # (2) 이전 사이클 Top N개
+        _draw_prev_tops(ax, df)
+
+        # (3) 수평 R/S
         if draw_sr:
             levels = _levels_from_info_or_df(struct_info, df, atr)
             _draw_levels(ax, df, levels, atr)
+
 
         # 빅피겨 라운드 넘버 (선택)
         if env_bool("STRUCT_DRAW_BIGFIG", True):
             _bigfig_levels(ax, df, k=env_int("STRUCT_BIGFIG_K", 6))
 
+
         if draw_tl:
             tls = _trendlines_from_info_or_df(struct_info, df, tf=tf)
             _draw_tls(ax, df, tls)
 
+        # (5) 회귀 μ / Fib 채널
         if draw_reg:
             _draw_reg_channel(ax, df, k=env_float("STRUCT_REGCH_K", 1.0), tf=tf)
 
@@ -10755,46 +10750,10 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
             _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
 
-        # ATH 라인
-        if env_bool("STRUCT_DRAW_ATH", True):
-            ath = _get_ath_info(df)
-            _draw_ath_lines(ax, df, ath,
-                            show_h=env_bool("STRUCT_DRAW_ATH_H", True),
-                            show_v=env_bool("STRUCT_DRAW_ATH_V", True))
 
+        # (6) 15m 축/라벨 겹침 방지
+        _fix_time_axis(ax, tf)
 
-        # === X축 tick/format (TF-aware) ==============================================
-        span = pd.to_datetime(ax.get_xlim()[1], unit='s', origin='unix') - pd.to_datetime(ax.get_xlim()[0], unit='s', origin='unix') \
-                if isinstance(df.index, pd.DatetimeIndex) else None
-        tf_l = str(tf or "").lower()
-
-
-        # 기본: AutoDateLocator + Concise
-        locator = mdates.AutoDateLocator(minticks=3, maxticks=8, interval_multiples=True)
-        formatter = mdates.ConciseDateFormatter(locator)
-
-        # TF/스팬에 따라 명시적 locator로 다운그레이드 (AutoDateLocator 경고 회피)
-        try:
-            if tf_l in ("1m","3m","5m","15m","30m","45m"):
-                # 인트라데이: 시간/분 단위 고정
-                if tf_l in ("1m","3m","5m"):
-                    locator = mdates.MinuteLocator(interval=15)
-                    formatter = mdates.ConciseDateFormatter(locator)
-                elif tf_l in ("15m","30m","45m"):
-                    locator = mdates.HourLocator(interval=2)
-                    formatter = mdates.ConciseDateFormatter(locator)
-            elif tf_l in ("1h","2h","4h","6h","8h","12h"):
-                locator = mdates.HourLocator(interval=6)
-                formatter = mdates.ConciseDateFormatter(locator)
-            else:
-                # 1D 이상
-                locator = mdates.AutoDateLocator(minticks=3, maxticks=8, interval_multiples=True)
-                formatter = mdates.ConciseDateFormatter(locator)
-        except Exception:
-            pass
-
-        ax.xaxis.set_major_locator(locator)
-        ax.xaxis.set_major_formatter(formatter)
 
         # 보강: 초근접 TF에선 분단위 고정 locator
         if str(tf).lower()=="15m":
