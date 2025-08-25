@@ -794,11 +794,13 @@ def _draw_tls(ax, df, tls):
             continue
 
         y = m*x + b
+
         col_up = os.getenv("STRUCT_COL_TL_UP", "#28a745")
         col_dn = os.getenv("STRUCT_COL_TL_DN", "#dc3545")
         lw_tl  = env_float("STRUCT_LW_TL", 1.6)
         if dirv == "up":
             ax.plot(xdt, y, linestyle="--", color=col_up, linewidth=lw_tl, label="up TL", zorder=1)
+
         else:
             ax.plot(xdt, y, linestyle="--", color=col_dn, linewidth=lw_tl, label="down TL", zorder=1)
 
@@ -818,6 +820,7 @@ def _draw_reg_channel(ax, df, k=None):
     yhat = m*x + b
     resid = y - yhat
     sigma = np.std(resid) if np.std(resid) > 0 else 1e-6
+
 
     col_reg = os.getenv("STRUCT_COL_REG", "#6f42c1")
     lw_reg  = env_float("STRUCT_LW_REG", 1.4)
@@ -841,9 +844,11 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
     lw_mid   = env_float("STRUCT_LW_FIB_MID", 0.9)
     alpha_mid= env_float("STRUCT_FIB_ALPHA_MID", 0.6)
 
+
     x = np.arange(len(df)); y = df["close"].values
-    if not base:
+    if not base:  # auto: recent swing pair
         i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
+
         if i0 == i1: return
         if i0 > i1: i0, i1 = i1, i0
     else:
@@ -851,11 +856,13 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
     m = (y[i1]-y[i0])/(x[i1]-x[i0] + 1e-9); b = y[i0] - m*x[i0]
     y0 = m*x + b
 
+
     resid = y - y0
     mad = np.median(np.abs(resid - np.median(resid)))
     scale = (1.4826*mad) if mad>0 else np.std(resid)
     if not np.isfinite(scale) or scale <= 0:
         scale = max(1e-6, np.std(resid))
+
 
     ax.plot(df.index, y0, color=clr, linewidth=lw_main, alpha=alpha_m, label="Fib base", zorder=1)
     levels = sorted({float(abs(v)) for v in levels})
@@ -865,6 +872,7 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf:str=None):
         ax.plot(df.index, y0 - lv*scale, color=clr, linewidth=lw_main, linestyle="--",
                 alpha=alpha_m, zorder=1)
     if mid_on:
+
         pairs = [0.0] + levels
         for a, b_ in zip(pairs[:-1], pairs[1:]):
             mid = 0.5*(a + b_)
@@ -10452,10 +10460,12 @@ def render_struct_overlay(symbol: str, tf: str, rows_or_df, struct_info, *,
             fib_levels = [float(x) for x in os.getenv("STRUCT_FIB_LEVELS","0.382,0.5,0.618,1.0").split(",") if x]
             _draw_fib_channel(ax, df, base=base, levels=fib_levels, tf=tf)
 
+
         locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
         formatter = mdates.ConciseDateFormatter(locator)
         ax.xaxis.set_major_locator(locator)
         ax.xaxis.set_major_formatter(formatter)
+
 
         handles, labels = ax.get_legend_handles_labels()
         if labels:
