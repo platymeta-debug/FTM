@@ -653,14 +653,16 @@ def y_to_scale(y, mode: str):
     return arr.copy()
 
 
+def _apply_scale(arr, mode):
+    arr = np.asarray(arr, dtype=float)
+    if mode == "log":
+        return np.power(10.0, np.clip(arr, -308, 308))  # overflow 방지
+    return arr
+
+
 def scale_to_y(arr, mode: str):
     """Inverse transform from scaled space back to price."""
-    import numpy as np
-    if mode == "log":
-        a = np.asarray(arr, dtype=float)
-        # float64 안전범위 내에서만 지수 복원
-        return np.power(10.0, np.clip(a, -12.0, 12.0))
-    return arr
+    return _apply_scale(arr, mode)
 
 
 
@@ -1220,15 +1222,28 @@ def draw_fib_channel(df, symbol, ax):
 
 
 # === Big Fibonacci Channel ===================================================
-def _get_fibch_spec_for(symbol: str):
-    """ENV에서 심볼별 big fib channel 사양 읽기"""
-    import json, os
-    raw = os.getenv("STRUCT_FIBCH_SETS", "{}")
+def _fibch_params_from_env(symbol: str):
+    import re, json, os
+    # 1) JSON 맵 우선
+    raw = os.getenv("STRUCT_FIBCH_SETS", "")
     try:
-        spec_map = json.loads(raw)
+        m = json.loads(raw) if raw else {}
+        if symbol in m:
+            a, b = m[symbol]["anchors"]
+            unit = m[symbol]["unit"]
+            return float(a), float(b), float(unit)
     except Exception:
-        spec_map = {}
-    return spec_map.get(symbol) or spec_map.get(symbol.replace(":", "/")) or None
+        pass
+
+    # 2) 키 변형을 폭넓게 탐색: ETH/USDT -> ETHUSDT, ETHUSD, ETH
+    s = re.sub(r"[/\-: _]", "", symbol).upper()       # ETH/USDT -> ETHUSDT
+    base = s[:-4] if s.endswith("USDT") else (s[:-3] if s.endswith("USD") else s)
+    for k in (s, base+"USDT", base+"USD", base):
+        v = os.getenv(f"STRUCT_FIBCH_{k}")
+        if v:
+            a, b, u = [float(x) for x in v.split(",")[:3]]
+            return a, b, u
+    return None
 
 
 def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
@@ -1238,8 +1253,11 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
     if os.getenv("STRUCT_FIBCH_ENABLE", "0") != "1":
         return
 
-    spec = _get_fibch_spec_for(symbol)
-    if not spec:
+    params = _fibch_params_from_env(symbol)
+    if not params:
+        return
+    anchor1, anchor2, unit = params
+    if unit <= 0:
         return
 
     # 1) 레벨/스타일
@@ -1250,16 +1268,10 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
     dashed = os.getenv("STRUCT_FIBCH_DASHED","1") == "1"
     search_col = os.getenv("STRUCT_FIBCH_SEARCH_COL","high")
 
-    # 2) 심볼별 앵커/단위폭
-    anchors = list(spec.get("anchors", []))
-    unit = float(spec.get("unit", 0.0))
-    if len(anchors) != 2 or unit <= 0:
-        return
-
     # 3) 앵커 가격과 가장 가까운 봉 인덱스 찾기
     y = df[search_col].values.astype(float)
-    idx1 = int(np.argmin(np.abs(y - anchors[0])))
-    idx2 = int(np.argmin(np.abs(y - anchors[1])))
+    idx1 = int(np.argmin(np.abs(y - anchor1)))
+    idx2 = int(np.argmin(np.abs(y - anchor2)))
     xdates = mdates.date2num(df.index.to_pydatetime())
     x1, y1 = xdates[idx1], y[idx1]
     x2, y2 = xdates[idx2], y[idx2]
@@ -1268,7 +1280,7 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
 
     # 4) 기준선(레벨 0) 기울기/절편
     m = (y2 - y1) / (x2 - x1)
-    b = y1 - m * x1
+    intercept = y1 - m * x1
 
     # 5) 화면 좌우로 연장
     left_ext  = float(os.getenv("STRUCT_FIBCH_EXTEND_LEFT","1")) == 1.0
@@ -1281,8 +1293,15 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
     xs = np.linspace(xL, xR, 400)
 
     # 6) 레벨별 선 그리기(단위폭 = '가격USD')
-    base = m * xs + b
-    ax.plot(mdates.num2date(xs), base, color=col, linewidth=lw, alpha=alpha, label=spec.get("label","Fib channel (big)"))
+    base = m * xs + intercept
+    ax.plot(
+        mdates.num2date(xs),
+        base,
+        color=col,
+        linewidth=lw,
+        alpha=alpha,
+        label=os.getenv("STRUCT_FIBCH_LABEL", "Fib channel (big)"),
+    )
     for lv in levels:
         if abs(lv) < 1e-12:
             continue
@@ -11051,7 +11070,8 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     try:
         if env_bool("STRUCT_DRAW_SR", True):
             levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
-            _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
+            if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
+                _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
     except Exception as e:
         err_flags.append(("sr", e))
     try:
