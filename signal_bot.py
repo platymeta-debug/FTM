@@ -1146,7 +1146,16 @@ def _smart_label_layout_v2(ax, pts: list[dict]):
     to_disp = ax.transData.transform
     to_data = ax.transData.inverted().transform
 
-    min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "9"))
+    # === P6: 과밀도 기반 최소 간격 확장 ===
+    base_min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "9"))
+    th = int(os.getenv("STRUCT_LABEL_DENSITY_TH", "8"))           # 이 개수 초과면 확장
+    grow = float(os.getenv("STRUCT_LABEL_DENSITY_GROW", "0.35"))  # 초과 1개당 배율 증가율
+    max_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY_MAX", "18"))
+    if len(pts) > th:
+        extra = (len(pts) - th) * grow
+        min_dy_px = min(max_px, base_min_dy_px * (1.0 + extra))
+    else:
+        min_dy_px = base_min_dy_px
     top_px  = float(os.getenv("STRUCT_LABEL_CLAMP_TOP_PX", "6"))
     bot_px  = float(os.getenv("STRUCT_LABEL_CLAMP_BOT_PX", "6"))
 
@@ -1242,6 +1251,42 @@ def _fmt_elapsed(dt: pd.Timedelta, mode: str = None) -> str:
     if m:
         return f"{m}m"
     return f"{s}s"
+# ==== P6: visibility & ATR helpers ==========================================
+def _atr_last(df: pd.DataFrame, n: int = None) -> float:
+    n = int(os.getenv("STRUCT_ATR_N","14")) if n is None else n
+    try:
+        return float(ta_atr(df["high"], df["low"], df["close"], n)[-1])
+    except Exception:
+        # 폴백: 최근 n봉 평균 범위
+        return float((df["high"] - df["low"]).tail(max(n,3)).mean())
+
+def _fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr):
+    """
+    레벨 노출 필터링:
+      - close와의 거리/ATR이 [min, max] 범위에 드는 레벨만 남김
+      - 가장 중요한 코어 레벨(0/0.5/1/1.25)은 항상 포함
+      - 최종 개수를 max_count로 제한(가까운 순)
+    """
+    import numpy as np
+    min_atr = float(os.getenv("STRUCT_FIBCH_VIS_MIN_ATR", "0.20"))
+    max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR", "6.0"))
+    max_count = int(os.getenv("STRUCT_FIBCH_VIS_MAX_COUNT", "9"))
+    keep_core = {0.0, 0.5, 1.0, 1.25}
+
+    close = float(df["close"].iloc[-1])
+    scores = []
+    for lv in levels:
+        y_at = m*x_ref_num + (b + unit*float(lv))
+        dist = abs(y_at - close)
+        dist_atr = (dist/atr) if atr>0 else 999.0
+        scores.append((float(lv), dist_atr))
+
+    # 범위 필터 + 코어 유지
+    cand = [lv for lv,da in scores if (min_atr <= da <= max_atr) or (lv in keep_core)]
+    # 가까운 순 정렬
+    cand.sort(key=lambda lv: next(da for l,da in scores if l==lv))
+    # 개수 제한
+    return cand[:max_count]
 # =============================================================================
 
 
@@ -1483,20 +1528,50 @@ def _draw_big_fib_channel(ax, df, symbol):
             return f"{base} ({y_val:,.0f})"
         return base
 
+    # === P6: 가시성 후보 선별(ATR 비례) + 강조 타깃 계산 ====================
+    x_ref_num = mdates.date2num(df.index[-1])   # 우측 기준
+    atr = _atr_last(df)
+    # P5에서 만든 이름 매핑 사용(없으면 생성)
+    try:
+        name_map
+    except NameError:
+        close_price = float(df["close"].iloc[-1])
+        name_map = _rs_preset_names(levels, m, b, unit, x_ref_num, close_price)
+
+    # 가시성 필터
+    vis_levels = set(_fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr))
+
+    # 강조 규칙
+    emph_names = {s.strip().upper() for s in os.getenv("STRUCT_FIBCH_EMPH_NAMES","R1,S1").split(",") if s.strip()}
+    emph_lw    = float(os.getenv("STRUCT_FIBCH_EMPH_LW","2.2"))
+    emph_alpha = float(os.getenv("STRUCT_FIBCH_EMPH_ALPHA","1.0"))
+    deem_alpha = float(os.getenv("STRUCT_FIBCH_DEEMPH_ALPHA","0.55"))
+
     label_candidates = []
     for i, lv in enumerate(levels):
-        dy = unit * lv
+        if float(lv) not in vis_levels:
+            continue  # P6: 가시성 제외 레벨 skip
+
+        dy = unit * float(lv)
         yL = _line_at_x(m, b + dy, xL)
         yR = _line_at_x(m, b + dy, xR)
-        ls = (0, (4, 4)) if (os.getenv("STRUCT_FIBCH_DASHED", "1") == "1" and lv not in (0.0, 0.5, 1.0, 1.25)) else "-"
+        ls = (0, (4, 4)) if (os.getenv("STRUCT_FIBCH_DASHED","1")=="1" and lv not in (0.0, 0.5, 1.0, 1.25)) else "-"
+
+        # === 강조/비강조 스타일 결정 ===
+        nm = (name_map or {}).get(float(lv))
+        is_emph = (nm or "").upper() in emph_names
+        base_col = cols[i] if i < len(cols) else cols[0]
+        base_lw  = lws[i] if i < len(lws) else lws[0]
+        use_lw   = emph_lw if is_emph else base_lw
+        use_alpha= emph_alpha if is_emph else alpha * deem_alpha
+
         ax.plot([mdates.num2date(xL), mdates.num2date(xR)], [yL, yR],
-                color=cols[i] if i < len(cols) else cols[0],
-                lw=lws[i] if i < len(lws) else lws[0],
-                ls=ls,
-                alpha=alpha,
-                solid_capstyle='round', clip_on=False,
-                zorder=env_int('STRUCT_Z_OVERLAY',1),
+                color=base_col, lw=use_lw, ls=ls,
+                alpha=use_alpha,
+                solid_capstyle="round", clip_on=False, zorder=int(os.getenv("STRUCT_Z_OVERLAY","1")),
                 label=(os.getenv('STRUCT_FIBCH_LABEL','Fib channel (big)') if i==0 else None))
+
+        # (라벨 후보도 강조 반영: bold/alpha)
         if label_mode != "none":
             xr, yr = xR, yR
             if not hide_outside or (ax.get_ylim()[0] <= yr <= ax.get_ylim()[1]):
@@ -1504,11 +1579,13 @@ def _draw_big_fib_channel(ax, df, symbol):
                     "x": mdates.num2date(xr), "y": yr,
                     "text": _compose_label(float(lv), float(yr)),
                     "color": label_col, "fontsize": label_fs,
-                    "ha": "left" if label_side == "right" else "right",
+                    "ha": "left" if label_side=="right" else "right",
                     "va": "center",
-                    "dx": label_dx if label_side == "right" else -label_dx,
+                    "dx": label_dx if label_side=="right" else -label_dx,
                     "dy": label_dy,
                     "priority": _fib_level_priority(float(lv)),
+                    "fontweight": ("bold" if is_emph else "normal"),
+                    "alpha": (1.0 if is_emph else deem_alpha)
                 })
         if mark_on:
             cross = _latest_level_cross(df, m, b, dy, col="close", lookback=mark_lookback, side=mark_side)
@@ -1527,6 +1604,8 @@ def _draw_big_fib_channel(ax, df, symbol):
                                 zorder=env_int('STRUCT_Z_OVERLAY',1)+2)
 
     for mlv in mid_levels:
+        if float(mlv) not in vis_levels:
+            continue
         dy = unit * mlv
         yL = _line_at_x(m, b + dy, xL)
         yR = _line_at_x(m, b + dy, xR)
@@ -1541,8 +1620,10 @@ def _draw_big_fib_channel(ax, df, symbol):
             ax.annotate(p["text"], xy=(p["x"], p["y"]), xycoords="data",
                         xytext=(p["dx"], p["dy"]), textcoords="offset points",
                         ha=p["ha"], va=p["va"], fontsize=p["fontsize"],
-                        color=p["color"], alpha=label_alpha, clip_on=False,
-                        zorder=env_int('STRUCT_Z_OVERLAY',1)+1)
+                        color=p["color"], alpha=p.get("alpha", label_alpha),
+                        fontweight=p.get("fontweight","normal"),
+                        clip_on=False,
+                        zorder=int(os.getenv("STRUCT_Z_OVERLAY","1"))+1)
 
     if ext_ratio > 0:
         _apply_right_pad(ax, ext_ratio)
