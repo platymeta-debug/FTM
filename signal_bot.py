@@ -1130,7 +1130,6 @@ def _draw_fib_channel_auto(ax, df, base=None, levels=None, tf: str=None):
 
     # === base selection ===
     if not base:
-
         i0, i1 = _env_idxpair("STRUCT_FIB_BASE_OVERRIDE_IDX", default=(None, None))
         if i0 is not None and i1 is not None:
             base = (int(i0), int(i1))
@@ -1218,6 +1217,81 @@ def draw_fib_channel(df, symbol, ax):
         y1 = scale_to_y(ch(t1), mode)
         y2 = scale_to_y(ch(t2), mode)
         _extend_segment(t1, y1, t2, y2, ax, color=clr, lw=lw, ls='--', alpha=alpha, zorder=z)
+
+
+# === Big Fibonacci Channel ===================================================
+def _get_fibch_spec_for(symbol: str):
+    """ENV에서 심볼별 big fib channel 사양 읽기"""
+    import json, os
+    raw = os.getenv("STRUCT_FIBCH_SETS", "{}")
+    try:
+        spec_map = json.loads(raw)
+    except Exception:
+        spec_map = {}
+    return spec_map.get(symbol) or spec_map.get(symbol.replace(":", "/")) or None
+
+
+def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
+    import os, numpy as np
+    import matplotlib.dates as mdates
+
+    if os.getenv("STRUCT_FIBCH_ENABLE", "0") != "1":
+        return
+
+    spec = _get_fibch_spec_for(symbol)
+    if not spec:
+        return
+
+    # 1) 레벨/스타일
+    levels = [float(x) for x in os.getenv("STRUCT_FIBCH_LEVELS","0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1.0,1.125,1.25").split(",")]
+    col = os.getenv("STRUCT_FIBCH_COLOR", "#20c997")
+    lw  = float(os.getenv("STRUCT_FIBCH_LW","1.2"))
+    alpha = float(os.getenv("STRUCT_FIBCH_ALPHA","0.9"))
+    dashed = os.getenv("STRUCT_FIBCH_DASHED","1") == "1"
+    search_col = os.getenv("STRUCT_FIBCH_SEARCH_COL","high")
+
+    # 2) 심볼별 앵커/단위폭
+    anchors = list(spec.get("anchors", []))
+    unit = float(spec.get("unit", 0.0))
+    if len(anchors) != 2 or unit <= 0:
+        return
+
+    # 3) 앵커 가격과 가장 가까운 봉 인덱스 찾기
+    y = df[search_col].values.astype(float)
+    idx1 = int(np.argmin(np.abs(y - anchors[0])))
+    idx2 = int(np.argmin(np.abs(y - anchors[1])))
+    xdates = mdates.date2num(df.index.to_pydatetime())
+    x1, y1 = xdates[idx1], y[idx1]
+    x2, y2 = xdates[idx2], y[idx2]
+    if x2 == x1:
+        return
+
+    # 4) 기준선(레벨 0) 기울기/절편
+    m = (y2 - y1) / (x2 - x1)
+    b = y1 - m * x1
+
+    # 5) 화면 좌우로 연장
+    left_ext  = float(os.getenv("STRUCT_FIBCH_EXTEND_LEFT","1")) == 1.0
+    right_ext = float(os.getenv("STRUCT_FIBCH_EXTEND_RIGHT","1")) == 1.0
+    ext_ratio = float(os.getenv("STRUCT_FIBCH_EXTEND_RATIO","0.25"))
+    xmin, xmax = xdates.min(), xdates.max()
+    span = xmax - xmin if xmax > xmin else 1.0
+    xL = xmin - (ext_ratio * span if left_ext else 0.0)
+    xR = xmax + (ext_ratio * span if right_ext else 0.0)
+    xs = np.linspace(xL, xR, 400)
+
+    # 6) 레벨별 선 그리기(단위폭 = '가격USD')
+    base = m * xs + b
+    ax.plot(mdates.num2date(xs), base, color=col, linewidth=lw, alpha=alpha, label=spec.get("label","Fib channel (big)"))
+    for lv in levels:
+        if abs(lv) < 1e-12:
+            continue
+        y_up = base + (lv * unit)
+        y_dn = base - (lv * unit)
+        ls = (0, (4, 4)) if dashed else "-"
+        ax.plot(mdates.num2date(xs), y_up, color=col, linewidth=lw, alpha=alpha*0.9, linestyle=ls)
+        ax.plot(mdates.num2date(xs), y_dn, color=col, linewidth=lw, alpha=alpha*0.9, linestyle=ls)
+
 
 # === ATH helpers ==============================================================
 def _get_ath_info(df: pd.DataFrame):
@@ -11029,6 +11103,10 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         _draw_avwap_items(ax, df)
     except Exception as _e:
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
+    try:
+        _draw_big_fib_channel(ax, df, symbol, ycol="close")
+    except Exception as e:
+        err_flags.append(("bigfib", e))
     atr_n = env_int("STRUCT_ATR_N", 14)
     atr = _safe_atr(df, atr_n)
 
