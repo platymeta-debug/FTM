@@ -646,16 +646,22 @@ def _calc_scale() -> str | None:
 def y_to_scale(y, mode: str):
     """Convert price array ``y`` to scaled space (log10 or linear)."""
     arr = np.asarray(y, dtype=float)
+
     if mode == "log":
         arr = np.clip(arr, 1e-12, None)
         return np.log10(arr)
     return arr.copy()
 
 
-def scale_to_y(s, mode: str):
+def scale_to_y(arr, mode: str):
     """Inverse transform from scaled space back to price."""
-    arr = np.asarray(s, dtype=float)
-    return 10 ** arr if mode == "log" else arr
+    import numpy as np
+    if mode == "log":
+        a = np.asarray(arr, dtype=float)
+        # float64 안전범위 내에서만 지수 복원
+        return np.power(10.0, np.clip(a, -12.0, 12.0))
+    return arr
+
 
 
 def _extend_segment(x1, y1, x2, y2, ax, pad=None, **plot_kw):
@@ -672,6 +678,44 @@ def _extend_segment(x1, y1, x2, y2, ax, pad=None, **plot_kw):
     y_right = y1 + m * (xmax - x1)
     ax.plot([mdates.num2date(xmin), mdates.num2date(xmax)],
             [y_left, y_right], **plot_kw)
+
+
+# === view anchoring / right padding ==========================================
+def _apply_right_pad(ax, df, tf, default_anchor=0.66):
+    """
+    현재 마지막 캔들이 figure 가로축에서 anchor(0~1) 위치에 오도록
+    우측으로 xlim을 늘려준다. (예: 0.66 -> 화면의 2/3 지점)
+
+    또한 인트라데이 축 라벨 혼잡을 완화한다.
+    """
+    try:
+        import matplotlib.dates as mdates
+        import numpy as np
+        anchor = float(os.getenv("STRUCT_VIEW_ANCHOR", default_anchor))
+        anchor = float(np.clip(anchor, 0.55, 0.90))  # 안전 범위
+
+        idx = getattr(df, "index", None)
+        if idx is None or len(idx) < 2:
+            return
+
+        xmin = idx[0]
+        xend = idx[-1]
+        span = (xend - xmin)
+        if span == 0:
+            return
+
+        xmax = xmin + span / anchor  # xend 가 anchor 위치에 오도록
+        ax.set_xlim(xmin, xmax)
+
+        # 15m/1h 축 라벨 과밀 완화
+        tf_norm = (tf or "").lower()
+        if tf_norm in ("15m", "1h"):
+            loc = mdates.AutoDateLocator(minticks=6, maxticks=12)
+            ax.xaxis.set_major_locator(loc)
+            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+            ax.tick_params(axis="x", labelsize=9, rotation=0)
+    except Exception as e:
+        logger.info(f"[RIGHT_PAD_WARN] {type(e).__name__}: {e}")
 
 
 def _fib_base_from_env(df: pd.DataFrame):
@@ -992,8 +1036,9 @@ def _draw_tls(ax, df, tls, tf: str=None):
     calc = _calc_scale() or _decide_scale(tf)
     for t in tls:
         m = float(t["m"]); b = float(t["b"])
-        y_t = m*x + b
-        y = scale_to_y(y_t, calc)
+
+        y = m*x + b
+
         if t.get("dir")=="up":
             ax.plot(xdt, y, linestyle="--", color=os.getenv("STRUCT_COL_TL_UP","#28a745"),
                     linewidth=env_float("STRUCT_LW_TL",1.8), label=os.getenv("STRUCT_LBL_TL_UP","상승추세선"), zorder=1)
@@ -1081,6 +1126,7 @@ def _draw_fib_channel_auto(ax, df, base=None, levels=None, tf: str=None):
     x = np.arange(len(df)); y = df["close"].values.astype(float)
     calc = _calc_scale() or _decide_scale(tf)
     y_t = y_to_scale(y, calc)
+
 
     # === base selection ===
     if not base:
@@ -4719,6 +4765,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.08, 1, 0.97])
+    _apply_right_pad(axs[0], df, timeframe)
     pA = os.path.join(outdir, f"chart_{sym}_{timeframe}_A_trend.png")
     fig.savefig(pA, dpi=140); plt.close(fig); paths.append(pA)
 
@@ -4745,6 +4792,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.08, 1, 0.97])
+    _apply_right_pad(axs[0], df, timeframe)
     pB = os.path.join(outdir, f"chart_{sym}_{timeframe}_B_momentum.png")
     fig.savefig(pB, dpi=140); plt.close(fig); paths.append(pB)
 
@@ -4771,6 +4819,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.08, 1, 0.97])
+    _apply_right_pad(axs[0], df, timeframe)
     pC = os.path.join(outdir, f"chart_{sym}_{timeframe}_C_strength.png")
     fig.savefig(pC, dpi=140); plt.close(fig); paths.append(pC)
 
@@ -4786,6 +4835,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.09, 1, 0.97])
+    _apply_right_pad(ax, df, timeframe)
     pD = os.path.join(outdir, f"chart_{sym}_{timeframe}_D_flow.png")
     fig.savefig(pD, dpi=140); plt.close(fig); paths.append(pD)
 
