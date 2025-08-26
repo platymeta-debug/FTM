@@ -671,7 +671,9 @@ def y_to_scale(y, mode: str):
 def _apply_scale(arr, mode):
     arr = np.asarray(arr, dtype=float)
     if mode == "log":
+
         return _safe_pow10(arr)
+
     return arr
 
 
@@ -1099,6 +1101,7 @@ import matplotlib.dates as mdates
 from matplotlib.transforms import Affine2D
 
 
+
 def _fib_midlines(levels: list[float]) -> list[float]:
     """Between-level midlines: 각 인접 레벨 쌍의 중간값."""
     if not levels or len(levels) < 2:
@@ -1179,6 +1182,7 @@ def _smart_label_layout_v2(ax, pts: list[dict]):
 
     return pts
 # =============================================================================
+
 
 def _line_at_x(m: float, b: float, x: float) -> float:
     """직선 y = m*x + b"""
@@ -1354,6 +1358,7 @@ def _parse_ls(raw, n):
             out.append(t)
     return out
 
+
 def _apply_tv_template():
     os.environ.setdefault('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25')
     os.environ.setdefault('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6')
@@ -1365,6 +1370,7 @@ def _apply_tv_template():
 def _label_fibch(ax, lvl, xyR):
     mode = env('STRUCT_FIBCH_LABEL_MODE','level')
     if mode=='none':
+
         return
     text = f'{lvl:g}'
     if mode=='level+price':
@@ -1394,6 +1400,7 @@ def _draw_big_fib_channel(ax, df, symbol):
     anc = _get_anchors(symbol)
     if not anc:
         return
+
     x1,y1,x2,y2 = _resolve_weekly_anchor_points(df, anc['a1'], anc['a2'], symbol)
     m,b = _fit_line(x1,y1,x2,y2)
     unit = float(anc['unit'])
@@ -1427,10 +1434,12 @@ def _draw_big_fib_channel(ax, df, symbol):
     mark_age_fs = int(os.getenv("STRUCT_FIBCH_MARK_AGE_FS", "8"))
     mark_age_col = os.getenv("STRUCT_FIBCH_MARK_AGE_COLOR", "#333333")
 
+
     xmin, xmax = mdates.date2num(df.index[0]), mdates.date2num(df.index[-1])
     span = xmax - xmin
     ext_ratio = float(os.getenv("STRUCT_FIBCH_EXTEND_RATIO", "0.25"))
     xL, xR = xmin - span * ext_ratio, xmax + span * ext_ratio
+
 
     x_ref_num = xR
     close_price = float(df['close'].iloc[-1])
@@ -1642,6 +1651,7 @@ def _draw_avwap_items(ax, df):
         px = df["close"].values.astype(float)
     vol = df[vcol].values.astype(float)
 
+
     def _plot_avwap(anchor_idx, color, label):
         vw = anchored_vwap(px, vol, anchor_idx)
         if vw is None:
@@ -1651,14 +1661,17 @@ def _draw_avwap_items(ax, df):
         else:
             ax.plot(df.index, vw, color=color, linewidth=lw, alpha=0.95, label=label, zorder=1)
 
+
     if draw_ytd:
         _plot_avwap(_ytd_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"), os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"))
 
     if draw_ath:
         _plot_avwap(_ath_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"), os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"))
 
+
 def _draw_ath_line(ax, df):
     """Draw ATH horizontal line."""
+
     draw_ath = env_bool("STRUCT_DRAW_ATH", True)
     draw_h = env_bool("STRUCT_DRAW_ATH_H", True)
     col_ath = os.getenv("STRUCT_COL_ATH", "#000000")
@@ -11311,6 +11324,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
 
     if tf_l == "15m":
         loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_XTICK_MAX", 10))
+
     elif tf_l == "4h":
         loc = mdates.AutoDateLocator(maxticks=8)
     elif tf_l.endswith("m"):
@@ -11322,11 +11336,13 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     for label in ax.get_xticklabels():
         label.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
     ax.grid(bool(env_int("STRUCT_XGRID_ON", 1)), axis='x', alpha=0.15)
+
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
             levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
-            _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
+            if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
+                _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
     except Exception as e:
         err_flags.append(("sr", e))
     try:
@@ -11346,7 +11362,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as e:
         err_flags.append(("bigfig", e))
     try:
+
         _draw_ath_line(ax, df_1d)
+
     except Exception as e:
         err_flags.append(("ath", e))
     try:
@@ -11356,6 +11374,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
     try:
         _draw_big_fib_channel(ax, df, symbol)
+
     except Exception as e:
         err_flags.append(("bigfib", e))
     try:
