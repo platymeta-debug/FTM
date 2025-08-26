@@ -671,7 +671,9 @@ def y_to_scale(y, mode: str):
 def _apply_scale(arr, mode):
     arr = np.asarray(arr, dtype=float)
     if mode == "log":
+
         return _safe_pow10(arr)
+
     return arr
 
 
@@ -1098,6 +1100,7 @@ def _choose_fib_base(df, tf):
 
 
 
+
 # === Big Fibonacci Channel ===================================================
 FIBCH_PATH = Path(__file__).with_name('fibch_anchors.json')
 
@@ -1109,10 +1112,13 @@ def _fibch_load():
 def _fibch_save(d):
     FIBCH_PATH.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding='utf-8')
 
+
 FIBCH = _fibch_load()
+
 
 def _fibch_params_from_env(symbol: str):
     import re, json, os
+
     raw = os.getenv("STRUCT_FIBCH_SETS", "")
     try:
         m = json.loads(raw) if raw else {}
@@ -1122,7 +1128,9 @@ def _fibch_params_from_env(symbol: str):
             return float(a), float(b), float(unit)
     except Exception:
         pass
+
     s = re.sub(r"[/\-: _]", "", symbol).upper()
+
     base = s[:-4] if s.endswith("USDT") else (s[:-3] if s.endswith("USD") else s)
     for k in (s, base+"USDT", base+"USD", base):
         v = os.getenv(f"STRUCT_FIBCH_{k}")
@@ -1130,6 +1138,7 @@ def _fibch_params_from_env(symbol: str):
             a, b, u = [float(x) for x in v.split(",")[:3]]
             return a, b, u
     return None
+
 
 def _get_anchors(symbol: str):
     s = re.sub(r"[/\-: _]", "", symbol).upper()
@@ -1211,6 +1220,7 @@ def _parse_ls(raw, n):
             out.append(t)
     return out
 
+
 def _apply_tv_template():
     os.environ.setdefault('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25')
     os.environ.setdefault('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6')
@@ -1290,6 +1300,7 @@ def handle_cmd(msg):
         os.environ['STRUCT_FIBCH_TEMPLATE']='tv'
         return 'Applied TV template.'
     return None
+
 # === ATH helpers ==============================================================
 def _get_ath_info(df: pd.DataFrame):
     """All-Time High price & timestamp index."""
@@ -1389,8 +1400,10 @@ def _draw_avwap_items(ax, df):
     if draw_ath:
         _plot_avwap(_ath_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"), os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"))
 
+
 def _draw_ath_line(ax, df):
     """Draw ATH horizontal line."""
+
     draw_ath = env_bool("STRUCT_DRAW_ATH", True)
     draw_h = env_bool("STRUCT_DRAW_ATH_H", True)
     col_ath = os.getenv("STRUCT_COL_ATH", "#000000")
@@ -1399,6 +1412,7 @@ def _draw_ath_line(ax, df):
     if draw_ath and draw_h and len(df):
         y_ath = float(df["high"].max())
         _draw_hline(ax, df, y_ath, col_ath, "ATH", lw=lw_ath, alpha=alpha_ath, z=2)
+
 
 
 def draw_prev_tops(ax, df, n=4, color="#ff8c00", lw=1.2, alpha=0.65,
@@ -11042,7 +11056,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     ax.set_yscale("log" if axis_scale == "log" else "linear")
 
     if tf_l == "15m":
+
         loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_XTICK_MAX", 10))
+
     elif tf_l == "4h":
         loc = mdates.AutoDateLocator(maxticks=8)
     elif tf_l.endswith("m"):
@@ -11051,14 +11067,17 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         loc = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
     for label in ax.get_xticklabels():
         label.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
     ax.grid(bool(env_int("STRUCT_XGRID_ON", 1)), axis='x', alpha=0.15)
+
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
             levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
-            _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
+            if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
+                _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
     except Exception as e:
         err_flags.append(("sr", e))
     try:
@@ -11078,7 +11097,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as e:
         err_flags.append(("bigfig", e))
     try:
+
         _draw_ath_line(ax, df_1d)
+
     except Exception as e:
         err_flags.append(("ath", e))
     try:
