@@ -1147,8 +1147,10 @@ def _smart_label_layout_v2(ax, pts: list[dict]):
     to_data = ax.transData.inverted().transform
 
     # === P6: 과밀도 기반 최소 간격 확장 ===
-    base_min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "9"))
-    th = int(os.getenv("STRUCT_LABEL_DENSITY_TH", "8"))           # 이 개수 초과면 확장
+
+    base_min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "10"))
+    th = int(os.getenv("STRUCT_FIBCH_LABEL_DENSITY_TH", "10"))           # 이 개수 초과면 확장
+
     grow = float(os.getenv("STRUCT_LABEL_DENSITY_GROW", "0.35"))  # 초과 1개당 배율 증가율
     max_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY_MAX", "18"))
     if len(pts) > th:
@@ -1260,16 +1262,27 @@ def _atr_last(df: pd.DataFrame, n: int = None) -> float:
         # 폴백: 최근 n봉 평균 범위
         return float((df["high"] - df["low"]).tail(max(n,3)).mean())
 
-def _fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr):
+
+def _fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr, tf: str | None = None):
+
     """
     레벨 노출 필터링:
       - close와의 거리/ATR이 [min, max] 범위에 드는 레벨만 남김
       - 가장 중요한 코어 레벨(0/0.5/1/1.25)은 항상 포함
       - 최종 개수를 max_count로 제한(가까운 순)
     """
-    import numpy as np
+
+    import numpy as np, os
     min_atr = float(os.getenv("STRUCT_FIBCH_VIS_MIN_ATR", "0.20"))
-    max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR", "6.0"))
+    base_max = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR", "10.0"))
+    tf_l = (tf or "").lower()
+    if tf_l == "4h":
+        max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR_4H", "12.0"))
+    elif tf_l in ("1d", "d"):
+        max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR_1D", "14.0"))
+    else:
+        max_atr = base_max
+
     max_count = int(os.getenv("STRUCT_FIBCH_VIS_MAX_COUNT", "9"))
     keep_core = {0.0, 0.5, 1.0, 1.25}
 
@@ -1303,56 +1316,133 @@ def _fibch_save(d):
 
 FIBCH = _fibch_load()
 
-def _fibch_params_from_env(symbol: str):
-    import re, json, os
+
+def _fibch_get_manual_params(symbol: str):
+    """Return (a1,a2,unit,used_key,candidates) from STRUCT_FIBCH_SETS JSON."""
+    import json, os, re
     raw = os.getenv("STRUCT_FIBCH_SETS", "")
+    candidates: list[str] = []
+    if not raw:
+        return None, None, candidates
     try:
-        m = json.loads(raw) if raw else {}
-        if symbol in m:
-            a, b = m[symbol]["anchors"]
-            unit = m[symbol]["unit"]
-            return float(a), float(b), float(unit)
+        data = json.loads(raw)
     except Exception:
-        pass
-    s = re.sub(r"[/\-: _]", "", symbol).upper()
-    base = s[:-4] if s.endswith("USDT") else (s[:-3] if s.endswith("USD") else s)
-    for k in (s, base+"USDT", base+"USD", base):
-        v = os.getenv(f"STRUCT_FIBCH_{k}")
-        if v:
-            a, b, u = [float(x) for x in v.split(",")[:3]]
-            return a, b, u
-    return None
+        return None, None, candidates
+    sym = symbol.upper()
+    base = sym.split(":")[-1]
+    # generate candidate keys
+    variants = {
+        sym,
+        base,
+        sym.replace("/", ""),
+        base.replace("/", ""),
+        re.sub(r"[:/_-]", "", sym),
+        re.sub(r"[:/_-]", "", base),
+    }
+    # expand with USD/USDT permutations
+    clean = re.sub(r"[:/_-]", "", base)
+    if clean.endswith("USDT"):
+        b = clean[:-4]
+        variants.update({f"{b}USDT", f"{b}/USDT", f"{b}USD", f"{b}/USD", b})
+    elif clean.endswith("USD"):
+        b = clean[:-3]
+        variants.update({f"{b}USD", f"{b}/USD", f"{b}USDT", f"{b}/USDT", b})
+    candidates = list(variants)
+    for k in candidates:
+        if k in data:
+            try:
+                a, b, u = data[k]["anchors"]
+                unit = data[k]["unit"]
+                return (float(a), float(b), float(unit)), k, candidates
+            except Exception:
+                continue
+    # canonical match
+    canon = re.sub(r"[^A-Z0-9]", "", sym)
+    for k, v in data.items():
+        if re.sub(r"[^A-Z0-9]", "", k.upper()) == canon:
+            try:
+                a, b, u = v["anchors"]
+                unit = v["unit"]
+                return (float(a), float(b), float(unit)), k, candidates
+            except Exception:
+                pass
+    return None, None, candidates
 
 def _get_anchors(symbol: str):
+    """Return anchor dict and metadata for symbol."""
     s = re.sub(r"[/\-: _]", "", symbol).upper()
+    used_key = None
+    cand = []
     if s in FIBCH:
-        return FIBCH[s]
-    params = _fibch_params_from_env(symbol)
+        return FIBCH[s], used_key, cand
+    params, used_key, cand = _fibch_get_manual_params(symbol)
     if params:
-        a,b,u = params
-        FIBCH[s] = {"a1":float(a), "a2":float(b), "unit":float(u)}
+        a, b, u = params
+        FIBCH[s] = {"a1": float(a), "a2": float(b), "unit": float(u)}
         _fibch_save(FIBCH)
-        return FIBCH[s]
-    return None
+        return FIBCH[s], used_key, cand
+    return None, used_key, cand
 
-def _resolve_weekly_anchor_points(df, a1, a2, symbol=""):
-    import pandas as pd, numpy as np, matplotlib.dates as mdates
-    tol = env_float("STRUCT_FIBCH_ANCH_TOL_PCT", 2.0) / 100.0
-    src = df['high'].resample('1W').max().to_frame('high')
-    def _find(price):
-        diff = (src['high'] - price).abs() / price
-        cand = diff[diff <= tol]
-        if not cand.empty:
-            idx = src.loc[cand.index, 'high'].idxmax()
-        else:
+
+def _fibch_resolve_anchors(df: pd.DataFrame, a1: float, a2: float, symbol: str = "", *,
+                           mode: str = "manual", used_key: str | None = None,
+                           cand_keys: list[str] | None = None):
+    """Resolve anchor timestamps optionally snapping to nearest bars."""
+    import matplotlib.dates as mdates, numpy as np, pandas as pd
+    cand_keys = cand_keys or []
+    trust = env_bool("STRUCT_FIBCH_TRUST_MANUAL", False)
+    snap = env_bool("STRUCT_FIBCH_SNAP_TO_BARS", True)
+    tol = env_float("STRUCT_FIBCH_ANCHOR_TOL_PCT", 0.12)
+    if trust or not snap:
+        ts1, ts2 = df.index[0], df.index[-1]
+        if ts1 == ts2:
+            logger.warning(f"[FIBCH] {symbol} anchor resolve fail mode={mode} snap={snap} tol={tol*100:.2f}% cand={cand_keys} used={used_key} ts_same=True")
+            return None
+        return mdates.date2num(ts1), float(a1), mdates.date2num(ts2), float(a2)
+
+    tf = os.getenv("STRUCT_FIBCH_ANCHOR_SEARCH_TF", "1d")
+    lookback = env_int("STRUCT_FIBCH_ANCHOR_LOOKBACK", 3000)
+    try:
+        rows = _load_ohlcv_rows(symbol, tf, limit=lookback)
+        src = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "vol"])
+        src["ts"] = pd.to_datetime(src["ts"], unit="ms")
+        src.set_index("ts", inplace=True)
+    except Exception as e:
+        logger.warning(f"[FIBCH] {symbol} anchor load fail mode={mode} snap={snap}: {e}")
+        src = df
+
+    def _snap(price: float):
+        cols = ["high", "low", "close"]
+        best_idx = None
+        best_price = price
+        best_diff = np.inf
+        for c in cols:
+            if c not in src:
+                continue
+            diff = (src[c] - price).abs() / max(abs(price), 1e-12)
             idx = diff.idxmin()
-            logger.warning(f"[FIBCH] {symbol} anchor {price} diff {diff.min()*100:.2f}% > tol")
-        return idx, float(src.loc[idx, 'high'])
-    idx1, y1 = _find(a1)
-    idx2, y2 = _find(a2)
-    logger.info(f"[FIBCH] {symbol} anchors resolved → {idx1.date()} @ {y1:,.2f} / {idx2.date()} @ {y2:,.2f}")
-    x1, x2 = mdates.date2num([idx1, idx2])
-    return x1, y1, x2, y2
+            d = float(diff.loc[idx])
+            if d < best_diff:
+                best_idx, best_price, best_diff = idx, float(src.loc[idx, c]), d
+        return best_idx, best_price, best_diff
+
+    idx1, y1, d1 = _snap(float(a1))
+    idx2, y2, d2 = _snap(float(a2))
+
+    ts1 = idx1 if d1 <= tol else src.index[0]
+    ts2 = idx2 if d2 <= tol else src.index[-1]
+    y1 = y1 if d1 <= tol else float(a1)
+    y2 = y2 if d2 <= tol else float(a2)
+
+    if ts1 == ts2:
+        ts1, ts2 = src.index[0], src.index[-1]
+        ts_same = True
+    else:
+        ts_same = False
+    if ts1 == ts2:
+        logger.warning(f"[FIBCH] {symbol} anchor resolve fail mode={mode} snap={snap} tol={tol*100:.2f}% cand={cand_keys} used={used_key} ts_same={ts_same}")
+        return None
+    return mdates.date2num(ts1), y1, mdates.date2num(ts2), y2
 
 def _fit_line(x1,y1,x2,y2):
     m = (y2 - y1) / (x2 - x1 + 1e-12)
@@ -1405,9 +1495,9 @@ def _parse_ls(raw, n):
 
 
 def _apply_tv_template():
-    os.environ.setdefault('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25')
-    os.environ.setdefault('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6')
-    os.environ.setdefault('STRUCT_FIBCH_LS','solid,dashed,solid,dashed,solid,dashed,dashed,dashed,solid,solid,solid')
+    os.environ.setdefault('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25,1.5')
+    os.environ.setdefault('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6,#ff66a6')
+    os.environ.setdefault('STRUCT_FIBCH_LS','solid,dashed,solid,dashed,solid,dashed,dashed,dashed,solid,solid,solid,solid')
     os.environ.setdefault('STRUCT_FIBCH_LWS','1.8')
     os.environ.setdefault('STRUCT_FIBCH_ALPHA','0.9')
     os.environ.setdefault('STRUCT_FIBCH_LABEL_ALPHA','0.9')
@@ -1435,22 +1525,61 @@ def _label_fibch(ax, lvl, xyR):
 def _draw_big_fib_channel(ax, df, symbol):
     import numpy as np, matplotlib.dates as mdates
     if os.getenv("STRUCT_FIBCH_TEMPLATE", "").lower() == "tv":
-        os.environ.setdefault("STRUCT_FIBCH_LEVELS", "0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25")
-        os.environ.setdefault("STRUCT_FIBCH_COLORS", "#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6")
-        os.environ.setdefault("STRUCT_FIBCH_LS", "solid,dashed,solid,dashed,solid,dashed,dashed,dashed,solid,solid,solid")
+        os.environ.setdefault("STRUCT_FIBCH_LEVELS", "0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25,1.5")
+        os.environ.setdefault("STRUCT_FIBCH_COLORS", "#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6,#ff66a6")
+        os.environ.setdefault("STRUCT_FIBCH_LS", "solid,dashed,solid,dashed,solid,dashed,dashed,dashed,solid,solid,solid,solid")
         os.environ.setdefault("STRUCT_FIBCH_LWS", "1.8")
         os.environ.setdefault("STRUCT_FIBCH_ALPHA", "0.90")
+    os.environ.setdefault("STRUCT_FIBCH_LABEL_MODE", "name+price")
+    os.environ.setdefault("STRUCT_FIBCH_LABEL_DENSITY_TH", "10")
+    os.environ.setdefault("STRUCT_FIBCH_LABEL_MIN_DY", "10")
+    os.environ.setdefault("STRUCT_FIBCH_EMPH_NAMES", "R1,R2,S1")
+    os.environ.setdefault("STRUCT_FIBCH_VIS_MAX_ATR", "10.0")
     if os.getenv('STRUCT_FIBCH_ENABLE','0')!='1':
         return
-    anc = _get_anchors(symbol)
+    anc, used_key, cand_keys = _get_anchors(symbol)
     if not anc:
+        logger.warning(f"[FIBCH] {symbol} anchors missing mode=manual snap={env_bool('STRUCT_FIBCH_SNAP_TO_BARS', True)} tol={env_float('STRUCT_FIBCH_ANCHOR_TOL_PCT',0.12)*100:.2f}% cand={cand_keys} used={used_key}")
         return
 
-    x1,y1,x2,y2 = _resolve_weekly_anchor_points(df, anc['a1'], anc['a2'], symbol)
+    res = _fibch_resolve_anchors(df, anc['a1'], anc['a2'], symbol, mode='manual', used_key=used_key, cand_keys=cand_keys)
+    if not res:
+        return
+    x1,y1,x2,y2 = res
     m,b = _fit_line(x1,y1,x2,y2)
     unit = float(anc['unit'])
 
-    levels = _parse_floats(os.getenv('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25'))
+    def _infer_tf():
+        if len(df) >= 2 and isinstance(df.index, pd.DatetimeIndex):
+            dt = df.index[-1] - df.index[-2]
+            mins = dt.total_seconds() / 60.0
+            if mins <= 20:
+                return "15m"
+            if mins <= 90:
+                return "1h"
+            if mins <= 360:
+                return "4h"
+        return "1d"
+
+    tf = _infer_tf()
+
+    levels = _parse_floats(os.getenv('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25,1.5'))
+    tf_vis_raw = os.getenv("STRUCT_FIBCH_TF_VIS", "15m,1h:1.25;4h,1d:1.5")
+    tf_map = {}
+    for seg in tf_vis_raw.split(';'):
+        if ':' not in seg:
+            continue
+        tfs, val = seg.split(':', 1)
+        try:
+            lim = float(val)
+        except ValueError:
+            continue
+        for t in tfs.split(','):
+            tt = t.strip()
+            if tt:
+                tf_map[tt] = lim
+    tf_cap = tf_map.get(tf, 1.5)
+    levels = [lv for lv in levels if float(lv) <= tf_cap]
     cols = _parse_colors(os.getenv('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6'), len(levels))
     lws = _parse_floats(os.getenv('STRUCT_FIBCH_LWS','1.8'), fill=len(levels))
     alpha = float(os.getenv('STRUCT_FIBCH_ALPHA', '0.9'))
@@ -1539,10 +1668,12 @@ def _draw_big_fib_channel(ax, df, symbol):
         name_map = _rs_preset_names(levels, m, b, unit, x_ref_num, close_price)
 
     # 가시성 필터
-    vis_levels = set(_fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr))
+
+    vis_levels = set(_fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr, tf=tf))
 
     # 강조 규칙
-    emph_names = {s.strip().upper() for s in os.getenv("STRUCT_FIBCH_EMPH_NAMES","R1,S1").split(",") if s.strip()}
+    emph_names = {s.strip().upper() for s in os.getenv("STRUCT_FIBCH_EMPH_NAMES","R1,R2,S1").split(",") if s.strip()}
+
     emph_lw    = float(os.getenv("STRUCT_FIBCH_EMPH_LW","2.2"))
     emph_alpha = float(os.getenv("STRUCT_FIBCH_EMPH_ALPHA","1.0"))
     deem_alpha = float(os.getenv("STRUCT_FIBCH_DEEMPH_ALPHA","0.55"))
@@ -1794,7 +1925,7 @@ def draw_prev_tops(ax, df, n=4, color="#ff8c00", lw=1.2, alpha=0.65,
     w = 2
     highs = sel['high']
     is_peak = highs.rolling(2*w+1, center=True)\
-                   .apply(lambda x: float(x[w] == x.max()), raw=False)\
+                   .apply(lambda s: float(s.iloc[w] == s.max()), raw=False)\
                    .fillna(0) > 0.5
 
     peaks = highs[is_peak].sort_values(ascending=False)
@@ -1828,7 +1959,7 @@ def draw_prev_tops(ax, df, n=4, color="#ff8c00", lw=1.2, alpha=0.65,
 def _pivot_high_idx(series, w=3):
     # 중심 w 창의 로컬 최대 인덱스 반환
     is_peak = series.rolling(2*w+1, center=True)\
-                    .apply(lambda x: float(x[w] == x.max()), raw=False)\
+                    .apply(lambda s: float(s.iloc[w] == s.max()), raw=False)\
                     .fillna(0) > 0.5
     return series[is_peak].index
 
