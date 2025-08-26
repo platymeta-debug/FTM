@@ -1803,7 +1803,9 @@ def _draw_big_fib_channel(ax, df, symbol):
 
     tf = _infer_tf()
 
-    calc_mode = visual_mode = "linear" if tf in ("15m","1h") else "log"
+    calc_mode  = os.getenv("STRUCT_CALC_SCALE_MODE","log")
+    visual_mode= os.getenv("STRUCT_AXIS_SCALE_VISUAL","log")
+
     channel = BigFibChannel(df, {"ts1": ts1, "a1": anc["a1"], "ts2": ts2, "a2": anc["a2"], "unit": anc["unit"]},
                             calc_mode=calc_mode, visual_mode=visual_mode)
     channel.draw(ax, symbol, tf)
