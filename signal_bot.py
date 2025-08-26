@@ -1132,13 +1132,61 @@ def _smart_label_layout(ax, pts: list[dict], min_px: float = None):
     return pts
 
 
+# ==== Label layout v2: clamp & priority ======================================
+def _smart_label_layout_v2(ax, pts: list[dict]):
+    """
+    pts: [{'x','y','text','color','fontsize','ha','va','dx','dy','priority'}]
+    1) 우선순위(priority DESC) -> 2) 현재 y 기준 정렬 -> 3) 겹침시 아래로 밀기
+    모든 y는 축 경계 내로 clamp (px margin 적용)
+    """
+    if not pts:
+        return pts
+
+    import numpy as np
+    to_disp = ax.transData.transform
+    to_data = ax.transData.inverted().transform
+
+    min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "9"))
+    top_px  = float(os.getenv("STRUCT_LABEL_CLAMP_TOP_PX", "6"))
+    bot_px  = float(os.getenv("STRUCT_LABEL_CLAMP_BOT_PX", "6"))
+
+    # data->display y 변환 & 초기 y_disp 저장
+    for p in pts:
+        xd, yd = to_disp((p["x"], p["y"]))
+        p["_x_disp"], p["_y_disp"] = xd, yd
+
+    # 축 상하 한계(디스플레이 좌표)
+    y_lo_data, y_hi_data = ax.get_ylim()
+    _, y_lo_disp = to_disp((0, y_lo_data))
+    _, y_hi_disp = to_disp((0, y_hi_data))
+    y_min = min(y_lo_disp, y_hi_disp) + bot_px
+    y_max = max(y_lo_disp, y_hi_disp) - top_px
+
+    # 우선순위 높은 것부터 배치(같으면 위에서 아래 순)
+    pts.sort(key=lambda z: (-int(z.get("priority", 0)), z["_y_disp"]))
+
+    placed = []
+    for p in pts:
+        y_target = np.clip(p["_y_disp"], y_min, y_max)
+        # 간격 보장: 이미 배치된 점들과 min_dy_px 유지
+        for q in placed:
+            if abs(y_target - q["_y_disp"]) < min_dy_px:
+                y_target = q["_y_disp"] + (min_dy_px if y_target >= q["_y_disp"] else -min_dy_px)
+                y_target = np.clip(y_target, y_min, y_max)
+        # 확정 후 역변환
+        new_x_data, new_y_data = to_data((p["_x_disp"], y_target))
+        p["y"] = float(new_y_data)
+        p.pop("_x_disp", None)
+        p.pop("_y_disp", None)
+        placed.append({"_y_disp": y_target})
+
+    return pts
+# =============================================================================
+
+
 def _line_at_x(m: float, b: float, x: float) -> float:
     """직선 y = m*x + b"""
     return m * x + b
-
-
-# === Big Fibonacci Channel ===================================================
-FIBCH_PATH = Path(__file__).with_name('fibch_anchors.json')
 
 
 def _latest_level_cross(df, m: float, b: float, lvl_offset: float, col="close", lookback=None, side="both"):
@@ -1163,7 +1211,7 @@ def _latest_level_cross(df, m: float, b: float, lvl_offset: float, col="close", 
                 t = abs(d0) / (abs(d0) + abs(d1))
                 x_cross = x[i-1] + (x[i] - x[i-1]) * t
                 y_cross = _line_at_x(m, b + lvl_offset, x_cross)
-                return (x_cross, y_cross)
+                return (x_cross, y_cross, i)
     except Exception as e:
         logger.info(f"[FIBCH_CROSS_WARN] {type(e).__name__}: {e}")
     return None
@@ -1175,6 +1223,25 @@ def _plot_marker(ax, x_num: float, y: float, color: str):
     ecw = float(os.getenv("STRUCT_FIBCH_MARK_EDGE", "1.0"))
     ax.scatter([mdates.num2date(x_num)], [y], s=ms, c=color, edgecolors="white",
                linewidths=ecw, zorder=int(os.getenv("STRUCT_Z_OVERLAY", "1")) + 1, clip_on=False)
+
+# --- 경과시간 포맷 -------------------------------------------------------------
+def _fmt_elapsed(dt: pd.Timedelta, mode: str = None) -> str:
+    mode = (mode or os.getenv("STRUCT_MARK_AGE_FMT", "short")).lower()
+    sec = int(abs(dt.total_seconds()))
+    d, h = divmod(sec, 86400)
+    h, m = divmod(h, 3600)
+    m, s = divmod(m, 60)
+    if mode == "dh":
+        return (f"{d}d" if d else "") + (f"{h}h" if h else ("0h" if d else ""))
+    if mode == "hm":
+        return (f"{h}h" if h else "") + (f"{m}m" if m else ("0m" if not h else ""))
+    if d:
+        return f"{d}d{h}h"
+    if h:
+        return f"{h}h{m}m"
+    if m:
+        return f"{m}m"
+    return f"{s}s"
 # =============================================================================
 
 
@@ -1203,7 +1270,6 @@ def _fibch_params_from_env(symbol: str):
     except Exception:
         pass
     s = re.sub(r"[/\-: _]", "", symbol).upper()
-
     base = s[:-4] if s.endswith("USDT") else (s[:-3] if s.endswith("USD") else s)
     for k in (s, base+"USDT", base+"USD", base):
         v = os.getenv(f"STRUCT_FIBCH_{k}")
@@ -1211,7 +1277,6 @@ def _fibch_params_from_env(symbol: str):
             a, b, u = [float(x) for x in v.split(",")[:3]]
             return a, b, u
     return None
-
 
 def _get_anchors(symbol: str):
     s = re.sub(r"[/\-: _]", "", symbol).upper()
@@ -1335,6 +1400,7 @@ def _draw_big_fib_channel(ax, df, symbol):
     anc = _get_anchors(symbol)
     if not anc:
         return
+
     x1,y1,x2,y2 = _resolve_weekly_anchor_points(df, anc['a1'], anc['a2'], symbol)
     m,b = _fit_line(x1,y1,x2,y2)
     unit = float(anc['unit'])
@@ -1362,11 +1428,60 @@ def _draw_big_fib_channel(ax, df, symbol):
     mark_on = os.getenv("STRUCT_FIBCH_MARK_ENABLE", "1") == "1"
     mark_side = os.getenv("STRUCT_FIBCH_MARK_SIDE", "both")
     mark_lookback = int(os.getenv("STRUCT_FIBCH_MARK_LOOKBACK", "600"))
+    mark_age_on = os.getenv("STRUCT_FIBCH_MARK_AGE", "1") == "1"
+    mark_age_dx = float(os.getenv("STRUCT_FIBCH_MARK_AGE_DX", "8"))
+    mark_age_dy = float(os.getenv("STRUCT_FIBCH_MARK_AGE_DY", "-2"))
+    mark_age_fs = int(os.getenv("STRUCT_FIBCH_MARK_AGE_FS", "8"))
+    mark_age_col = os.getenv("STRUCT_FIBCH_MARK_AGE_COLOR", "#333333")
+
 
     xmin, xmax = mdates.date2num(df.index[0]), mdates.date2num(df.index[-1])
     span = xmax - xmin
     ext_ratio = float(os.getenv("STRUCT_FIBCH_EXTEND_RATIO", "0.25"))
     xL, xR = xmin - span * ext_ratio, xmax + span * ext_ratio
+
+
+    x_ref_num = xR
+    close_price = float(df['close'].iloc[-1])
+
+    def _fib_level_priority(lv: float) -> int:
+        if lv in (0.0, 0.5, 1.0, 1.25):
+            return 3
+        if lv in (0.25, 0.75):
+            return 2
+        return 1
+
+    def _rs_preset_names(levels, m, b, unit, x_ref_num, close_price, topn=None):
+        import numpy as np
+        ranks = {}
+        above = []
+        below = []
+        for lv in levels:
+            y_at = _line_at_x(m, b + unit * lv, x_ref_num)
+            (above if y_at >= close_price else below).append((lv, abs(y_at - close_price)))
+        above.sort(key=lambda z: z[1])
+        below.sort(key=lambda z: z[1])
+        n = int(topn or os.getenv("STRUCT_FIBCH_RS_N", "4"))
+        for k, (lv, _) in enumerate(above[:n], 1):
+            ranks[lv] = f"R{k}"
+        for k, (lv, _) in enumerate(below[:n], 1):
+            ranks[lv] = f"S{k}"
+        return ranks
+
+    name_map = _rs_preset_names(levels, m, b, unit, x_ref_num, close_price)
+
+    def _compose_label(lv: float, y_val: float) -> str:
+        base = f"{lv:g}"
+        nm = name_map.get(lv)
+        if label_mode == "name":
+            return nm or base
+        if label_mode == "name+level":
+            return f"{(nm or '')} {base}".strip()
+        if label_mode == "name+price":
+            return f"{(nm or '')} {y_val:,.0f}".strip()
+        if label_mode == "level+price":
+            return f"{base} ({y_val:,.0f})"
+        return base
 
     label_candidates = []
     for i, lv in enumerate(levels):
@@ -1387,17 +1502,29 @@ def _draw_big_fib_channel(ax, df, symbol):
             if not hide_outside or (ax.get_ylim()[0] <= yr <= ax.get_ylim()[1]):
                 label_candidates.append({
                     "x": mdates.num2date(xr), "y": yr,
-                    "text": (f"{lv:g}" if label_mode == "level" else f"{lv:g} ({yr:,.0f})"),
+                    "text": _compose_label(float(lv), float(yr)),
                     "color": label_col, "fontsize": label_fs,
                     "ha": "left" if label_side == "right" else "right",
                     "va": "center",
                     "dx": label_dx if label_side == "right" else -label_dx,
                     "dy": label_dy,
+                    "priority": _fib_level_priority(float(lv)),
                 })
         if mark_on:
             cross = _latest_level_cross(df, m, b, dy, col="close", lookback=mark_lookback, side=mark_side)
             if cross:
-                _plot_marker(ax, cross[0], cross[1], color=cols[i] if i < len(cols) else cols[0])
+                x_num, y_m, i_idx = cross
+                _plot_marker(ax, x_num, y_m, color=cols[i] if i < len(cols) else cols[0])
+                if mark_age_on and 0 <= i_idx < len(df):
+                    now_ts = df.index[-1]
+                    cross_ts = df.index[i_idx]
+                    age = now_ts - cross_ts
+                    txt = _fmt_elapsed(age)
+                    ax.annotate(txt, xy=(mdates.num2date(x_num), y_m), xycoords='data',
+                                xytext=(mark_age_dx, mark_age_dy), textcoords='offset points',
+                                ha='left', va='center', fontsize=mark_age_fs,
+                                color=mark_age_col, alpha=0.9, clip_on=False,
+                                zorder=env_int('STRUCT_Z_OVERLAY',1)+2)
 
     for mlv in mid_levels:
         dy = unit * mlv
@@ -1409,7 +1536,7 @@ def _draw_big_fib_channel(ax, df, symbol):
                 zorder=env_int('STRUCT_Z_OVERLAY',1))
 
     if label_candidates:
-        laid = _smart_label_layout(ax, label_candidates, min_px=float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY","9")))
+        laid = _smart_label_layout_v2(ax, label_candidates)
         for p in laid:
             ax.annotate(p["text"], xy=(p["x"], p["y"]), xycoords="data",
                         xytext=(p["dx"], p["dy"]), textcoords="offset points",
@@ -1419,7 +1546,6 @@ def _draw_big_fib_channel(ax, df, symbol):
 
     if ext_ratio > 0:
         _apply_right_pad(ax, ext_ratio)
-
 
 def fibch_set(symbol, a1, a2, unit, save=True):
     s = symbol.upper()
@@ -1441,7 +1567,6 @@ def handle_cmd(msg):
         os.environ['STRUCT_FIBCH_TEMPLATE']='tv'
         return 'Applied TV template.'
     return None
-
 # === ATH helpers ==============================================================
 def _get_ath_info(df: pd.DataFrame):
     """All-Time High price & timestamp index."""
@@ -1526,6 +1651,7 @@ def _draw_avwap_items(ax, df):
         px = df["close"].values.astype(float)
     vol = df[vcol].values.astype(float)
 
+
     def _plot_avwap(anchor_idx, color, label):
         vw = anchored_vwap(px, vol, anchor_idx)
         if vw is None:
@@ -1534,6 +1660,7 @@ def _draw_avwap_items(ax, df):
             _draw_hline(ax, df, float(vw[-1]), color, label, lw=lw, alpha=0.95, z=1)
         else:
             ax.plot(df.index, vw, color=color, linewidth=lw, alpha=0.95, label=label, zorder=1)
+
 
     if draw_ytd:
         _plot_avwap(_ytd_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"), os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"))
@@ -11196,7 +11323,6 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     ax.set_yscale("log" if axis_scale == "log" else "linear")
 
     if tf_l == "15m":
-
         loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_XTICK_MAX", 10))
 
     elif tf_l == "4h":
@@ -11207,7 +11333,6 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         loc = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
-
     for label in ax.get_xticklabels():
         label.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
     ax.grid(bool(env_int("STRUCT_XGRID_ON", 1)), axis='x', alpha=0.15)
@@ -11248,7 +11373,6 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as _e:
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
     try:
-
         _draw_big_fib_channel(ax, df, symbol)
 
     except Exception as e:
