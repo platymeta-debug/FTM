@@ -1198,8 +1198,10 @@ def _smart_label_layout_v2(ax, pts: list[dict]):
     to_data = ax.transData.inverted().transform
 
     # === P6: 과밀도 기반 최소 간격 확장 ===
+
     base_min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "10"))
     th = int(os.getenv("STRUCT_FIBCH_LABEL_DENSITY_TH", "10"))           # 이 개수 초과면 확장
+
     grow = float(os.getenv("STRUCT_LABEL_DENSITY_GROW", "0.35"))  # 초과 1개당 배율 증가율
     max_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY_MAX", "18"))
     if len(pts) > th:
@@ -1311,13 +1313,16 @@ def _atr_last(df: pd.DataFrame, n: int = None) -> float:
         # 폴백: 최근 n봉 평균 범위
         return float((df["high"] - df["low"]).tail(max(n,3)).mean())
 
+
 def _fib_visibility_filter(channel, levels, df, x_ref_num, atr, tf: str | None = None):
+
     """
     레벨 노출 필터링:
       - close와의 거리/ATR이 [min, max] 범위에 드는 레벨만 남김
       - 가장 중요한 코어 레벨(0/0.5/1/1.25)은 항상 포함
       - 최종 개수를 max_count로 제한(가까운 순)
     """
+
     import numpy as np, os
     min_atr = float(os.getenv("STRUCT_FIBCH_VIS_MIN_ATR", "0.20"))
     base_max = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR", "10.0"))
@@ -1328,6 +1333,7 @@ def _fib_visibility_filter(channel, levels, df, x_ref_num, atr, tf: str | None =
         max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR_1D", "14.0"))
     else:
         max_atr = base_max
+
     max_count = int(os.getenv("STRUCT_FIBCH_VIS_MAX_COUNT", "9"))
     keep_core = {0.0, 0.5, 1.0, 1.25}
 
@@ -1335,6 +1341,7 @@ def _fib_visibility_filter(channel, levels, df, x_ref_num, atr, tf: str | None =
     scores = []
     for lv in levels:
         y_at = channel.price_at_level(x_ref_num, lv)
+
         dist = abs(y_at - close)
         dist_atr = (dist/atr) if atr>0 else 999.0
         scores.append((float(lv), dist_atr))
@@ -1544,6 +1551,7 @@ def _get_anchors(symbol: str):
         return FIBCH[s], used_key, cand
     params, used_key, cand = _fibch_get_manual_params(symbol)
     if params:
+
         (ts1, a1), (ts2, a2), u = params
         FIBCH[s] = {
             "ts1": str(ts1),
@@ -1555,6 +1563,7 @@ def _get_anchors(symbol: str):
         _fibch_save(FIBCH)
         return FIBCH[s], used_key, cand
     return None, used_key, cand
+
 
 def _fit_line(x1,y1,x2,y2):
     m = (y2 - y1) / (x2 - x1 + 1e-12)
@@ -1751,14 +1760,17 @@ class BigFibChannel:
 def _draw_big_fib_channel(ax, df, symbol):
     import matplotlib.dates as mdates
     if os.getenv("STRUCT_FIBCH_TEMPLATE", "").lower() == "tv":
+
         _apply_tv_template()
     os.environ.setdefault("STRUCT_FIBCH_LABEL_MODE", "name+price")
     os.environ.setdefault("STRUCT_FIBCH_LABEL_MIN_DY", "12")
     os.environ.setdefault("STRUCT_FIBCH_EMPH_NAMES", "R1,S1")
+
     if os.getenv('STRUCT_FIBCH_ENABLE','0')!='1':
         return
     anc, used_key, cand_keys = _get_anchors(symbol)
     if not anc:
+
         logger.warning(f"[FIBCH] {symbol} anchors missing cand={cand_keys} used={used_key}")
         return
     try:
@@ -1767,6 +1779,7 @@ def _draw_big_fib_channel(ax, df, symbol):
     except Exception:
         logger.warning(f"[FIBCH] {symbol} anchor timestamps invalid cand={cand_keys} used={used_key}")
         return
+
 
     def _infer_tf():
         if len(df) >= 2 and isinstance(df.index, pd.DatetimeIndex):
@@ -1781,6 +1794,7 @@ def _draw_big_fib_channel(ax, df, symbol):
         return "1d"
 
     tf = _infer_tf()
+
     calc_mode = visual_mode = "linear" if tf in ("15m","1h") else "log"
     channel = BigFibChannel(df, {"ts1": ts1, "a1": anc["a1"], "ts2": ts2, "a2": anc["a2"], "unit": anc["unit"]},
                             calc_mode=calc_mode, visual_mode=visual_mode)
@@ -1795,6 +1809,7 @@ def _draw_big_fib_channel(ax, df, symbol):
         ax.get_yaxis().set_major_formatter(FuncFormatter(lambda x, p: f"{x:,.0f}"))
     if tf=="15m":
         ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=env_int("STRUCT_XTICK_MAX",10)))
+
 # === ATH helpers ==============================================================
 def _get_ath_info(df: pd.DataFrame):
     """All-Time High price & timestamp index."""
