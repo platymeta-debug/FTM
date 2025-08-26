@@ -20,6 +20,17 @@ import datetime as dt
 logger = logging.getLogger(__name__)
 
 
+def _safe_log10(arr):
+    import numpy as np
+    return np.log10(np.clip(arr, 1e-12, np.inf))
+
+
+def _safe_pow10(arr):
+    import numpy as np
+    # float64 안전영역으로 클리핑하여 overflow 경고 방지
+    return np.power(10.0, np.clip(arr, -308.0, 308.0))
+
+
 # [ANCHOR: DEBUG_FLAG_BEGIN]
 def _env_on(k: str, default="0") -> bool:
     """Return True if env var looks like on: 1/true/yes/on (case-insensitive)."""
@@ -648,15 +659,16 @@ def y_to_scale(y, mode: str):
     arr = np.asarray(y, dtype=float)
 
     if mode == "log":
-        arr = np.clip(arr, 1e-12, None)
-        return np.log10(arr)
+        return _safe_log10(arr)
     return arr.copy()
 
 
 def _apply_scale(arr, mode):
     arr = np.asarray(arr, dtype=float)
     if mode == "log":
-        return np.power(10.0, np.clip(arr, -308, 308))  # overflow 방지
+
+        return _safe_pow10(arr)
+
     return arr
 
 
@@ -1282,8 +1294,10 @@ def _draw_avwap_items(ax, df):
     if draw_ath:
         _plot_avwap(_ath_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"), os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"))
 
-def _draw_ath_prev_lines(ax, df):
-    """Draw ATH and previous top horizontal lines."""
+
+def _draw_ath_line(ax, df):
+    """Draw ATH horizontal line."""
+
     draw_ath = env_bool("STRUCT_DRAW_ATH", True)
     draw_h = env_bool("STRUCT_DRAW_ATH_H", True)
     col_ath = os.getenv("STRUCT_COL_ATH", "#000000")
@@ -1293,21 +1307,107 @@ def _draw_ath_prev_lines(ax, df):
         y_ath = float(df["high"].max())
         _draw_hline(ax, df, y_ath, col_ath, "ATH", lw=lw_ath, alpha=alpha_ath, z=2)
 
-    n_prev = env_int("STRUCT_PREV_TOP_N", 0)
-    if n_prev > 0 and len(df):
-        df_w = df.resample('W').agg({'high':'max','low':'min','close':'last','open':'first'})
-        highs = df_w['high'].values
-        pivot = 3
-        idxs = []
-        for i in range(pivot, len(highs)-pivot):
-            if highs[i] == np.max(highs[i-pivot:i+pivot+1]):
-                idxs.append(i)
-        prices = sorted([float(highs[i]) for i in idxs], reverse=True)[:n_prev]
-        col_prev = os.getenv("STRUCT_COL_PREV_TOP", col_ath)
-        lw_prev = env_float("STRUCT_LW_PREV_TOP", lw_ath)
-        alpha_prev = env_float("STRUCT_PREV_TOP_ALPHA", alpha_ath)
-        for j, price in enumerate(prices, 1):
-            _draw_hline(ax, df, price, col_prev, f"Prev Top {j}", lw=lw_prev, alpha=alpha_prev, z=1)
+
+
+def draw_prev_tops(ax, df, n=4, color="#ff8c00", lw=1.2, alpha=0.65,
+                   weekly_only=True, before_ath_only=True,
+                   show_v=False, v_color="#ff8c00", v_alpha=0.25,
+                   zorder=1, label_prefix="Prev top"):
+    """
+    df: 원본 일봉 데이터(또는 그 이상). index=Datetime, columns include ['high']
+    n: ATH 이전의 큰 고점 n개
+    weekly_only: 주봉으로 리샘플하여 잡을지
+    before_ath_only: 절대최고점 이전 구간에서만 찾을지
+    show_v: 수직 가이드 표시
+    """
+    import pandas as pd, numpy as np, matplotlib.dates as mdates
+
+    if df.empty:
+        return
+
+    src = df.copy()
+    if weekly_only:
+        # 주봉 high를 사용
+        src = df['high'].resample('1W').max().to_frame('high')
+        # 주봉 기준의 타임스탬프를 중앙으로 이동(시각화 안정)
+        src.index = src.index + pd.Timedelta(days=3)
+
+    # ATH
+    ath_idx = src['high'].idxmax()
+    sel = src[src.index < ath_idx] if before_ath_only else src
+
+    # 국소 최대값(주변 2~3주 대비 높은 봉)
+    w = 2
+    highs = sel['high']
+    is_peak = highs.rolling(2*w+1, center=True)\
+                   .apply(lambda x: float(x[w] == x.max()), raw=False)\
+                   .fillna(0) > 0.5
+
+    peaks = highs[is_peak].sort_values(ascending=False)
+    peaks = peaks[~peaks.index.duplicated(keep='first')]
+
+    # 너무 근접한 고점 제거(가격 0.5% 이내는 하나로 간주)
+    picked = []
+    for ts, val in peaks.items():
+        if all(abs(val - v) / v > 0.005 for _, v in picked):
+            picked.append((ts, val))
+        if len(picked) >= n:
+            break
+
+    if not picked:
+        return
+
+    x0, x1 = ax.get_xlim()
+    x0d, x1d = mdates.num2date(x0), mdates.num2date(x1)
+
+    for i, (ts, price) in enumerate(sorted(picked, key=lambda t:t[1], reverse=True)):
+        # 수평선
+        ax.axhline(price, color=color, lw=lw, alpha=alpha, zorder=zorder)
+        # 라벨은 범례에 1개만
+    ax.plot([], [], color=color, lw=lw, alpha=alpha, label=f"{label_prefix} ({len(picked)})")
+
+    if show_v:
+        for ts, _ in picked:
+            ax.axvline(ts, color=v_color, lw=1.0, alpha=v_alpha, zorder=zorder-0.1)
+
+
+def _pivot_high_idx(series, w=3):
+    # 중심 w 창의 로컬 최대 인덱스 반환
+    is_peak = series.rolling(2*w+1, center=True)\
+                    .apply(lambda x: float(x[w] == x.max()), raw=False)\
+                    .fillna(0) > 0.5
+    return series[is_peak].index
+
+
+def draw_shortterm_down_res(ax, df_1d, lookback_days=120, w=3,
+                            color="#dc3545", lw=1.8, alpha=0.9,
+                            linestyle=(0,(6,6)),  # dashed
+                            label="단기 하락 저항선",
+                            zorder=1):
+    import pandas as pd, numpy as np, matplotlib.dates as mdates
+    if df_1d.empty:
+        return
+    st = df_1d.index.max() - pd.Timedelta(days=lookback_days)
+    seg = df_1d[df_1d.index >= st]
+    if len(seg) < 2*w+1:
+        return
+    piv_idx = _pivot_high_idx(seg['high'], w=w)
+    if len(piv_idx) < 2:
+        return
+    # 최근 두 개의 피벗 high (오래된 것 -> 최근 것)
+    x1, x2 = piv_idx[-2], piv_idx[-1]
+    y1, y2 = seg.loc[x1, 'high'], seg.loc[x2, 'high']
+    # y = m*x + b (x는 날짜수)
+    xnum1, xnum2 = mdates.date2num([x1, x2])
+    m = (y2 - y1) / (xnum2 - xnum1 + 1e-12)
+    b = y1 - m*xnum1
+
+    # 전체 가시영역 + 우측 패딩까지 연장
+    x0, x1 = ax.get_xlim()
+    xs = [x0, x1]
+    ys = [m*xs[0] + b, m*xs[1] + b]
+    ax.plot(xs, ys, color=color, lw=lw, alpha=alpha, linestyle=linestyle, zorder=zorder, label=label)
+
 
 
 
@@ -1316,7 +1416,7 @@ def _bigfig_levels(ax, df, k:int=6):
     if len(df)==0: return
     close = float(df["close"].iloc[-1])
     # 자릿수 결정 (현재가 규모에 맞춰 1-2-5 스텝)
-    mag = 10 ** int(np.floor(np.log10(max(close,1e-9))))
+    mag = _safe_pow10(int(np.floor(_safe_log10(max(close,1e-9)))))
     step = mag
     for m in (1,2,5,10):
         if close / (mag*m) < 8:
@@ -10803,6 +10903,13 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     df = _rows_to_df(df)
     if df is None or len(df) == 0:
         return None
+    try:
+        df_1d = _rows_to_df(get_ohlcv(symbol, '1d', limit=300))
+    except Exception:
+        try:
+            df_1d = df.resample('1D').agg({'open':'first','high':'max','low':'min','close':'last','volume':'sum'})
+        except Exception:
+            df_1d = df
     def _parse_size(s, default_w, default_h):
         try:
             w, h = [int(x.strip()) for x in str(s).lower().replace("x", ",").split(",")[:2]]
@@ -10844,22 +10951,22 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     ax.set_yscale("log" if axis_scale == "log" else "linear")
 
     if tf_l == "15m":
-        loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_15M_XTICK_MIN", 6),
-                                     maxticks=env_int("STRUCT_XTICK_MAX", 10))
-    elif tf_l.endswith("m"):
-        loc = mdates.AutoDateLocator(minticks=4,
-                                     maxticks=env_int("STRUCT_XTICK_MAX", 10))
+
+        loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_XTICK_MAX", 10))
+
     elif tf_l == "4h":
         loc = mdates.AutoDateLocator(maxticks=8)
+    elif tf_l.endswith("m"):
+        loc = mdates.AutoDateLocator(minticks=4, maxticks=env_int("STRUCT_XTICK_MAX", 10))
     else:
         loc = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
-    if env_bool("STRUCT_XGRID_ON", False):
-        ax.grid(True, axis="x", alpha=0.3)
 
-    for lab in ax.get_xticklabels():
-        lab.set_rotation(int(os.getenv("STRUCT_XTICK_ROT", "0")))
+    for label in ax.get_xticklabels():
+        label.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
+    ax.grid(bool(env_int("STRUCT_XGRID_ON", 1)), axis='x', alpha=0.15)
+
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
@@ -10885,7 +10992,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as e:
         err_flags.append(("bigfig", e))
     try:
-        _draw_ath_prev_lines(ax, df)
+
+        _draw_ath_line(ax, df_1d)
+
     except Exception as e:
         err_flags.append(("ath", e))
     try:
@@ -10897,6 +11006,39 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         _draw_big_fib_channel(ax, df, symbol, ycol="close")
     except Exception as e:
         err_flags.append(("bigfib", e))
+    try:
+        if env_bool("STRUCT_DRAW_PREV_TOPS", True):
+            draw_prev_tops(
+                ax, df_1d,
+                n=env_int("STRUCT_PREV_TOP_N", 4),
+                color=os.getenv("STRUCT_COL_PREV_TOP", "#ff8c00"),
+                lw=env_float("STRUCT_LW_PREV_TOP", 1.2),
+                alpha=env_float("STRUCT_PREV_TOP_ALPHA", 0.65),
+                weekly_only=env_bool("STRUCT_PREV_TOP_WEEKLY", True),
+                before_ath_only=env_bool("STRUCT_PREV_TOP_ONLY_BEFORE_ATH", True),
+                show_v=env_bool("STRUCT_PREV_TOP_SHOW_V", False),
+                v_color=os.getenv("STRUCT_COL_PREV_TOP", "#ff8c00"),
+                v_alpha=env_float("STRUCT_PREV_TOP_V_ALPHA", 0.25),
+                zorder=env_int("STRUCT_Z_RS", 2),
+                label_prefix=os.getenv("STRUCT_LBL_PREV_TOP", "Prev top"),
+            )
+    except Exception as e:
+        err_flags.append(("prevtop", e))
+    try:
+        if env_bool("STRUCT_STDN_ENABLE", True):
+            draw_shortterm_down_res(
+                ax, df_1d,
+                lookback_days=env_int("STRUCT_STDN_LOOKBACK_D", 120),
+                w=env_int("STRUCT_STDN_PIVOT_WINDOW", 3),
+                color=os.getenv("STRUCT_COL_TL_DN", "#dc3545"),
+                lw=env_float("STRUCT_LW_TL", 1.8),
+                alpha=0.9,
+                linestyle=(0,(6,6)),
+                label=os.getenv("STRUCT_LBL_TL_DN", "단기 하락 저항선"),
+                zorder=env_int("STRUCT_Z_OVERLAY", 1),
+            )
+    except Exception as e:
+        err_flags.append(("stdn", e))
     atr_n = env_int("STRUCT_ATR_N", 14)
     atr = _safe_atr(df, atr_n)
 
@@ -10914,7 +11056,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
     try:
 
-        fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
+        fig.tight_layout()
         fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches=None)
     except Exception as e:
         plt.close(fig)
