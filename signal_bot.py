@@ -32,6 +32,22 @@ def _safe_pow10(arr):
     return np.power(10.0, np.clip(arr, -308.0, 308.0))
 
 
+def y_to_calc(y, mode):
+    """Convert price to calculation space."""
+    y = np.asarray(y, float)
+    if mode == "log":
+        return np.log10(np.clip(y, 1e-9, None))
+    return y
+
+
+def y_from_calc(yc, mode):
+    """Convert from calculation space back to price."""
+    yc = np.asarray(yc, float)
+    if mode == "log":
+        return np.power(10.0, yc)
+    return yc
+
+
 # [ANCHOR: DEBUG_FLAG_BEGIN]
 def _env_on(k: str, default="0") -> bool:
     """Return True if env var looks like on: 1/true/yes/on (case-insensitive)."""
@@ -1146,7 +1162,16 @@ def _smart_label_layout_v2(ax, pts: list[dict]):
     to_disp = ax.transData.transform
     to_data = ax.transData.inverted().transform
 
-    min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "9"))
+    # === P6: 과밀도 기반 최소 간격 확장 ===
+    base_min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "10"))
+    th = int(os.getenv("STRUCT_FIBCH_LABEL_DENSITY_TH", "10"))           # 이 개수 초과면 확장
+    grow = float(os.getenv("STRUCT_LABEL_DENSITY_GROW", "0.35"))  # 초과 1개당 배율 증가율
+    max_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY_MAX", "18"))
+    if len(pts) > th:
+        extra = (len(pts) - th) * grow
+        min_dy_px = min(max_px, base_min_dy_px * (1.0 + extra))
+    else:
+        min_dy_px = base_min_dy_px
     top_px  = float(os.getenv("STRUCT_LABEL_CLAMP_TOP_PX", "6"))
     bot_px  = float(os.getenv("STRUCT_LABEL_CLAMP_BOT_PX", "6"))
 
@@ -1242,6 +1267,49 @@ def _fmt_elapsed(dt: pd.Timedelta, mode: str = None) -> str:
     if m:
         return f"{m}m"
     return f"{s}s"
+# ==== P6: visibility & ATR helpers ==========================================
+def _atr_last(df: pd.DataFrame, n: int = None) -> float:
+    n = int(os.getenv("STRUCT_ATR_N","14")) if n is None else n
+    try:
+        return float(ta_atr(df["high"], df["low"], df["close"], n)[-1])
+    except Exception:
+        # 폴백: 최근 n봉 평균 범위
+        return float((df["high"] - df["low"]).tail(max(n,3)).mean())
+
+def _fib_visibility_filter(channel, levels, df, x_ref_num, atr, tf: str | None = None):
+    """
+    레벨 노출 필터링:
+      - close와의 거리/ATR이 [min, max] 범위에 드는 레벨만 남김
+      - 가장 중요한 코어 레벨(0/0.5/1/1.25)은 항상 포함
+      - 최종 개수를 max_count로 제한(가까운 순)
+    """
+    import numpy as np, os
+    min_atr = float(os.getenv("STRUCT_FIBCH_VIS_MIN_ATR", "0.20"))
+    base_max = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR", "10.0"))
+    tf_l = (tf or "").lower()
+    if tf_l == "4h":
+        max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR_4H", "12.0"))
+    elif tf_l in ("1d", "d"):
+        max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR_1D", "14.0"))
+    else:
+        max_atr = base_max
+    max_count = int(os.getenv("STRUCT_FIBCH_VIS_MAX_COUNT", "9"))
+    keep_core = {0.0, 0.5, 1.0, 1.25}
+
+    close = float(df["close"].iloc[-1])
+    scores = []
+    for lv in levels:
+        y_at = channel.price_at_level(x_ref_num, lv)
+        dist = abs(y_at - close)
+        dist_atr = (dist/atr) if atr>0 else 999.0
+        scores.append((float(lv), dist_atr))
+
+    # 범위 필터 + 코어 유지
+    cand = [lv for lv,da in scores if (min_atr <= da <= max_atr) or (lv in keep_core)]
+    # 가까운 순 정렬
+    cand.sort(key=lambda lv: next(da for l,da in scores if l==lv))
+    # 개수 제한
+    return cand[:max_count]
 # =============================================================================
 
 
@@ -1258,56 +1326,83 @@ def _fibch_save(d):
 
 FIBCH = _fibch_load()
 
-def _fibch_params_from_env(symbol: str):
-    import re, json, os
+
+def _fibch_get_manual_params(symbol: str):
+    """Return ((ts1,p1),(ts2,p2),unit,used_key,candidates) from STRUCT_FIBCH_SETS JSON."""
+    import json, os, re, pandas as pd
     raw = os.getenv("STRUCT_FIBCH_SETS", "")
+    candidates: list[str] = []
+    if not raw:
+        return None, None, candidates
     try:
-        m = json.loads(raw) if raw else {}
-        if symbol in m:
-            a, b = m[symbol]["anchors"]
-            unit = m[symbol]["unit"]
-            return float(a), float(b), float(unit)
+        data = json.loads(raw)
     except Exception:
-        pass
-    s = re.sub(r"[/\-: _]", "", symbol).upper()
-    base = s[:-4] if s.endswith("USDT") else (s[:-3] if s.endswith("USD") else s)
-    for k in (s, base+"USDT", base+"USD", base):
-        v = os.getenv(f"STRUCT_FIBCH_{k}")
-        if v:
-            a, b, u = [float(x) for x in v.split(",")[:3]]
-            return a, b, u
-    return None
+        return None, None, candidates
+    sym = symbol.upper()
+    base = sym.split(":")[-1]
+    variants = {
+        sym,
+        base,
+        sym.replace("/", ""),
+        base.replace("/", ""),
+        re.sub(r"[:/_-]", "", sym),
+        re.sub(r"[:/_-]", "", base),
+    }
+    clean = re.sub(r"[:/_-]", "", base)
+    if clean.endswith("USDT"):
+        b = clean[:-4]
+        variants.update({f"{b}USDT", f"{b}/USDT", f"{b}USD", f"{b}/USD", b})
+    elif clean.endswith("USD"):
+        b = clean[:-3]
+        variants.update({f"{b}USD", f"{b}/USD", f"{b}USDT", f"{b}/USDT", b})
+    candidates = list(variants)
+    for k in candidates:
+        if k in data:
+            try:
+                a1_raw, a2_raw = data[k]["anchors"]
+                unit = float(data[k]["unit"])
+                ts1_str, p1 = a1_raw.split("@")
+                ts2_str, p2 = a2_raw.split("@")
+                ts1 = pd.Timestamp(ts1_str, tz="UTC")
+                ts2 = pd.Timestamp(ts2_str, tz="UTC")
+                return ((ts1, float(p1)), (ts2, float(p2)), unit), k, candidates
+            except Exception:
+                continue
+    canon = re.sub(r"[^A-Z0-9]", "", sym)
+    for k, v in data.items():
+        if re.sub(r"[^A-Z0-9]", "", k.upper()) == canon:
+            try:
+                a1_raw, a2_raw = v["anchors"]
+                unit = float(v["unit"])
+                ts1_str, p1 = a1_raw.split("@")
+                ts2_str, p2 = a2_raw.split("@")
+                ts1 = pd.Timestamp(ts1_str, tz="UTC")
+                ts2 = pd.Timestamp(ts2_str, tz="UTC")
+                return ((ts1, float(p1)), (ts2, float(p2)), unit), k, candidates
+            except Exception:
+                pass
+    return None, None, candidates
 
 def _get_anchors(symbol: str):
+    """Return anchor dict and metadata for symbol."""
     s = re.sub(r"[/\-: _]", "", symbol).upper()
+    used_key = None
+    cand = []
     if s in FIBCH:
-        return FIBCH[s]
-    params = _fibch_params_from_env(symbol)
+        return FIBCH[s], used_key, cand
+    params, used_key, cand = _fibch_get_manual_params(symbol)
     if params:
-        a,b,u = params
-        FIBCH[s] = {"a1":float(a), "a2":float(b), "unit":float(u)}
+        (ts1, a1), (ts2, a2), u = params
+        FIBCH[s] = {
+            "ts1": str(ts1),
+            "a1": float(a1),
+            "ts2": str(ts2),
+            "a2": float(a2),
+            "unit": float(u),
+        }
         _fibch_save(FIBCH)
-        return FIBCH[s]
-    return None
-
-def _resolve_weekly_anchor_points(df, a1, a2, symbol=""):
-    import pandas as pd, numpy as np, matplotlib.dates as mdates
-    tol = env_float("STRUCT_FIBCH_ANCH_TOL_PCT", 2.0) / 100.0
-    src = df['high'].resample('1W').max().to_frame('high')
-    def _find(price):
-        diff = (src['high'] - price).abs() / price
-        cand = diff[diff <= tol]
-        if not cand.empty:
-            idx = src.loc[cand.index, 'high'].idxmax()
-        else:
-            idx = diff.idxmin()
-            logger.warning(f"[FIBCH] {symbol} anchor {price} diff {diff.min()*100:.2f}% > tol")
-        return idx, float(src.loc[idx, 'high'])
-    idx1, y1 = _find(a1)
-    idx2, y2 = _find(a2)
-    logger.info(f"[FIBCH] {symbol} anchors resolved → {idx1.date()} @ {y1:,.2f} / {idx2.date()} @ {y2:,.2f}")
-    x1, x2 = mdates.date2num([idx1, idx2])
-    return x1, y1, x2, y2
+        return FIBCH[s], used_key, cand
+    return None, used_key, cand
 
 def _fit_line(x1,y1,x2,y2):
     m = (y2 - y1) / (x2 - x1 + 1e-12)
@@ -1360,213 +1455,194 @@ def _parse_ls(raw, n):
 
 
 def _apply_tv_template():
-    os.environ.setdefault('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25')
-    os.environ.setdefault('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6')
-    os.environ.setdefault('STRUCT_FIBCH_LS','solid,dashed,solid,dashed,solid,dashed,dashed,dashed,solid,solid,solid')
+    os.environ.setdefault('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25,1.5')
+    os.environ.setdefault('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6,#ff66a6')
+    os.environ.setdefault('STRUCT_FIBCH_LS','solid,dashed,solid,dashed,solid,dashed,dashed,dashed,solid,solid,solid,solid')
     os.environ.setdefault('STRUCT_FIBCH_LWS','1.8')
     os.environ.setdefault('STRUCT_FIBCH_ALPHA','0.9')
     os.environ.setdefault('STRUCT_FIBCH_LABEL_ALPHA','0.9')
 
-def _label_fibch(ax, lvl, xyR):
-    mode = env('STRUCT_FIBCH_LABEL_MODE','level')
-    if mode=='none':
+def _fib_level_priority(lv: float) -> int:
+    if lv in (0.0, 0.5, 1.0, 1.25):
+        return 3
+    if lv in (0.25, 0.75):
+        return 2
+    return 1
 
-        return
-    text = f'{lvl:g}'
-    if mode=='level+price':
-        text = f'{lvl:g} ({xyR[1]:,.0f})'
-    align = env('STRUCT_FIBCH_LABEL_SIDE','right')
-    dx = float(env('STRUCT_FIBCH_LABEL_DX',6))
-    dy = float(env('STRUCT_FIBCH_LABEL_DY',0))
-    fontsize = int(env('STRUCT_FIBCH_LABEL_FONTSIZE',9))
-    color = env('STRUCT_FIBCH_LABEL_COLOR','#007bff')
-    alpha = float(env('STRUCT_FIBCH_LABEL_ALPHA',0.9))
-    ha = 'left' if align=='right' else 'right'
-    ax.annotate(text, xy=xyR, xycoords='data',
-                xytext=(dx if align=='right' else -dx, dy), textcoords='offset points',
-                ha=ha, va='center', fontsize=fontsize, color=color,
-                alpha=alpha, clip_on=False, zorder=env_int('STRUCT_Z_OVERLAY',1))
+def _rs_preset_names(levels, channel, x_ref_num, close_price, topn=None):
+    ranks = {}
+    above = []
+    below = []
+    for lv in levels:
+        y_at = channel.price_at_level(x_ref_num, lv)
+        (above if y_at >= close_price else below).append((lv, abs(y_at - close_price)))
+    above.sort(key=lambda z: z[1])
+    below.sort(key=lambda z: z[1])
+    n = int(topn or os.getenv("STRUCT_FIBCH_RS_N", "4"))
+    for k, (lv, _) in enumerate(above[:n], 1):
+        ranks[lv] = f"R{k}"
+    for k, (lv, _) in enumerate(below[:n], 1):
+        ranks[lv] = f"S{k}"
+    return ranks
+
+def _compose_label(lv: float, y_val: float, name_map: dict, mode: str) -> str:
+    base = f"{lv:g}"
+    nm = name_map.get(lv)
+    if mode == "name":
+        return nm or base
+    if mode == "name+level":
+        return f"{(nm or '')} {base}".strip()
+    if mode == "name+price":
+        return f"{(nm or '')} {y_val:,.0f}".strip()
+    if mode == "level+price":
+        return f"{base} ({y_val:,.0f})"
+    return base
+
+class BigFibChannel:
+    def __init__(self, df: pd.DataFrame, anchor: dict, calc_mode: str = "linear", visual_mode: str = "linear"):
+        import matplotlib.dates as mdates
+        self.df = df
+        self.calc_mode = calc_mode
+        self.visual_mode = visual_mode
+        self.t1 = mdates.date2num(pd.Timestamp(anchor["ts1"]))
+        self.t2 = mdates.date2num(pd.Timestamp(anchor["ts2"]))
+        self.a1 = float(anchor["a1"])
+        self.a2 = float(anchor["a2"])
+        self.unit = float(anchor["unit"])
+        y1 = y_to_calc(self.a1, calc_mode)
+        y2 = y_to_calc(self.a2, calc_mode)
+        self.m = (y2 - y1) / (self.t2 - self.t1 + 1e-12)
+        self.t0 = self.t1
+        self.yc0 = y1
+        p_mid = (self.a1 + self.a2) / 2.0
+        if calc_mode == "log":
+            self.w = y_to_calc(p_mid + self.unit, "log") - y_to_calc(p_mid, "log")
+        else:
+            self.w = self.unit
+
+    def price_at_level(self, t: float, lvl: float) -> float:
+        sign = 1 if (lvl == 0 or lvl > 0) else -1
+        yc = self.m * (t - self.t0) + self.yc0 + lvl * self.w * sign
+        return y_from_calc(yc, self.calc_mode)
+
+    def draw(self, ax, symbol: str, tf: str):
+        import matplotlib.dates as mdates
+        ax.set_yscale("log" if self.visual_mode == "log" else "linear")
+        levels = _parse_floats(os.getenv("STRUCT_FIBCH_LEVELS","0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25,1.5"))
+        if env_bool("STRUCT_FIBCH_SYMMETRIC", True):
+            levels = sorted(set([-l for l in levels] + levels))
+        cols = _parse_colors(os.getenv('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6'), len(levels))
+        lws = _parse_floats(os.getenv('STRUCT_FIBCH_LWS','1.8'), fill=len(levels))
+        ls = _parse_ls(os.getenv('STRUCT_FIBCH_LS','solid'), len(levels))
+        xL, xR = _x_extend(ax)
+        x_ref_num = mdates.date2num(self.df.index[-1])
+        atr = _atr_last(self.df)
+        close_price = float(self.df["close"].iloc[-1])
+        name_map = _rs_preset_names(levels, self, x_ref_num, close_price)
+        vis_levels = set(_fib_visibility_filter(self, levels, self.df, x_ref_num, atr, tf))
+        emph_names = {s.strip().upper() for s in os.getenv("STRUCT_FIBCH_EMPH_NAMES","R1,S1").split(",") if s.strip()}
+        emph_lw    = float(os.getenv("STRUCT_FIBCH_EMPH_LW","2.2"))
+        emph_alpha = float(os.getenv("STRUCT_FIBCH_EMPH_ALPHA","1.0"))
+        deem_alpha = float(os.getenv("STRUCT_FIBCH_DEEMPH_ALPHA","0.55"))
+        label_mode = os.getenv("STRUCT_FIBCH_LABEL_MODE", "name+price")
+        label_dx = float(os.getenv("STRUCT_FIBCH_LABEL_DX","6"))
+        label_dy = float(os.getenv("STRUCT_FIBCH_LABEL_DY","0"))
+        label_fs = int(os.getenv("STRUCT_FIBCH_LABEL_FONTSIZE","9"))
+        label_col = os.getenv("STRUCT_FIBCH_LABEL_COLOR","#007bff")
+        label_alpha = float(os.getenv("STRUCT_FIBCH_LABEL_ALPHA","0.9"))
+        hide_outside = os.getenv("STRUCT_FIBCH_LABEL_HIDE_OUTSIDE", "1") == "1"
+        label_candidates = []
+        for i, lv in enumerate(levels):
+            if float(lv) not in vis_levels:
+                continue
+            yL = self.price_at_level(xL, lv)
+            yR = self.price_at_level(xR, lv)
+            line_style = ls[i] if i < len(ls) else "-"
+            nm = (name_map or {}).get(float(lv))
+            is_emph = (nm or "").upper() in emph_names
+            base_col = cols[i] if i < len(cols) else cols[0]
+            base_lw = lws[i] if i < len(lws) else lws[0]
+            use_lw = emph_lw if is_emph else base_lw
+            use_alpha = emph_alpha if is_emph else float(os.getenv("STRUCT_FIBCH_ALPHA","0.9"))*(1.0 if is_emph else deem_alpha)
+            ax.plot([mdates.num2date(xL), mdates.num2date(xR)],[yL,yR],
+                    color=base_col, lw=use_lw, ls=line_style,
+                    alpha=use_alpha, solid_capstyle="round", clip_on=False,
+                    label=os.getenv('STRUCT_FIBCH_LABEL','Fib channel (big)') if i==0 else None,
+                    zorder=int(os.getenv("STRUCT_Z_OVERLAY","1")))
+            if label_mode != "none":
+                xr, yr = xR, yR
+                if not hide_outside or (ax.get_ylim()[0] <= yr <= ax.get_ylim()[1]):
+                    text = _compose_label(float(lv), float(yr), name_map, label_mode)
+                    label_candidates.append({"x": mdates.num2date(xr), "y": yr,
+                                             "text": text, "color": label_col,
+                                             "fontsize": label_fs,
+                                             "ha": "left", "va": "center",
+                                             "dx": label_dx, "dy": label_dy,
+                                             "priority": _fib_level_priority(float(lv)),
+                                             "fontweight": ("bold" if is_emph else "normal"),
+                                             "alpha": (1.0 if is_emph else deem_alpha)})
+        if label_candidates:
+            laid = _smart_label_layout_v2(ax, label_candidates)
+            for p in laid:
+                ax.annotate(p["text"], xy=(p["x"], p["y"]), xycoords="data",
+                            xytext=(p["dx"], p["dy"]), textcoords="offset points",
+                            ha=p["ha"], va=p["va"], fontsize=p["fontsize"],
+                            color=p["color"], alpha=p.get("alpha", label_alpha),
+                            fontweight=p.get("fontweight","normal"), clip_on=False,
+                            zorder=int(os.getenv("STRUCT_Z_OVERLAY","1"))+1)
+        legend = ax.get_legend()
+        if legend:
+            legend.remove()
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.05), fontsize=8, framealpha=0.6)
+
 
 def _draw_big_fib_channel(ax, df, symbol):
-    import numpy as np, matplotlib.dates as mdates
+    import matplotlib.dates as mdates
     if os.getenv("STRUCT_FIBCH_TEMPLATE", "").lower() == "tv":
-        os.environ.setdefault("STRUCT_FIBCH_LEVELS", "0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25")
-        os.environ.setdefault("STRUCT_FIBCH_COLORS", "#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6")
-        os.environ.setdefault("STRUCT_FIBCH_LS", "solid,dashed,solid,dashed,solid,dashed,dashed,dashed,solid,solid,solid")
-        os.environ.setdefault("STRUCT_FIBCH_LWS", "1.8")
-        os.environ.setdefault("STRUCT_FIBCH_ALPHA", "0.90")
+        _apply_tv_template()
+    os.environ.setdefault("STRUCT_FIBCH_LABEL_MODE", "name+price")
+    os.environ.setdefault("STRUCT_FIBCH_LABEL_MIN_DY", "12")
+    os.environ.setdefault("STRUCT_FIBCH_EMPH_NAMES", "R1,S1")
     if os.getenv('STRUCT_FIBCH_ENABLE','0')!='1':
         return
-    anc = _get_anchors(symbol)
+    anc, used_key, cand_keys = _get_anchors(symbol)
     if not anc:
+        logger.warning(f"[FIBCH] {symbol} anchors missing cand={cand_keys} used={used_key}")
+        return
+    try:
+        ts1 = pd.Timestamp(anc['ts1'], tz='UTC')
+        ts2 = pd.Timestamp(anc['ts2'], tz='UTC')
+    except Exception:
+        logger.warning(f"[FIBCH] {symbol} anchor timestamps invalid cand={cand_keys} used={used_key}")
         return
 
-    x1,y1,x2,y2 = _resolve_weekly_anchor_points(df, anc['a1'], anc['a2'], symbol)
-    m,b = _fit_line(x1,y1,x2,y2)
-    unit = float(anc['unit'])
+    def _infer_tf():
+        if len(df) >= 2 and isinstance(df.index, pd.DatetimeIndex):
+            dt = df.index[-1] - df.index[-2]
+            mins = dt.total_seconds() / 60.0
+            if mins <= 20:
+                return "15m"
+            if mins <= 90:
+                return "1h"
+            if mins <= 360:
+                return "4h"
+        return "1d"
 
-    levels = _parse_floats(os.getenv('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25'))
-    cols = _parse_colors(os.getenv('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6'), len(levels))
-    lws = _parse_floats(os.getenv('STRUCT_FIBCH_LWS','1.8'), fill=len(levels))
-    alpha = float(os.getenv('STRUCT_FIBCH_ALPHA', '0.9'))
+    tf = _infer_tf()
+    calc_mode = visual_mode = "linear" if tf in ("15m","1h") else "log"
+    channel = BigFibChannel(df, {"ts1": ts1, "a1": anc["a1"], "ts2": ts2, "a2": anc["a2"], "unit": anc["unit"]},
+                            calc_mode=calc_mode, visual_mode=visual_mode)
+    channel.draw(ax, symbol, tf)
 
-    mid_on = os.getenv("STRUCT_FIBCH_MIDL_ENABLE", "1") == "1"
-    mid_alpha = float(os.getenv("STRUCT_FIBCH_MIDL_ALPHA", "0.5"))
-    mid_lw = float(os.getenv("STRUCT_FIBCH_MIDL_LW", "1.0"))
-    mid_ls = (0, (4, 4))
-    mid_levels = _fib_midlines(levels) if mid_on else []
-
-    label_mode = os.getenv("STRUCT_FIBCH_LABEL_MODE", "level")
-    label_side = os.getenv("STRUCT_FIBCH_LABEL_SIDE", "right")
-    label_dx = float(os.getenv("STRUCT_FIBCH_LABEL_DX", "6"))
-    label_dy = float(os.getenv("STRUCT_FIBCH_LABEL_DY", "0"))
-    label_fs = int(os.getenv("STRUCT_FIBCH_LABEL_FONTSIZE", "9"))
-    label_col = os.getenv("STRUCT_FIBCH_LABEL_COLOR", "#007bff")
-    label_alpha = float(os.getenv("STRUCT_FIBCH_LABEL_ALPHA", "0.9"))
-    hide_outside = os.getenv("STRUCT_FIBCH_LABEL_HIDE_OUTSIDE", "1") == "1"
-
-    mark_on = os.getenv("STRUCT_FIBCH_MARK_ENABLE", "1") == "1"
-    mark_side = os.getenv("STRUCT_FIBCH_MARK_SIDE", "both")
-    mark_lookback = int(os.getenv("STRUCT_FIBCH_MARK_LOOKBACK", "600"))
-    mark_age_on = os.getenv("STRUCT_FIBCH_MARK_AGE", "1") == "1"
-    mark_age_dx = float(os.getenv("STRUCT_FIBCH_MARK_AGE_DX", "8"))
-    mark_age_dy = float(os.getenv("STRUCT_FIBCH_MARK_AGE_DY", "-2"))
-    mark_age_fs = int(os.getenv("STRUCT_FIBCH_MARK_AGE_FS", "8"))
-    mark_age_col = os.getenv("STRUCT_FIBCH_MARK_AGE_COLOR", "#333333")
-
-
-    xmin, xmax = mdates.date2num(df.index[0]), mdates.date2num(df.index[-1])
-    span = xmax - xmin
-    ext_ratio = float(os.getenv("STRUCT_FIBCH_EXTEND_RATIO", "0.25"))
-    xL, xR = xmin - span * ext_ratio, xmax + span * ext_ratio
-
-
-    x_ref_num = xR
-    close_price = float(df['close'].iloc[-1])
-
-    def _fib_level_priority(lv: float) -> int:
-        if lv in (0.0, 0.5, 1.0, 1.25):
-            return 3
-        if lv in (0.25, 0.75):
-            return 2
-        return 1
-
-    def _rs_preset_names(levels, m, b, unit, x_ref_num, close_price, topn=None):
-        import numpy as np
-        ranks = {}
-        above = []
-        below = []
-        for lv in levels:
-            y_at = _line_at_x(m, b + unit * lv, x_ref_num)
-            (above if y_at >= close_price else below).append((lv, abs(y_at - close_price)))
-        above.sort(key=lambda z: z[1])
-        below.sort(key=lambda z: z[1])
-        n = int(topn or os.getenv("STRUCT_FIBCH_RS_N", "4"))
-        for k, (lv, _) in enumerate(above[:n], 1):
-            ranks[lv] = f"R{k}"
-        for k, (lv, _) in enumerate(below[:n], 1):
-            ranks[lv] = f"S{k}"
-        return ranks
-
-    name_map = _rs_preset_names(levels, m, b, unit, x_ref_num, close_price)
-
-    def _compose_label(lv: float, y_val: float) -> str:
-        base = f"{lv:g}"
-        nm = name_map.get(lv)
-        if label_mode == "name":
-            return nm or base
-        if label_mode == "name+level":
-            return f"{(nm or '')} {base}".strip()
-        if label_mode == "name+price":
-            return f"{(nm or '')} {y_val:,.0f}".strip()
-        if label_mode == "level+price":
-            return f"{base} ({y_val:,.0f})"
-        return base
-
-    label_candidates = []
-    for i, lv in enumerate(levels):
-        dy = unit * lv
-        yL = _line_at_x(m, b + dy, xL)
-        yR = _line_at_x(m, b + dy, xR)
-        ls = (0, (4, 4)) if (os.getenv("STRUCT_FIBCH_DASHED", "1") == "1" and lv not in (0.0, 0.5, 1.0, 1.25)) else "-"
-        ax.plot([mdates.num2date(xL), mdates.num2date(xR)], [yL, yR],
-                color=cols[i] if i < len(cols) else cols[0],
-                lw=lws[i] if i < len(lws) else lws[0],
-                ls=ls,
-                alpha=alpha,
-                solid_capstyle='round', clip_on=False,
-                zorder=env_int('STRUCT_Z_OVERLAY',1),
-                label=(os.getenv('STRUCT_FIBCH_LABEL','Fib channel (big)') if i==0 else None))
-        if label_mode != "none":
-            xr, yr = xR, yR
-            if not hide_outside or (ax.get_ylim()[0] <= yr <= ax.get_ylim()[1]):
-                label_candidates.append({
-                    "x": mdates.num2date(xr), "y": yr,
-                    "text": _compose_label(float(lv), float(yr)),
-                    "color": label_col, "fontsize": label_fs,
-                    "ha": "left" if label_side == "right" else "right",
-                    "va": "center",
-                    "dx": label_dx if label_side == "right" else -label_dx,
-                    "dy": label_dy,
-                    "priority": _fib_level_priority(float(lv)),
-                })
-        if mark_on:
-            cross = _latest_level_cross(df, m, b, dy, col="close", lookback=mark_lookback, side=mark_side)
-            if cross:
-                x_num, y_m, i_idx = cross
-                _plot_marker(ax, x_num, y_m, color=cols[i] if i < len(cols) else cols[0])
-                if mark_age_on and 0 <= i_idx < len(df):
-                    now_ts = df.index[-1]
-                    cross_ts = df.index[i_idx]
-                    age = now_ts - cross_ts
-                    txt = _fmt_elapsed(age)
-                    ax.annotate(txt, xy=(mdates.num2date(x_num), y_m), xycoords='data',
-                                xytext=(mark_age_dx, mark_age_dy), textcoords='offset points',
-                                ha='left', va='center', fontsize=mark_age_fs,
-                                color=mark_age_col, alpha=0.9, clip_on=False,
-                                zorder=env_int('STRUCT_Z_OVERLAY',1)+2)
-
-    for mlv in mid_levels:
-        dy = unit * mlv
-        yL = _line_at_x(m, b + dy, xL)
-        yR = _line_at_x(m, b + dy, xR)
-        ax.plot([mdates.num2date(xL), mdates.num2date(xR)], [yL, yR],
-                color=label_col, lw=mid_lw, ls=mid_ls, alpha=mid_alpha,
-                solid_capstyle='round', clip_on=False,
-                zorder=env_int('STRUCT_Z_OVERLAY',1))
-
-    if label_candidates:
-        laid = _smart_label_layout_v2(ax, label_candidates)
-        for p in laid:
-            ax.annotate(p["text"], xy=(p["x"], p["y"]), xycoords="data",
-                        xytext=(p["dx"], p["dy"]), textcoords="offset points",
-                        ha=p["ha"], va=p["va"], fontsize=p["fontsize"],
-                        color=p["color"], alpha=label_alpha, clip_on=False,
-                        zorder=env_int('STRUCT_Z_OVERLAY',1)+1)
-
-    if ext_ratio > 0:
-        _apply_right_pad(ax, ext_ratio)
-
-def fibch_set(symbol, a1, a2, unit, save=True):
-    s = symbol.upper()
-    FIBCH[s] = {"a1":float(a1),"a2":float(a2),"unit":float(unit)}
-    if save:
-        _fibch_save(FIBCH)
-    return FIBCH[s]
-
-def handle_cmd(msg):
-    t = msg.strip().split()
-    if len(t)>=6 and t[0]=='!fibch' and t[1]=='set':
-        _,_,sym,a1,a2,unit = t[:6]
-        fibch_set(sym,a1,a2,unit,save=True)
-        return f'FIBCH[{sym}] = {a1},{a2},{unit}'
-    if t[:2]==['!fibch','show'] and len(t)>=3:
-        sym=t[2].upper()
-        return f'FIBCH[{sym}] {FIBCH.get(sym)}'
-    if t[:2]==['!fibch','template'] and t[2]=='tv':
-        os.environ['STRUCT_FIBCH_TEMPLATE']='tv'
-        return 'Applied TV template.'
-    return None
+    pad_top = env_float("STRUCT_PAD_TOP", 0.0)
+    if pad_top:
+        ax.margins(y=pad_top)
+    _apply_right_pad(ax, env_float("STRUCT_PAD_RIGHT", 0.0))
+    if env_int("STRUCT_Y_AXIS_SCIENTIFIC",1)==0:
+        from matplotlib.ticker import FuncFormatter
+        ax.get_yaxis().set_major_formatter(FuncFormatter(lambda x, p: f"{x:,.0f}"))
+    if tf=="15m":
+        ax.xaxis.set_major_locator(mdates.AutoDateLocator(maxticks=env_int("STRUCT_XTICK_MAX",10)))
 # === ATH helpers ==============================================================
 def _get_ath_info(df: pd.DataFrame):
     """All-Time High price & timestamp index."""
@@ -1713,7 +1789,7 @@ def draw_prev_tops(ax, df, n=4, color="#ff8c00", lw=1.2, alpha=0.65,
     w = 2
     highs = sel['high']
     is_peak = highs.rolling(2*w+1, center=True)\
-                   .apply(lambda x: float(x[w] == x.max()), raw=False)\
+                   .apply(lambda s: float(s.iloc[w] == s.max()), raw=False)\
                    .fillna(0) > 0.5
 
     peaks = highs[is_peak].sort_values(ascending=False)
@@ -1747,7 +1823,7 @@ def draw_prev_tops(ax, df, n=4, color="#ff8c00", lw=1.2, alpha=0.65,
 def _pivot_high_idx(series, w=3):
     # 중심 w 창의 로컬 최대 인덱스 반환
     is_peak = series.rolling(2*w+1, center=True)\
-                    .apply(lambda x: float(x[w] == x.max()), raw=False)\
+                    .apply(lambda s: float(s.iloc[w] == s.max()), raw=False)\
                     .fillna(0) > 0.5
     return series[is_peak].index
 
