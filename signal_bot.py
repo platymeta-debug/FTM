@@ -666,7 +666,9 @@ def y_to_scale(y, mode: str):
 def _apply_scale(arr, mode):
     arr = np.asarray(arr, dtype=float)
     if mode == "log":
+
         return _safe_pow10(arr)
+
     return arr
 
 
@@ -1142,6 +1144,7 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
     search_col = os.getenv("STRUCT_FIBCH_SEARCH_COL","high")
     unit_is_price = env_bool("STRUCT_FIBCH_UNIT_IS_PRICE", True)
 
+
     # 3) 앵커 가격과 가장 가까운 봉 인덱스 찾기
     y = df[search_col].values.astype(float)
     idx1 = int(np.argmin(np.abs(y - anchor1)))
@@ -1291,8 +1294,10 @@ def _draw_avwap_items(ax, df):
     if draw_ath:
         _plot_avwap(_ath_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"), os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"))
 
+
 def _draw_ath_line(ax, df):
     """Draw ATH horizontal line."""
+
     draw_ath = env_bool("STRUCT_DRAW_ATH", True)
     draw_h = env_bool("STRUCT_DRAW_ATH_H", True)
     col_ath = os.getenv("STRUCT_COL_ATH", "#000000")
@@ -1301,6 +1306,7 @@ def _draw_ath_line(ax, df):
     if draw_ath and draw_h and len(df):
         y_ath = float(df["high"].max())
         _draw_hline(ax, df, y_ath, col_ath, "ATH", lw=lw_ath, alpha=alpha_ath, z=2)
+
 
 
 def draw_prev_tops(ax, df, n=4, color="#ff8c00", lw=1.2, alpha=0.65,
@@ -1401,6 +1407,7 @@ def draw_shortterm_down_res(ax, df_1d, lookback_days=120, w=3,
     xs = [x0, x1]
     ys = [m*xs[0] + b, m*xs[1] + b]
     ax.plot(xs, ys, color=color, lw=lw, alpha=alpha, linestyle=linestyle, zorder=zorder, label=label)
+
 
 
 
@@ -10944,7 +10951,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     ax.set_yscale("log" if axis_scale == "log" else "linear")
 
     if tf_l == "15m":
+
         loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_XTICK_MAX", 10))
+
     elif tf_l == "4h":
         loc = mdates.AutoDateLocator(maxticks=8)
     elif tf_l.endswith("m"):
@@ -10953,14 +10962,17 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         loc = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
     for label in ax.get_xticklabels():
         label.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
     ax.grid(bool(env_int("STRUCT_XGRID_ON", 1)), axis='x', alpha=0.15)
+
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
             levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
-            _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
+            if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
+                _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
     except Exception as e:
         err_flags.append(("sr", e))
     try:
@@ -10980,7 +10992,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as e:
         err_flags.append(("bigfig", e))
     try:
+
         _draw_ath_line(ax, df_1d)
+
     except Exception as e:
         err_flags.append(("ath", e))
     try:
