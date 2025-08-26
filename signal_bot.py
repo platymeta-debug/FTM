@@ -671,7 +671,9 @@ def y_to_scale(y, mode: str):
 def _apply_scale(arr, mode):
     arr = np.asarray(arr, dtype=float)
     if mode == "log":
+
         return _safe_pow10(arr)
+
     return arr
 
 
@@ -1099,6 +1101,7 @@ import matplotlib.dates as mdates
 from matplotlib.transforms import Affine2D
 
 
+
 def _fib_midlines(levels: list[float]) -> list[float]:
     """Between-level midlines: 각 인접 레벨 쌍의 중간값."""
     if not levels or len(levels) < 2:
@@ -1132,6 +1135,10 @@ def _smart_label_layout(ax, pts: list[dict], min_px: float = None):
 def _line_at_x(m: float, b: float, x: float) -> float:
     """직선 y = m*x + b"""
     return m * x + b
+
+
+# === Big Fibonacci Channel ===================================================
+FIBCH_PATH = Path(__file__).with_name('fibch_anchors.json')
 
 
 def _latest_level_cross(df, m: float, b: float, lvl_offset: float, col="close", lookback=None, side="both"):
@@ -1196,6 +1203,7 @@ def _fibch_params_from_env(symbol: str):
     except Exception:
         pass
     s = re.sub(r"[/\-: _]", "", symbol).upper()
+
     base = s[:-4] if s.endswith("USDT") else (s[:-3] if s.endswith("USD") else s)
     for k in (s, base+"USDT", base+"USD", base):
         v = os.getenv(f"STRUCT_FIBCH_{k}")
@@ -1203,6 +1211,7 @@ def _fibch_params_from_env(symbol: str):
             a, b, u = [float(x) for x in v.split(",")[:3]]
             return a, b, u
     return None
+
 
 def _get_anchors(symbol: str):
     s = re.sub(r"[/\-: _]", "", symbol).upper()
@@ -1284,6 +1293,7 @@ def _parse_ls(raw, n):
             out.append(t)
     return out
 
+
 def _apply_tv_template():
     os.environ.setdefault('STRUCT_FIBCH_LEVELS','0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25')
     os.environ.setdefault('STRUCT_FIBCH_COLORS','#808080,#e67e22,#2ecc71,#95a5a6,#e74c3c,#1abc9c,#7f8c8d,#2980b9,#e74c3c,#e056fd,#ff66a6')
@@ -1295,6 +1305,7 @@ def _apply_tv_template():
 def _label_fibch(ax, lvl, xyR):
     mode = env('STRUCT_FIBCH_LABEL_MODE','level')
     if mode=='none':
+
         return
     text = f'{lvl:g}'
     if mode=='level+price':
@@ -1409,6 +1420,7 @@ def _draw_big_fib_channel(ax, df, symbol):
     if ext_ratio > 0:
         _apply_right_pad(ax, ext_ratio)
 
+
 def fibch_set(symbol, a1, a2, unit, save=True):
     s = symbol.upper()
     FIBCH[s] = {"a1":float(a1),"a2":float(a2),"unit":float(unit)}
@@ -1429,6 +1441,7 @@ def handle_cmd(msg):
         os.environ['STRUCT_FIBCH_TEMPLATE']='tv'
         return 'Applied TV template.'
     return None
+
 # === ATH helpers ==============================================================
 def _get_ath_info(df: pd.DataFrame):
     """All-Time High price & timestamp index."""
@@ -1528,8 +1541,10 @@ def _draw_avwap_items(ax, df):
     if draw_ath:
         _plot_avwap(_ath_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"), os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"))
 
+
 def _draw_ath_line(ax, df):
     """Draw ATH horizontal line."""
+
     draw_ath = env_bool("STRUCT_DRAW_ATH", True)
     draw_h = env_bool("STRUCT_DRAW_ATH_H", True)
     col_ath = os.getenv("STRUCT_COL_ATH", "#000000")
@@ -11181,7 +11196,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     ax.set_yscale("log" if axis_scale == "log" else "linear")
 
     if tf_l == "15m":
+
         loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_XTICK_MAX", 10))
+
     elif tf_l == "4h":
         loc = mdates.AutoDateLocator(maxticks=8)
     elif tf_l.endswith("m"):
@@ -11190,14 +11207,17 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         loc = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
     for label in ax.get_xticklabels():
         label.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
     ax.grid(bool(env_int("STRUCT_XGRID_ON", 1)), axis='x', alpha=0.15)
+
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
             levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
-            _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
+            if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
+                _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
     except Exception as e:
         err_flags.append(("sr", e))
     try:
@@ -11217,7 +11237,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as e:
         err_flags.append(("bigfig", e))
     try:
+
         _draw_ath_line(ax, df_1d)
+
     except Exception as e:
         err_flags.append(("ath", e))
     try:
@@ -11226,7 +11248,9 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as _e:
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
     try:
+
         _draw_big_fib_channel(ax, df, symbol)
+
     except Exception as e:
         err_flags.append(("bigfib", e))
     try:
