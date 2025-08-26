@@ -1132,6 +1132,7 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
     search_col = os.getenv("STRUCT_FIBCH_SEARCH_COL","high")
     unit_is_price = env_bool("STRUCT_FIBCH_UNIT_IS_PRICE", True)
 
+
     # 3) 앵커 가격과 가장 가까운 봉 인덱스 찾기
     y = df[search_col].values.astype(float)
     idx1 = int(np.argmin(np.abs(y - anchor1)))
@@ -10863,7 +10864,8 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     try:
         if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
             levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
-            _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
+            if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
+                _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
     except Exception as e:
         err_flags.append(("sr", e))
     try:
