@@ -653,14 +653,16 @@ def y_to_scale(y, mode: str):
     return arr.copy()
 
 
+def _apply_scale(arr, mode):
+    arr = np.asarray(arr, dtype=float)
+    if mode == "log":
+        return np.power(10.0, np.clip(arr, -308, 308))  # overflow 방지
+    return arr
+
+
 def scale_to_y(arr, mode: str):
     """Inverse transform from scaled space back to price."""
-    import numpy as np
-    if mode == "log":
-        a = np.asarray(arr, dtype=float)
-        # float64 안전범위 내에서만 지수 복원
-        return np.power(10.0, np.clip(a, -12.0, 12.0))
-    return arr
+    return _apply_scale(arr, mode)
 
 
 
@@ -681,41 +683,14 @@ def _extend_segment(x1, y1, x2, y2, ax, pad=None, **plot_kw):
 
 
 # === view anchoring / right padding ==========================================
-def _apply_right_pad(ax, df, tf, default_anchor=0.66):
+def _apply_right_pad(ax, ratio: float):
     """
-    현재 마지막 캔들이 figure 가로축에서 anchor(0~1) 위치에 오도록
-    우측으로 xlim을 늘려준다. (예: 0.66 -> 화면의 2/3 지점)
-
-    또한 인트라데이 축 라벨 혼잡을 완화한다.
+    우측으로 보는 구간을 ratio 만큼 더 늘려 미래 공간을 만든다.
+    ratio=0.2 이면 현재 xlim 폭의 20%를 오른쪽으로 확장.
     """
-    try:
-        import matplotlib.dates as mdates
-        import numpy as np
-        anchor = float(os.getenv("STRUCT_VIEW_ANCHOR", default_anchor))
-        anchor = float(np.clip(anchor, 0.55, 0.90))  # 안전 범위
-
-        idx = getattr(df, "index", None)
-        if idx is None or len(idx) < 2:
-            return
-
-        xmin = idx[0]
-        xend = idx[-1]
-        span = (xend - xmin)
-        if span == 0:
-            return
-
-        xmax = xmin + span / anchor  # xend 가 anchor 위치에 오도록
-        ax.set_xlim(xmin, xmax)
-
-        # 15m/1h 축 라벨 과밀 완화
-        tf_norm = (tf or "").lower()
-        if tf_norm in ("15m", "1h"):
-            loc = mdates.AutoDateLocator(minticks=6, maxticks=12)
-            ax.xaxis.set_major_locator(loc)
-            ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
-            ax.tick_params(axis="x", labelsize=9, rotation=0)
-    except Exception as e:
-        logger.info(f"[RIGHT_PAD_WARN] {type(e).__name__}: {e}")
+    x0, x1 = ax.get_xlim()
+    pad = (x1 - x0) * float(max(0.0, ratio))
+    ax.set_xlim(x0, x1 + pad)
 
 
 def _fib_base_from_env(df: pd.DataFrame):
@@ -882,15 +857,22 @@ def _best_trendlines(df, tf:str=None):
     return up, dn
 
 def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame, tf:str=None):
-    tls = []
-    if struct_info and isinstance(struct_info, dict):
-        tls = struct_info.get("trendlines", []) or []
-        if tls:
-            return tls
-    up, dn = _best_trendlines(df, tf=tf)
-    if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
-    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
-    return tls
+    tf_l = str(tf).lower()
+    if tf_l != "1d" or len(df) < 10:
+        return []
+    highs = df["high"].values
+    w = 3
+    idxs = []
+    for i in range(w, len(highs)-w):
+        if highs[i] == np.max(highs[i-w:i+w+1]):
+            idxs.append(i)
+    if len(idxs) < 2:
+        return []
+    i0, i1 = idxs[-2], idxs[-1]
+    x = np.arange(len(df))
+    m = (highs[i1]-highs[i0])/(x[i1]-x[i0]) if (x[i1]-x[i0]) != 0 else 0.0
+    b = highs[i0] - m*x[i0]
+    return [{"dir":"down", "m":m, "b":b}]
 
 # === level normalizer =========================================
 def _norm_level_item(item):
@@ -1047,7 +1029,10 @@ def _draw_tls(ax, df, tls, tf: str=None):
                     linewidth=env_float("STRUCT_LW_TL",1.8), label=os.getenv("STRUCT_LBL_TL_DN","하락추세선"), zorder=1)
 
 def _draw_reg_channel(ax, df, k=None, tf: str=None):
-    if k is None: k = env_float("STRUCT_REGCH_K", 1.0)
+    if not env_bool("STRUCT_SHOW_REG", False):
+        return
+    if k is None:
+        k = env_float("STRUCT_REGCH_K", 1.0)
     if k <= 0 or len(df) < 20: return
     x = np.arange(len(df))
     y = df["close"].values.astype(float)
@@ -1096,139 +1081,31 @@ def _choose_fib_base(df, tf):
     return (i0, i1)
 
 
-def _draw_fib_channel_auto(ax, df, base=None, levels=None, tf: str=None):
-
-    """
-    Base trend (two points) + parallel offsets measured in transformed space (log-safe).
-    """
-    if len(df) < 30: return
-
-    # Normalize levels (strings, extra tokens tolerated)
-    levels = [float(x) for x in map(str, levels or []) if x not in ("", None)]
-    # Normalize base to (i0,i1)
-    if base and isinstance(base, (list, tuple)) and len(base) >= 2:
-        base = (int(base[0]), int(base[1]))
-    if not levels:
-
-        tf_l = str(tf).lower()
-        if tf_l.endswith("d"):
-            lv_s = os.getenv("STRUCT_FIB_LEVELS_1D","0.382,0.5,0.618,1.0")
-            mid_on = env_bool("STRUCT_FIB_MIDLINES_1D", True)
-        else:
-            lv_s = os.getenv("STRUCT_FIB_LEVELS_INTRADAY","0.382,0.618")
-            mid_on = env_bool("STRUCT_FIB_MIDLINES_INTRADAY", False)
-        levels = [float(x) for x in lv_s.split(",") if x]
-    else:
-
-        mid_on = False
-
-
-    x = np.arange(len(df)); y = df["close"].values.astype(float)
-    calc = _calc_scale() or _decide_scale(tf)
-    y_t = y_to_scale(y, calc)
-
-
-    # === base selection ===
-    if not base:
-        i0, i1 = _env_idxpair("STRUCT_FIB_BASE_OVERRIDE_IDX", default=(None, None))
-        if i0 is not None and i1 is not None:
-            base = (int(i0), int(i1))
-    if not base:
-
-        base = _choose_fib_base(df, tf)
-    i0, i1 = base
-    if i0 == i1:
-        return
-    m = (y_t[i1]-y_t[i0])/(x[i1]-x[i0] + 1e-9); b = y_t[i0] - m*x[i0]
-    y0_t = m*x + b
-
-    resid_t = y_t - y0_t
-    if len(df) < 60:
-        scale = np.std(resid_t)
-    else:
-        mad = np.median(np.abs(resid_t - np.median(resid_t)))
-        scale = (1.4826*mad) if mad>0 else np.std(resid_t)
-
-    clr = os.getenv("STRUCT_COL_FIB","#20c997")
-    lw = env_float("STRUCT_LW_FIB",1.0)
-    alpha = env_float("STRUCT_FIB_ALPHA",0.9)
-    ax.plot(df.index, scale_to_y(y0_t, calc), color=clr, linewidth=lw, alpha=alpha,
-            label=os.getenv("STRUCT_LBL_FIB_BASE","Fib 기준선"), zorder=1)
-
-    for lv in levels:
-        y_up = scale_to_y(y0_t + lv*scale, calc)
-        y_dn = scale_to_y(y0_t - lv*scale, calc)
-        ax.plot(df.index, y_up, color=clr, linewidth=lw, linestyle="--", alpha=alpha,
-                label=os.getenv("STRUCT_LBL_FIB_LVL","Fib 레벨"), zorder=1)
-        ax.plot(df.index, y_dn, color=clr, linewidth=lw, linestyle="--", alpha=alpha, zorder=1)
-
-    if mid_on:
-        mid_alpha = env_float("STRUCT_FIB_ALPHA_MID", 0.6)
-        lw_mid = env_float("STRUCT_LW_FIB_MID", 0.9)
-        y_mid = scale_to_y(y0_t, calc)  # mid as base clone (visual cue between bands)
-        ax.plot(df.index, y_mid, color=clr, linewidth=lw_mid, linestyle=":", alpha=mid_alpha,
-                label=os.getenv("STRUCT_LBL_FIB_MID","Fib 중간"), zorder=1)
-
-
-def _nearest_idx_for_price(df, price, col='high', tol=0.02):
-    """Find index of price nearest to ``price`` in ``col`` within tolerance."""
-    p = df[col].to_numpy(dtype=float)
-    if len(p) == 0:
-        return 0
-    idx = int(np.argmin(np.abs(np.log(p) - np.log(price))))
-    if abs(p[idx] - price) / price > tol:
-        idx = int(np.argmax(p))
-    return idx
-
-
-def draw_fib_channel(df, symbol, ax):
-    """Draw manual Fibonacci channel based on ENV anchors."""
-    import matplotlib.dates as mdates
-    mode = os.getenv('STRUCT_CALC_SCALE_MODE', 'log')
-    key = f"STRUCT_FIBCH_{symbol.replace('/', '').replace('-', '').upper()}"
-    triple = os.getenv(key, '')
-    if not triple:
-        return
-    try:
-        h1, h2, wref = [float(x.strip()) for x in triple.split(',')[:3]]
-    except Exception:
-        return
-    i1 = _nearest_idx_for_price(df, h1, 'high')
-    i2 = _nearest_idx_for_price(df, h2, 'high')
-    t1, t2 = mdates.date2num(df.index[i1]), mdates.date2num(df.index[i2])
-    Y1 = y_to_scale(df['high'].iloc[i1], mode)
-    Y2 = y_to_scale(df['high'].iloc[i2], mode)
-    a = (Y2 - Y1) / (t2 - t1 + 1e-9)
-    b = Y1 - a * t1
-    baseY = lambda t: a * t + b
-    Y_ref = y_to_scale(wref, mode)
-    width = (Y_ref - baseY(t1))
-    if np.sign(width) == 0:
-        width = 1e-3
-    left_lvls = [float(x) for x in os.getenv('STRUCT_FIBCH_LEVELS_LEFT', '0,0.25,0.5,0.75,1').split(',') if x]
-    right_lvls = [float(x) for x in os.getenv('STRUCT_FIBCH_LEVELS_RIGHT', '0.125,0.375,0.625,0.875,1.125').split(',') if x]
-    levels = left_lvls + right_lvls
-    clr = os.getenv('STRUCT_COL_FIB', '#20c997')
-    lw = env_float('STRUCT_LW_FIB', 1.0)
-    alpha = env_float('STRUCT_FIB_ALPHA', 0.9)
-    z = int(os.getenv('STRUCT_Z_OVERLAY', '1'))
-    for lv in sorted(levels):
-        ch = lambda t: baseY(t) + lv * width
-        y1 = scale_to_y(ch(t1), mode)
-        y2 = scale_to_y(ch(t2), mode)
-        _extend_segment(t1, y1, t2, y2, ax, color=clr, lw=lw, ls='--', alpha=alpha, zorder=z)
 
 
 # === Big Fibonacci Channel ===================================================
-def _get_fibch_spec_for(symbol: str):
-    """ENV에서 심볼별 big fib channel 사양 읽기"""
-    import json, os
-    raw = os.getenv("STRUCT_FIBCH_SETS", "{}")
+def _fibch_params_from_env(symbol: str):
+    import re, json, os
+    # 1) JSON 맵 우선
+    raw = os.getenv("STRUCT_FIBCH_SETS", "")
     try:
-        spec_map = json.loads(raw)
+        m = json.loads(raw) if raw else {}
+        if symbol in m:
+            a, b = m[symbol]["anchors"]
+            unit = m[symbol]["unit"]
+            return float(a), float(b), float(unit)
     except Exception:
-        spec_map = {}
-    return spec_map.get(symbol) or spec_map.get(symbol.replace(":", "/")) or None
+        pass
+
+    # 2) 키 변형을 폭넓게 탐색: ETH/USDT -> ETHUSDT, ETHUSD, ETH
+    s = re.sub(r"[/\-: _]", "", symbol).upper()       # ETH/USDT -> ETHUSDT
+    base = s[:-4] if s.endswith("USDT") else (s[:-3] if s.endswith("USD") else s)
+    for k in (s, base+"USDT", base+"USD", base):
+        v = os.getenv(f"STRUCT_FIBCH_{k}")
+        if v:
+            a, b, u = [float(x) for x in v.split(",")[:3]]
+            return a, b, u
+    return None
 
 
 def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
@@ -1238,28 +1115,27 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
     if os.getenv("STRUCT_FIBCH_ENABLE", "0") != "1":
         return
 
-    spec = _get_fibch_spec_for(symbol)
-    if not spec:
+    params = _fibch_params_from_env(symbol)
+    if not params:
+        return
+    anchor1, anchor2, unit = params
+    if unit <= 0:
         return
 
     # 1) 레벨/스타일
-    levels = [float(x) for x in os.getenv("STRUCT_FIBCH_LEVELS","0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1.0,1.125,1.25").split(",")]
+    levels = [float(x) for x in os.getenv("STRUCT_FIBCH_LEVELS",
+                    "0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1.0,1.125,1.25").split(",")]
     col = os.getenv("STRUCT_FIBCH_COLOR", "#20c997")
     lw  = float(os.getenv("STRUCT_FIBCH_LW","1.2"))
     alpha = float(os.getenv("STRUCT_FIBCH_ALPHA","0.9"))
     dashed = os.getenv("STRUCT_FIBCH_DASHED","1") == "1"
     search_col = os.getenv("STRUCT_FIBCH_SEARCH_COL","high")
-
-    # 2) 심볼별 앵커/단위폭
-    anchors = list(spec.get("anchors", []))
-    unit = float(spec.get("unit", 0.0))
-    if len(anchors) != 2 or unit <= 0:
-        return
+    unit_is_price = env_bool("STRUCT_FIBCH_UNIT_IS_PRICE", True)
 
     # 3) 앵커 가격과 가장 가까운 봉 인덱스 찾기
     y = df[search_col].values.astype(float)
-    idx1 = int(np.argmin(np.abs(y - anchors[0])))
-    idx2 = int(np.argmin(np.abs(y - anchors[1])))
+    idx1 = int(np.argmin(np.abs(y - anchor1)))
+    idx2 = int(np.argmin(np.abs(y - anchor2)))
     xdates = mdates.date2num(df.index.to_pydatetime())
     x1, y1 = xdates[idx1], y[idx1]
     x2, y2 = xdates[idx2], y[idx2]
@@ -1268,7 +1144,7 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
 
     # 4) 기준선(레벨 0) 기울기/절편
     m = (y2 - y1) / (x2 - x1)
-    b = y1 - m * x1
+    intercept = y1 - m * x1
 
     # 5) 화면 좌우로 연장
     left_ext  = float(os.getenv("STRUCT_FIBCH_EXTEND_LEFT","1")) == 1.0
@@ -1281,16 +1157,29 @@ def _draw_big_fib_channel(ax, df, symbol, ycol="close"):
     xs = np.linspace(xL, xR, 400)
 
     # 6) 레벨별 선 그리기(단위폭 = '가격USD')
-    base = m * xs + b
-    ax.plot(mdates.num2date(xs), base, color=col, linewidth=lw, alpha=alpha, label=spec.get("label","Fib channel (big)"))
+    base = m * xs + intercept
+    ax.plot(
+        mdates.num2date(xs),
+        base,
+        color=col,
+        linewidth=lw,
+        alpha=alpha,
+        label=os.getenv("STRUCT_FIBCH_LABEL", "Fib channel (big)"),
+    )
     for lv in levels:
         if abs(lv) < 1e-12:
             continue
-        y_up = base + (lv * unit)
-        y_dn = base - (lv * unit)
+        if unit_is_price:
+            y_up = base + (lv * unit)
+            y_dn = base - (lv * unit)
+        else:
+            y_up = base * (1 + lv * unit)
+            y_dn = base * (1 - lv * unit)
         ls = (0, (4, 4)) if dashed else "-"
         ax.plot(mdates.num2date(xs), y_up, color=col, linewidth=lw, alpha=alpha*0.9, linestyle=ls)
         ax.plot(mdates.num2date(xs), y_dn, color=col, linewidth=lw, alpha=alpha*0.9, linestyle=ls)
+    if ext_ratio > 0:
+        _apply_right_pad(ax, ext_ratio)
 
 
 # === ATH helpers ==============================================================
@@ -1322,54 +1211,18 @@ def _draw_ath_lines(ax, df, ath, show_h=True, show_v=True):
 
 
 # === Anchored VWAP helpers ====================================================
-def _avwap_series(df: pd.DataFrame, start_idx: int, price_src: str = None):
-    """
-    df: columns need 'close' (+ 'high','low' for hlc3) and 'volume' (or 'vol').
-    start_idx: inclusive index (int) where AVWAP anchoring starts.
-    price_src: 'close'|'hlc3' (default from env).
-    returns: np.ndarray same length as df, values before start_idx set to np.nan
-    """
-    if len(df) == 0:
+def anchored_vwap(price, volume, start_idx):
+    """Return anchored VWAP series starting from start_idx."""
+    if len(price) == 0 or len(price) != len(volume):
         return None
-    vcol = "volume" if "volume" in df.columns else ("vol" if "vol" in df.columns else None)
-    if vcol is None or df[vcol].fillna(0).sum() == 0:
-        return None  # no volume → skip
-
-    price_src = (price_src or os.getenv("STRUCT_AVWAP_PRICE", "hlc3")).lower()
-    if price_src == "hlc3" and all(c in df.columns for c in ("high","low","close")):
-        px = (df["high"].values + df["low"].values + df["close"].values) / 3.0
-    else:
-        px = df["close"].values.astype(float)
-
-    v = df[vcol].values.astype(float)
-    pxv = px * v
-
-    # cumulative from anchor
-    avwap = np.full(len(df), np.nan, dtype="float64")
-    csum_v = np.cumsum(v[start_idx:])
-    csum_pv = np.cumsum(pxv[start_idx:])
-    av = csum_pv / np.maximum(csum_v, 1e-12)
-    avwap[start_idx:] = av
-    return avwap
-
-
-def _calc_avwap_xy(df, anchor_idx: int, price_src: str = None):
-    """
-    Returns (x, y) for plotting. Safe against any previous variants.
-    """
-    y_line = _avwap_series(df, anchor_idx, price_src=price_src)
-    if y_line is None:
-        return None
-    x = df.index
-    return x, y_line
-
-
-def _draw_avwap(ax, df, anchor_idx, color, label, price_src=None):
-    ret = _calc_avwap_xy(df, anchor_idx, price_src=price_src)
-    if ret is None:
-        return
-    x, y = _ensure_xy(ret)  # <- robust
-    ax.plot(x, y, color=color, linewidth=1.4, label=label)
+    price = np.asarray(price, dtype=float)
+    volume = np.asarray(volume, dtype=float)
+    pv = price * volume
+    out = np.full(len(price), np.nan, dtype="float64")
+    csum_v = np.cumsum(volume[start_idx:])
+    csum_pv = np.cumsum(pv[start_idx:])
+    out[start_idx:] = csum_pv / np.maximum(csum_v, 1e-12)
+    return out
 
 
 def _ytd_anchor_idx(df: pd.DataFrame):
@@ -1395,44 +1248,65 @@ def _draw_hline(ax, df, price, color, label, lw=1.6, alpha=0.9, z=2):
 
 def _draw_avwap_items(ax, df):
 
-    """Draw YTD/ATH AVWAP either as curve or flat level."""
+    """Draw YTD/ATH AVWAP as curve or horizontal level."""
     mode = (os.getenv("STRUCT_AVWAP_MODE", "curve") or "curve").lower()
+    style = (os.getenv("STRUCT_AVWAP_STYLE", "line") or "line").lower()
 
     lw = env_float("STRUCT_LW_AVWAP", 1.6)
     px_src = os.getenv("STRUCT_AVWAP_PRICE", "hlc3")
     draw_ytd = env_bool("STRUCT_DRAW_AVWAP_YTD", True)
     draw_ath = env_bool("STRUCT_DRAW_AVWAP_ATH", True)
 
+    vcol = "volume" if "volume" in df.columns else ("vol" if "vol" in df.columns else None)
+    if vcol is None or df[vcol].fillna(0).sum() == 0:
+        return
+    if px_src.lower() == "hlc3" and all(c in df.columns for c in ("high","low","close")):
+        px = (df["high"].values + df["low"].values + df["close"].values) / 3.0
+    else:
+        px = df["close"].values.astype(float)
+    vol = df[vcol].values.astype(float)
+
+    def _plot_avwap(anchor_idx, color, label):
+        vw = anchored_vwap(px, vol, anchor_idx)
+        if vw is None:
+            return
+        if style == "level" or mode == "flat":
+            _draw_hline(ax, df, float(vw[-1]), color, label, lw=lw, alpha=0.95, z=1)
+        else:
+            ax.plot(df.index, vw, color=color, linewidth=lw, alpha=0.95, label=label, zorder=1)
+
     if draw_ytd:
-        i0 = _ytd_anchor_idx(df)
-        ret = _calc_avwap_xy(df, i0, price_src=px_src)
-        if ret is not None:
-            x, s = _ensure_xy(ret)
-
-            if mode == "flat":
-                ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
-                           linewidth=lw, alpha=0.95,
-                           label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=1)
-            else:
-                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
-                        linewidth=lw, alpha=0.95,
-                        label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=1)
-
+        _plot_avwap(_ytd_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"), os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"))
 
     if draw_ath:
-        i1 = _ath_anchor_idx(df)
-        ret = _calc_avwap_xy(df, i1, price_src=px_src)
-        if ret is not None:
-            x, s = _ensure_xy(ret)
+        _plot_avwap(_ath_anchor_idx(df), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"), os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"))
 
-            if mode == "flat":
-                ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
-                           linewidth=lw, alpha=0.95,
-                           label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=1)
-            else:
-                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
-                        linewidth=lw, alpha=0.95,
-                        label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=1)
+def _draw_ath_prev_lines(ax, df):
+    """Draw ATH and previous top horizontal lines."""
+    draw_ath = env_bool("STRUCT_DRAW_ATH", True)
+    draw_h = env_bool("STRUCT_DRAW_ATH_H", True)
+    col_ath = os.getenv("STRUCT_COL_ATH", "#000000")
+    lw_ath = env_float("STRUCT_LW_ATH", 1.3)
+    alpha_ath = env_float("STRUCT_ATH_ALPHA", 0.65)
+    if draw_ath and draw_h and len(df):
+        y_ath = float(df["high"].max())
+        _draw_hline(ax, df, y_ath, col_ath, "ATH", lw=lw_ath, alpha=alpha_ath, z=2)
+
+    n_prev = env_int("STRUCT_PREV_TOP_N", 0)
+    if n_prev > 0 and len(df):
+        df_w = df.resample('W').agg({'high':'max','low':'min','close':'last','open':'first'})
+        highs = df_w['high'].values
+        pivot = 3
+        idxs = []
+        for i in range(pivot, len(highs)-pivot):
+            if highs[i] == np.max(highs[i-pivot:i+pivot+1]):
+                idxs.append(i)
+        prices = sorted([float(highs[i]) for i in idxs], reverse=True)[:n_prev]
+        col_prev = os.getenv("STRUCT_COL_PREV_TOP", col_ath)
+        lw_prev = env_float("STRUCT_LW_PREV_TOP", lw_ath)
+        alpha_prev = env_float("STRUCT_PREV_TOP_ALPHA", alpha_ath)
+        for j, price in enumerate(prices, 1):
+            _draw_hline(ax, df, price, col_prev, f"Prev Top {j}", lw=lw_prev, alpha=alpha_prev, z=1)
 
 
 
@@ -2176,72 +2050,6 @@ def _scale_note_label(i: int, delta: float) -> str:
 
 
 
-# === Exit resolution helpers (1m bar fetch + sanitize/clamp/guard) ===
-def _fetch_recent_bar_1m(symbol: str):
-    """
-    Return dict {open, high, low, close} for the latest 1m bar.
-    Reuse existing OHLCV cache/fetchers if available; safe fallback to last price.
-
-    """
-    try:
-        # Try common helpers first
-        if 'get_ohlcv' in globals():
-            ohlc = get_ohlcv(symbol, "1m", limit=1)[-1]
-            return {"open": float(ohlc[1]), "high": float(ohlc[2]), "low": float(ohlc[3]), "close": float(ohlc[4])}
-        if 'fetch_ohlcv' in globals():
-            ohlc = fetch_ohlcv(symbol, "1m", limit=1)[-1]
-            return {"open": float(ohlc[1]), "high": float(ohlc[2]), "low": float(ohlc[3]), "close": float(ohlc[4])}
-        if 'get_recent_ohlc' in globals():
-            b = get_recent_ohlc(symbol, "1m")
-            return {"open": float(b["open"]), "high": float(b["high"]), "low": float(b["low"]), "close": float(b["close"]) }
-    except Exception:
-        pass
-    # Fallback: use last price cache to emulate a flat bar
-    lp = get_last_price(symbol, 0.0)
-    return {"open": lp, "high": lp, "low": lp, "close": lp}
-
-
-def _raw_exit_price(symbol: str, last_hint: float|None = None) -> float:
-    # honor EXIT_PRICE_SOURCE, but never let 'mark' directly drive exits (we'll clamp anyway)
-    try:
-        src = EXIT_PRICE_SOURCE
-
-        if src == "index" and 'get_index_price' in globals():
-            return float(get_index_price(symbol))
-    except Exception:
-        pass
-
-    # 'mark' → force to last (will be clamped to current 1m H/L)
-    return float(last_hint if last_hint is not None else get_last_price(symbol, 0.0))
-
-def _sanitize_exit_price(symbol: str, last_hint: float|None = None):
-    """
-    Returns (clamped, bar), where bar is dict(open,high,low,close) of the *current* 1m bar.
-    We clamp price to [low, high] to avoid unseen spikes.
-    """
-    bar = _fetch_recent_bar_1m(symbol)
-    last_raw = _raw_exit_price(symbol, last_hint)
-
-    hi, lo = float(bar["high"]), float(bar["low"])
-    clamped = max(min(float(last_raw), hi), lo)
-    return clamped, bar
-
-def _outlier_guard(clamped: float, bar: dict) -> bool:
-    """
-
-    True → skip this minute as outlier (|Δ| > OUTLIER_MAX_1M vs 1m open/close).
-
-    """
-    try:
-        if OUTLIER_MAX_1M <= 0:
-            return False
-        ref = float(bar.get("open") or bar.get("close") or clamped)
-        if ref <= 0:
-            return False
-        delta = abs(clamped - ref) / ref
-        return delta > OUTLIER_MAX_1M
-    except Exception:
-        return False
 
 
 # === [ANCHOR: GATEKEEPER_STATE] 프레임 상태/쿨다운 ===
@@ -4839,7 +4647,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.08, 1, 0.97])
-    _apply_right_pad(axs[0], df, timeframe)
+    _apply_right_pad(axs[0], env_float("STRUCT_VIEW_PAD_RATIO", 0.0))
     pA = os.path.join(outdir, f"chart_{sym}_{timeframe}_A_trend.png")
     fig.savefig(pA, dpi=140); plt.close(fig); paths.append(pA)
 
@@ -4866,7 +4674,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.08, 1, 0.97])
-    _apply_right_pad(axs[0], df, timeframe)
+    _apply_right_pad(axs[0], env_float("STRUCT_VIEW_PAD_RATIO", 0.0))
     pB = os.path.join(outdir, f"chart_{sym}_{timeframe}_B_momentum.png")
     fig.savefig(pB, dpi=140); plt.close(fig); paths.append(pB)
 
@@ -4893,7 +4701,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.08, 1, 0.97])
-    _apply_right_pad(axs[0], df, timeframe)
+    _apply_right_pad(axs[0], env_float("STRUCT_VIEW_PAD_RATIO", 0.0))
     pC = os.path.join(outdir, f"chart_{sym}_{timeframe}_C_strength.png")
     fig.savefig(pC, dpi=140); plt.close(fig); paths.append(pC)
 
@@ -4909,7 +4717,7 @@ def save_chart_groups(df, symbol, timeframe, outdir="images"):
              ha='left', va='bottom', fontsize=9,
              bbox=dict(boxstyle='round,pad=0.4', fc='white', ec='#999', alpha=0.92))
     plt.tight_layout(rect=[0, 0.09, 1, 0.97])
-    _apply_right_pad(ax, df, timeframe)
+    _apply_right_pad(ax, env_float("STRUCT_VIEW_PAD_RATIO", 0.0))
     pD = os.path.join(outdir, f"chart_{sym}_{timeframe}_D_flow.png")
     fig.savefig(pD, dpi=140); plt.close(fig); paths.append(pD)
 
@@ -11034,7 +10842,10 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     axis_scale = os.getenv("STRUCT_AXIS_SCALE_VISUAL", "log").lower()
     ax.set_yscale("log" if axis_scale == "log" else "linear")
 
-    if tf_l.endswith("m"):
+    if tf_l == "15m":
+        loc = mdates.AutoDateLocator(minticks=env_int("STRUCT_15M_XTICK_MIN", 6),
+                                     maxticks=env_int("STRUCT_XTICK_MAX", 10))
+    elif tf_l.endswith("m"):
         loc = mdates.AutoDateLocator(minticks=4,
                                      maxticks=env_int("STRUCT_XTICK_MAX", 10))
     elif tf_l == "4h":
@@ -11043,13 +10854,14 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         loc = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
-
+    if env_bool("STRUCT_XGRID_ON", False):
+        ax.grid(True, axis="x", alpha=0.3)
 
     for lab in ax.get_xticklabels():
         lab.set_rotation(int(os.getenv("STRUCT_XTICK_ROT", "0")))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
-        if env_bool("STRUCT_DRAW_SR", True):
+        if os.getenv("STRUCT_DRAW_LEVELS", "0") == "1":
             levels = _levels_from_info_or_df(struct_info, df, _safe_atr(df))
             _draw_levels(ax, df, _merge_close_levels(levels, df), _safe_atr(df))
     except Exception as e:
@@ -11061,46 +10873,22 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as e:
         err_flags.append(("tl", e))
     try:
-        if env_bool("STRUCT_DRAW_REGCH", True):
-
+        if env_bool("STRUCT_SHOW_REG", False):
             _draw_reg_channel(ax, df, k=env_float("STRUCT_REGCH_K", 1.0), tf=tf)
     except Exception as e:
         err_flags.append(("reg", e))
-    try:
-        if env_bool("STRUCT_DRAW_FIBCH", True):
-            base = None
-            if struct_info and isinstance(struct_info, dict):
-                base = struct_info.get("fib_base")
-
-            if base is None:
-                # allow ENV override: e.g., STRUCT_FIB_BASE="120,260"
-                if os.getenv("STRUCT_FIB_BASE"):
-                    base = _env_idxpair("STRUCT_FIB_BASE", (0, 1))
-
-            # normalize shape (may be list/tuple/with extras)
-            if isinstance(base, (list, tuple)) and len(base) >= 2:
-                i0, i1 = int(base[0]), int(base[1])
-                base = (i0, i1)
-            else:
-                base = None
-
-            mode_fib = os.getenv("STRUCT_FIBCH_MODE", "manual").lower()
-            fib_levels = _resolve_fib_levels(tf)
-            if mode_fib == "auto":
-                _draw_fib_channel_auto(ax, df, base=base, levels=fib_levels, tf=tf)
-            else:
-                draw_fib_channel(df, symbol, ax)
-
-    except Exception as e:
-        err_flags.append(("fib", e))
     try:
         if env_bool("STRUCT_DRAW_BIGFIG", True):
             _bigfig_levels(ax, df, k=env_int("STRUCT_BIGFIG_K", 6))
     except Exception as e:
         err_flags.append(("bigfig", e))
-    # AVWAPs (YTD/ATH) as series or levels
     try:
-        _draw_avwap_items(ax, df)
+        _draw_ath_prev_lines(ax, df)
+    except Exception as e:
+        err_flags.append(("ath", e))
+    try:
+        if env_bool("STRUCT_SHOW_AVWAP", True):
+            _draw_avwap_items(ax, df)
     except Exception as _e:
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
     try:
@@ -11120,7 +10908,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         _safe_legend(ax)
     except Exception as e:
         err_flags.append(("legend", e))
-    _apply_right_pad(ax, df, tf)
+    _apply_right_pad(ax, env_float("STRUCT_VIEW_PAD_RATIO", 0.0))
     out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
     try:
 
