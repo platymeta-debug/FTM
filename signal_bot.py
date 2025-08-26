@@ -1147,8 +1147,10 @@ def _smart_label_layout_v2(ax, pts: list[dict]):
     to_data = ax.transData.inverted().transform
 
     # === P6: 과밀도 기반 최소 간격 확장 ===
+
     base_min_dy_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY", "10"))
     th = int(os.getenv("STRUCT_FIBCH_LABEL_DENSITY_TH", "10"))           # 이 개수 초과면 확장
+
     grow = float(os.getenv("STRUCT_LABEL_DENSITY_GROW", "0.35"))  # 초과 1개당 배율 증가율
     max_px = float(os.getenv("STRUCT_FIBCH_LABEL_MIN_DY_MAX", "18"))
     if len(pts) > th:
@@ -1260,13 +1262,16 @@ def _atr_last(df: pd.DataFrame, n: int = None) -> float:
         # 폴백: 최근 n봉 평균 범위
         return float((df["high"] - df["low"]).tail(max(n,3)).mean())
 
+
 def _fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr, tf: str | None = None):
+
     """
     레벨 노출 필터링:
       - close와의 거리/ATR이 [min, max] 범위에 드는 레벨만 남김
       - 가장 중요한 코어 레벨(0/0.5/1/1.25)은 항상 포함
       - 최종 개수를 max_count로 제한(가까운 순)
     """
+
     import numpy as np, os
     min_atr = float(os.getenv("STRUCT_FIBCH_VIS_MIN_ATR", "0.20"))
     base_max = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR", "10.0"))
@@ -1277,6 +1282,7 @@ def _fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr, tf: str | Non
         max_atr = float(os.getenv("STRUCT_FIBCH_VIS_MAX_ATR_1D", "14.0"))
     else:
         max_atr = base_max
+
     max_count = int(os.getenv("STRUCT_FIBCH_VIS_MAX_COUNT", "9"))
     keep_core = {0.0, 0.5, 1.0, 1.25}
 
@@ -1662,10 +1668,12 @@ def _draw_big_fib_channel(ax, df, symbol):
         name_map = _rs_preset_names(levels, m, b, unit, x_ref_num, close_price)
 
     # 가시성 필터
+
     vis_levels = set(_fib_visibility_filter(levels, m, b, unit, df, x_ref_num, atr, tf=tf))
 
     # 강조 규칙
     emph_names = {s.strip().upper() for s in os.getenv("STRUCT_FIBCH_EMPH_NAMES","R1,R2,S1").split(",") if s.strip()}
+
     emph_lw    = float(os.getenv("STRUCT_FIBCH_EMPH_LW","2.2"))
     emph_alpha = float(os.getenv("STRUCT_FIBCH_EMPH_ALPHA","1.0"))
     deem_alpha = float(os.getenv("STRUCT_FIBCH_DEEMPH_ALPHA","0.55"))
