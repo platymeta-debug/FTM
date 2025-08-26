@@ -726,6 +726,41 @@ def _apply_right_pad(ax, ratio: float):
     ax.set_xlim(x0, x1 + pad)
 
 
+# ===== [PATCH A] layout finalize util =====
+def _finalize_layout(fig, ax, *, cfg):
+    """
+    Use constrained_layout instead of tight_layout, and apply safe paddings.
+    This prevents 'Tight layout not applied' warnings.
+    """
+    engine = os.getenv("STRUCT_LAYOUT_ENGINE", "constrained").lower()
+    pad_top   = float(os.getenv("STRUCT_PAD_TOP",   "0.10"))
+    pad_right = float(os.getenv("STRUCT_PAD_RIGHT", "0.10"))
+    pad_left  = float(os.getenv("STRUCT_PAD_LEFT",  "0.06"))
+    pad_bottom= float(os.getenv("STRUCT_PAD_BOTTOM","0.08"))
+    try:
+        leg = ax.get_legend()
+        if leg is not None:
+            leg.set_draggable(False)
+            leg.get_frame().set_linewidth(0.0)
+            leg.get_frame().set_alpha(0.9)
+            for t in leg.get_texts():
+                t.set_fontsize(8)
+    except Exception:
+        pass
+    try:
+        if engine == "constrained":
+            fig.set_constrained_layout(True)
+            fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+        elif engine == "tight":
+            fig.tight_layout()
+        fig.subplots_adjust(
+            left=pad_left, right=1.0 - pad_right,
+            top=1.0 - pad_top, bottom=pad_bottom
+        )
+    except Exception:
+        pass
+
+
 def _fib_base_from_env(df: pd.DataFrame):
     """
     .env:
@@ -1334,10 +1369,126 @@ def _fibch_save(d):
 FIBCH = _fibch_load()
 
 
+# ===== [PATCH B] robust fib-channel anchor resolver =====
+from datetime import datetime, timezone
+import matplotlib.dates as mdates
+
+
+def _parse_anchor_token(tok: str):
+    """
+    'YYYY-MM-DD@PRICE' 또는 'YYYY-MM-DDTHH:MM:SSZ@PRICE' → (pd.Timestamp(UTC), float)
+    """
+    ts_str, price_str = tok.split("@", 1)
+    try:
+        ts = pd.to_datetime(ts_str, utc=True)
+    except Exception:
+        ts = pd.Timestamp(datetime.fromisoformat(ts_str.replace("Z", "")).replace(tzinfo=timezone.utc))
+    return ts, float(price_str)
+
+
+def _get_fibch_set_for(symbol: str):
+    """
+    STRUCT_FIBCH_SETS 한 줄 JSON에서 심볼 매핑을 얻는다. (ETH/USDT, ETHUSDT 등 변형 모두 커버)
+    """
+    raw = os.getenv("STRUCT_FIBCH_SETS", "").strip()
+    if not raw:
+        return None
+    try:
+        m = json.loads(raw)
+    except Exception:
+        return None
+    k = symbol.upper().replace("-", "").replace("_", "").replace("/", "")
+    cand_keys = {k, symbol.upper(), symbol.upper().replace("-", "/"), symbol.upper().replace("_", "/")}
+    for ck in cand_keys:
+        if ck in m:
+            return m[ck]
+    for kk in m.keys():
+        if kk.upper().replace("-", "").replace("_", "").replace("/", "") == k:
+            return m[kk]
+    return None
+
+
+def _resolve_fibch_anchors(symbol: str):
+    """
+    1) ENV 한 줄 JSON에서 앵커/단위폭 읽기
+    2) 데이터프레임에 캔들이 없어도 '가상 앵커' 좌표로 사용 (경고 발생 X)
+    return: (x1, y1, x2, y2, unit_price)
+    """
+    st = _get_fibch_set_for(symbol)
+    if not st:
+        return None
+    anchors = st.get("anchors", [])
+    unit = float(st.get("unit", 0.0))
+    if len(anchors) != 2 or unit <= 0:
+        return None
+    ts1, p1 = _parse_anchor_token(anchors[0])
+    ts2, p2 = _parse_anchor_token(anchors[1])
+    x1 = mdates.date2num(ts1.to_pydatetime())
+    x2 = mdates.date2num(ts2.to_pydatetime())
+    calc_scale = os.getenv("STRUCT_CALC_SCALE_MODE", "log").lower()
+    def y_map(price):
+        if calc_scale == "log":
+            return math.log10(max(price, 1e-9))
+        return float(price)
+    y1 = y_map(p1)
+    y2 = y_map(p2)
+    return x1, y1, x2, y2, unit
+
+
+def draw_big_fib_channel(ax, symbol: str):
+    """
+    현재 뷰포트(xlim)에 맞춰, 과거 앵커가 범위 밖이어도 선을 그린다.
+    """
+    res = _resolve_fibch_anchors(symbol)
+    if not res:
+        return False
+    x1, y1, x2, y2, unit_price = res
+    k = (y2 - y1) / (x2 - x1) if x2 != x1 else 0.0
+    b0 = y1 - k * x1
+    levels = os.getenv("STRUCT_FIBCH_LEVELS", "0,0.125,0.25,0.375,0.5,0.625,0.75,0.875,1,1.125,1.25").split(",")
+    lv = [float(s) for s in levels if s.strip() != ""]
+    lv.sort()
+    calc_scale = os.getenv("STRUCT_CALC_SCALE_MODE", "log").lower()
+    def unit_to_dy(price, unit_price):
+        if calc_scale == "log":
+            p_hi = max(price + unit_price, 1e-9)
+            p_lo = max(price, 1e-9)
+            return math.log10(p_hi) - math.log10(p_lo)
+        else:
+            return unit_price
+    approx_price = max((10 ** ((y1 + y2) / 2.0)) if calc_scale == "log" else ((y1 + y2) / 2.0), 1e-9)
+    dy_unit = unit_to_dy(approx_price, unit_price)
+    x0, x1lim = ax.get_xlim()
+    pad_ratio = float(os.getenv("STRUCT_FIBCH_EXTEND_RATIO", "0.25"))
+    span = (x1lim - x0)
+    X0 = x0 - span * pad_ratio
+    X1 = x1lim + span * pad_ratio
+    col_center = os.getenv("STRUCT_FIBCH_COL_CENTER", "#808080")
+    col_up = os.getenv("STRUCT_FIBCH_COL_UP", "#ff7f0e")
+    col_dn = os.getenv("STRUCT_FIBCH_COL_DN", "#1f77b4")
+    lw_main = float(os.getenv("STRUCT_FIBCH_LW_MAIN", "1.8"))
+    lw_lvl = float(os.getenv("STRUCT_FIBCH_LW_LEVEL", "1.2"))
+    alpha = float(os.getenv("STRUCT_FIBCH_ALPHA", "0.55"))
+    dashed = os.getenv("STRUCT_FIBCH_DASHED", "1") == "1"
+    label_on = os.getenv("STRUCT_FIBCH_LABELS", "1") == "1"
+    lbl_mode = os.getenv("STRUCT_FIBCH_LABEL_MODE", "name").lower()
+    for lvf in lv:
+        intercept = b0 + (lvf * dy_unit)
+        yX0 = k * X0 + intercept
+        yX1 = k * X1 + intercept
+        col = col_up if lvf >= 0 else col_dn
+        lw = lw_main if abs(lvf) < 1e-9 else lw_lvl
+        ls = "--" if (dashed and abs(lvf) > 1e-9) else "-"
+        ax.plot([X0, X1], [yX0, yX1], ls, lw=lw, alpha=alpha, color=col, zorder=1)
+        if label_on and abs(lvf) > 1e-9:
+            txt = f"{lvf:.3g}" if "name" not in lbl_mode else f"{lvf}"
+            ax.text(X1, yX1, txt, va="center", ha="left", fontsize=8, color=col, alpha=0.9)
+    return True
+
+
 def _fibch_get_manual_params(symbol: str):
     """Return ((ts1,p1),(ts2,p2),unit,used_key,candidates) from STRUCT_FIBCH_SETS JSON."""
     import json, os, re, pandas as pd
-
     raw = os.getenv("STRUCT_FIBCH_SETS", "")
     candidates: list[str] = []
     if not raw:
@@ -1348,7 +1499,6 @@ def _fibch_get_manual_params(symbol: str):
         return None, None, candidates
     sym = symbol.upper()
     base = sym.split(":")[-1]
-
     variants = {
         sym,
         base,
@@ -1357,7 +1507,6 @@ def _fibch_get_manual_params(symbol: str):
         re.sub(r"[:/_-]", "", sym),
         re.sub(r"[:/_-]", "", base),
     }
-
     clean = re.sub(r"[:/_-]", "", base)
     if clean.endswith("USDT"):
         b = clean[:-4]
@@ -1369,7 +1518,6 @@ def _fibch_get_manual_params(symbol: str):
     for k in candidates:
         if k in data:
             try:
-
                 a1_raw, a2_raw = data[k]["anchors"]
                 unit = float(data[k]["unit"])
                 ts1_str, p1 = a1_raw.split("@")
@@ -1379,12 +1527,10 @@ def _fibch_get_manual_params(symbol: str):
                 return ((ts1, float(p1)), (ts2, float(p2)), unit), k, candidates
             except Exception:
                 continue
-
     canon = re.sub(r"[^A-Z0-9]", "", sym)
     for k, v in data.items():
         if re.sub(r"[^A-Z0-9]", "", k.upper()) == canon:
             try:
-
                 a1_raw, a2_raw = v["anchors"]
                 unit = float(v["unit"])
                 ts1_str, p1 = a1_raw.split("@")
@@ -1392,7 +1538,6 @@ def _fibch_get_manual_params(symbol: str):
                 ts1 = pd.Timestamp(ts1_str, tz="UTC")
                 ts2 = pd.Timestamp(ts2_str, tz="UTC")
                 return ((ts1, float(p1)), (ts2, float(p2)), unit), k, candidates
-
             except Exception:
                 pass
     return None, None, candidates
@@ -11471,7 +11616,11 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     except Exception as _e:
         logger.info(f"[AVWAP_WARN] {symbol} {tf} {type(_e).__name__}: {str(_e)}")
     try:
-        _draw_big_fib_channel(ax, df, symbol)
+        if os.getenv("STRUCT_FIBCH_ENABLE", "1") == "1":
+            try:
+                draw_big_fib_channel(ax, symbol)
+            except Exception as e:
+                logger.warning("[FIBCH] draw error: %s", e)
 
     except Exception as e:
         err_flags.append(("bigfib", e))
@@ -11525,8 +11674,8 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
     try:
 
-        fig.tight_layout()
-        fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches=None)
+        _finalize_layout(fig, ax, cfg={})
+        fig.savefig(out, dpi=env_int("STRUCT_DPI", 140))
     except Exception as e:
         plt.close(fig)
         log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
