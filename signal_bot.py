@@ -1061,10 +1061,12 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
 
     # === base selection ===
     if not base:
+
         i0, i1 = _env_idxpair("STRUCT_FIB_BASE_OVERRIDE_IDX", default=(None, None))
         if i0 is not None and i1 is not None:
             base = (int(i0), int(i1))
     if not base:
+
         base = _choose_fib_base(df, tf)
     i0, i1 = base
     if i0 == i1:
@@ -10834,9 +10836,11 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
+
     if str(tf).lower() == "15m":
         loc = mdates.AutoDateLocator(minticks=5,
                                      maxticks=env_int("STRUCT_XTICK_MAX", 12))
+
         ax.xaxis.set_major_locator(loc)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
 
