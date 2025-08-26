@@ -163,22 +163,32 @@ def _env_xy(key: str, default=(0.66, 0.66)):
     return float(vals[0]), float(vals[1])
 
 def _env_idxpair(key: str, default=(0, 1)):
+    """Parse 'i0,i1' to a tuple; tolerant of extra tokens and blanks.
+
+    If parsing fails and ``default`` contains ``None`` values, ``None`` is
+    propagated instead of raising.
     """
-    Parse 'i0,i1' to 2-int tuple for index pairs (e.g., Fib base).
-    Extra tokens ignored.
-    """
-    raw = os.getenv(key, f"{default[0]},{default[1]}") or ""
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
     raw = raw.replace(";", ",").replace(" ", ",")
-    parts = [p for p in raw.split(",") if p != ""]
-    out = []
-    for p in parts:
+    parts = []
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
         try:
-            out.append(int(float(p)))
+            parts.append(int(float(p)))
         except Exception:
-            pass
-    while len(out) < 2:
-        out.append(default[len(out)])
-    return int(out[0]), int(out[1])
+            parts.append(None)
+    while len(parts) < 2:
+        parts.append(None)
+    i0, i1 = parts[0], parts[1]
+    if i0 is None and default[0] is not None:
+        i0 = int(default[0])
+    if i1 is None and default[1] is not None:
+        i1 = int(default[1])
+    return i0, i1
 
 def _ensure_xy(ret):
     """
@@ -613,30 +623,23 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
 # ==== Structure calc & draw helpers ==========================================
 # === Scale resolver (visual + calc unified) ===================================
 def _decide_scale(tf: str) -> str:
+    """Resolve visual axis scale via STRUCT_AXIS_SCALE_VISUAL.
+
+    'auto' chooses log for daily+ timeframes and linear otherwise.
     """
-    Returns 'log' or 'linear' for both visual axis and calculation.
-    Precedence: STRUCT_AXIS_SCALE_VISUAL > STRUCT_YAXIS_SCALE > STRUCT_SCALE_MODE
-    auto => log for 1d+ ; linear for intraday.
-    """
-    vis = (os.getenv("STRUCT_AXIS_SCALE_VISUAL")
-           or os.getenv("STRUCT_YAXIS_SCALE")
-           or os.getenv("STRUCT_SCALE_MODE")
-           or "auto").lower()
+    vis = os.getenv("STRUCT_AXIS_SCALE_VISUAL", "log").lower()
     if vis == "auto":
         tf_l = str(tf).lower()
         return "log" if tf_l.endswith("d") or tf_l.endswith("w") else "linear"
     return "log" if vis == "log" else "linear"
 
-def _calc_scale() -> str:
-    """Calculation scale for trendline/reg/fib; fallback to visual scale if empty."""
-    m = (os.getenv("STRUCT_CALC_SCALE_MODE")
-         or os.getenv("STRUCT_TL_SCALE_MODE")
-         or os.getenv("STRUCT_SCALE_MODE")
-         or os.getenv("STRUCT_YAXIS_SCALE")
-         or os.getenv("STRUCT_AXIS_SCALE_VISUAL")
-         or "auto").lower()
-    if m == "auto":
-        # Keep calc identical to visual on auto
+def _calc_scale() -> str | None:
+    """Calculation scale controlled solely by STRUCT_CALC_SCALE_MODE.
+
+    Returns ``None`` to follow visual scale when unset or set to 'auto'.
+    """
+    m = os.getenv("STRUCT_CALC_SCALE_MODE", "").lower()
+    if m in ("", "auto"):
         return None
     return "log" if m == "log" else "linear"
 
@@ -819,11 +822,9 @@ def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame, tf:str=None):
         tls = struct_info.get("trendlines", []) or []
         if tls:
             return tls
-    # === 스케일 모드 (추세선 전용) ===
-    tl_scale = (os.getenv("STRUCT_TL_SCALE_MODE", os.getenv("STRUCT_SCALE_MODE", "log")) or "log").lower()
     up, dn = _best_trendlines(df, tf=tf)
-    if up: tls.append({"dir":"up","m":up[1],"b":up[2], "scale": tl_scale})
-    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2], "scale": tl_scale})
+    if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
+    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
     return tls
 
 # === level normalizer =========================================
@@ -1060,6 +1061,12 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
 
     # === base selection ===
     if not base:
+
+        i0, i1 = _env_idxpair("STRUCT_FIB_BASE_OVERRIDE_IDX", default=(None, None))
+        if i0 is not None and i1 is not None:
+            base = (int(i0), int(i1))
+    if not base:
+
         base = _choose_fib_base(df, tf)
     i0, i1 = base
     if i0 == i1:
@@ -10742,6 +10749,16 @@ def _tf_timefmt(tf: str) -> str:
     m = {"15m":"%m-%d %H:%M","1h":"%m-%d %Hh","4h":"%m-%d %Hh","1d":"%Y-%m-%d"}
     return m.get(tf, "%m-%d %H:%M")
 
+def _apply_right_pad(ax, df, tf):
+    """Extend x-axis to place last bar around STRUCT_VIEW_ANCHOR."""
+    anchor = env_float("STRUCT_VIEW_ANCHOR", 0.66)
+    lookback = _tf_view_lookback(tf)
+    right_frac = max(0.0, 1.0 - anchor)
+    if len(df) >= 2:
+        step = df.index[-1] - df.index[-2]
+        right_pad = step * int(lookback * right_frac)
+        ax.set_xlim(df.index[-lookback], df.index[-1] + right_pad)
+
 def _atr_fast(df):
     try:
         h,l,c = df["high"].values, df["low"].values, df["close"].values
@@ -10819,15 +10836,16 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
-    tf_l = str(tf).lower()
-    if tf_l == "15m":
-        iv = int(os.getenv("STRUCT_15M_XTICK_MIN", "60"))
-        loc = mdates.HourLocator(interval=max(1, iv // 60))
+
+    if str(tf).lower() == "15m":
+        loc = mdates.AutoDateLocator(minticks=5,
+                                     maxticks=env_int("STRUCT_XTICK_MAX", 12))
+
         ax.xaxis.set_major_locator(loc)
         ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
 
     for lab in ax.get_xticklabels():
-        lab.set_rotation(int(os.getenv("STRUCT_XTICK_ROT","0")))
+        lab.set_rotation(int(os.getenv("STRUCT_XTICK_ROT", "0")))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if env_bool("STRUCT_DRAW_SR", True):
@@ -10893,11 +10911,12 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         _safe_legend(ax)
     except Exception as e:
         err_flags.append(("legend", e))
+    _apply_right_pad(ax, df, tf)
     out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
     try:
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
-        fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches='tight', pad_inches=0.1)
+        fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches=None)
     except Exception as e:
         plt.close(fig)
         log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
