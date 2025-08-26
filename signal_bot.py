@@ -163,22 +163,32 @@ def _env_xy(key: str, default=(0.66, 0.66)):
     return float(vals[0]), float(vals[1])
 
 def _env_idxpair(key: str, default=(0, 1)):
+    """Parse 'i0,i1' to a tuple; tolerant of extra tokens and blanks.
+
+    If parsing fails and ``default`` contains ``None`` values, ``None`` is
+    propagated instead of raising.
     """
-    Parse 'i0,i1' to 2-int tuple for index pairs (e.g., Fib base).
-    Extra tokens ignored.
-    """
-    raw = os.getenv(key, f"{default[0]},{default[1]}") or ""
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
     raw = raw.replace(";", ",").replace(" ", ",")
-    parts = [p for p in raw.split(",") if p != ""]
-    out = []
-    for p in parts:
+    parts = []
+    for p in raw.split(","):
+        p = p.strip()
+        if not p:
+            continue
         try:
-            out.append(int(float(p)))
+            parts.append(int(float(p)))
         except Exception:
-            pass
-    while len(out) < 2:
-        out.append(default[len(out)])
-    return int(out[0]), int(out[1])
+            parts.append(None)
+    while len(parts) < 2:
+        parts.append(None)
+    i0, i1 = parts[0], parts[1]
+    if i0 is None and default[0] is not None:
+        i0 = int(default[0])
+    if i1 is None and default[1] is not None:
+        i1 = int(default[1])
+    return i0, i1
 
 def _ensure_xy(ret):
     """
@@ -613,30 +623,23 @@ def _log_panel_source(symbol: str, tf: str, rows_or_df):
 # ==== Structure calc & draw helpers ==========================================
 # === Scale resolver (visual + calc unified) ===================================
 def _decide_scale(tf: str) -> str:
+    """Resolve visual axis scale via STRUCT_AXIS_SCALE_VISUAL.
+
+    'auto' chooses log for daily+ timeframes and linear otherwise.
     """
-    Returns 'log' or 'linear' for both visual axis and calculation.
-    Precedence: STRUCT_AXIS_SCALE_VISUAL > STRUCT_YAXIS_SCALE > STRUCT_SCALE_MODE
-    auto => log for 1d+ ; linear for intraday.
-    """
-    vis = (os.getenv("STRUCT_AXIS_SCALE_VISUAL")
-           or os.getenv("STRUCT_YAXIS_SCALE")
-           or os.getenv("STRUCT_SCALE_MODE")
-           or "auto").lower()
+    vis = os.getenv("STRUCT_AXIS_SCALE_VISUAL", "log").lower()
     if vis == "auto":
         tf_l = str(tf).lower()
         return "log" if tf_l.endswith("d") or tf_l.endswith("w") else "linear"
     return "log" if vis == "log" else "linear"
 
-def _calc_scale() -> str:
-    """Calculation scale for trendline/reg/fib; fallback to visual scale if empty."""
-    m = (os.getenv("STRUCT_CALC_SCALE_MODE")
-         or os.getenv("STRUCT_TL_SCALE_MODE")
-         or os.getenv("STRUCT_SCALE_MODE")
-         or os.getenv("STRUCT_YAXIS_SCALE")
-         or os.getenv("STRUCT_AXIS_SCALE_VISUAL")
-         or "auto").lower()
-    if m == "auto":
-        # Keep calc identical to visual on auto
+def _calc_scale() -> str | None:
+    """Calculation scale controlled solely by STRUCT_CALC_SCALE_MODE.
+
+    Returns ``None`` to follow visual scale when unset or set to 'auto'.
+    """
+    m = os.getenv("STRUCT_CALC_SCALE_MODE", "").lower()
+    if m in ("", "auto"):
         return None
     return "log" if m == "log" else "linear"
 
@@ -819,11 +822,9 @@ def _trendlines_from_info_or_df(struct_info, df: pd.DataFrame, tf:str=None):
         tls = struct_info.get("trendlines", []) or []
         if tls:
             return tls
-    # === 스케일 모드 (추세선 전용) ===
-    tl_scale = (os.getenv("STRUCT_TL_SCALE_MODE", os.getenv("STRUCT_SCALE_MODE", "log")) or "log").lower()
     up, dn = _best_trendlines(df, tf=tf)
-    if up: tls.append({"dir":"up","m":up[1],"b":up[2], "scale": tl_scale})
-    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2], "scale": tl_scale})
+    if up: tls.append({"dir":"up","m":up[1],"b":up[2]})
+    if dn: tls.append({"dir":"down","m":dn[1],"b":dn[2]})
     return tls
 
 # === level normalizer =========================================
@@ -1006,6 +1007,28 @@ def _draw_reg_channel(ax, df, k=None, tf: str=None):
         ax.plot(df.index, up, color=col, linewidth=0.9, linestyle=":", alpha=0.8, label="+1.0σ", zorder=1)
         ax.plot(df.index, dn, color=col, linewidth=0.9, linestyle=":", alpha=0.8, label="-1.0σ", zorder=1)
 
+def _pick_swing_highs(df, width=7, min_sep=20):
+    """Simple pivot high detection."""
+    highs = df["high"].values
+    idxs = []
+    n = len(highs)
+    for i in range(width, n - width):
+        if highs[i] == np.max(highs[i-width:i+width+1]):
+            if (not idxs) or (i - idxs[-1] >= min_sep):
+                idxs.append(i)
+    return idxs
+
+def _choose_fib_base(df, tf):
+    mode = os.getenv("STRUCT_FIB_BASE_MODE", "ph_ph")
+    if mode == "ph_ph":
+        w = int(os.getenv("STRUCT_FIB_SWING_WIDTH", "7"))
+        sep = int(os.getenv("STRUCT_FIB_SWING_MIN_SEP", "20"))
+        hs = _pick_swing_highs(df, width=w, min_sep=sep)
+        if len(hs) >= 2:
+            return (hs[-2], hs[-1])
+    i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
+    return (i0, i1)
+
 def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
     """
     Base trend (two points) + parallel offsets measured in transformed space (log-safe).
@@ -1036,12 +1059,16 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
     calc = _calc_scale() or _decide_scale(tf)
     y_t = _to_scale(y, calc)
 
-    # base
+    # === base selection ===
     if not base:
-        i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
-        if i0 == i1: return
-        base = (i0, i1)
+        i0, i1 = _env_idxpair("STRUCT_FIB_BASE_OVERRIDE_IDX", default=(None, None))
+        if i0 is not None and i1 is not None:
+            base = (int(i0), int(i1))
+    if not base:
+        base = _choose_fib_base(df, tf)
     i0, i1 = base
+    if i0 == i1:
+        return
     m = (y_t[i1]-y_t[i0])/(x[i1]-x[i0] + 1e-9); b = y_t[i0] - m*x[i0]
     y0_t = m*x + b
 
@@ -1173,8 +1200,8 @@ def _draw_hline(ax, df, price, color, label, lw=1.6, alpha=0.9, z=2):
     ax.hlines(price, df.index[0], df.index[-1], colors=color, linewidths=lw, alpha=alpha, label=label, zorder=z)
 
 def _draw_avwap_items(ax, df):
-    """Draw YTD/ATH AVWAP as level or series depending on env."""
-    style = (os.getenv("STRUCT_AVWAP_STYLE","level") or "level").lower()  # 'level'|'series'
+    """Draw YTD/ATH AVWAP as series or final level."""
+    mode = (os.getenv("STRUCT_AVWAP_MODE","series") or "series").lower()
     lw = env_float("STRUCT_LW_AVWAP", 1.6)
     px_src = os.getenv("STRUCT_AVWAP_PRICE","hlc3")
     draw_ytd = env_bool("STRUCT_DRAW_AVWAP_YTD", True)
@@ -1182,31 +1209,31 @@ def _draw_avwap_items(ax, df):
 
     if draw_ytd:
         i0 = _ytd_anchor_idx(df)
-
         ret = _calc_avwap_xy(df, i0, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
-            if style == "series":
-                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
-
-                        linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
+            if mode == "level":
+                ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
+                           linewidth=lw, alpha=0.95,
+                           label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
             else:
-                _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
-                            os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), lw=lw, alpha=0.95, z=2)
+                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
+                        linewidth=lw, alpha=0.95,
+                        label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
 
     if draw_ath:
         i1 = _ath_anchor_idx(df)
-
         ret = _calc_avwap_xy(df, i1, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
-            if style == "series":
-                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
-
-                        linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
+            if mode == "level":
+                ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
+                           linewidth=lw, alpha=0.95,
+                           label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
             else:
-                _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
-                            os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), lw=lw, alpha=0.95, z=2)
+                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
+                        linewidth=lw, alpha=0.95,
+                        label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
 
 
 # === Big-figure levels (round numbers near price) =============================
@@ -10720,6 +10747,16 @@ def _tf_timefmt(tf: str) -> str:
     m = {"15m":"%m-%d %H:%M","1h":"%m-%d %Hh","4h":"%m-%d %Hh","1d":"%Y-%m-%d"}
     return m.get(tf, "%m-%d %H:%M")
 
+def _apply_right_pad(ax, df, tf):
+    """Extend x-axis to place last bar around STRUCT_VIEW_ANCHOR."""
+    anchor = env_float("STRUCT_VIEW_ANCHOR", 0.66)
+    lookback = _tf_view_lookback(tf)
+    right_frac = max(0.0, 1.0 - anchor)
+    if len(df) >= 2:
+        step = df.index[-1] - df.index[-2]
+        right_pad = step * int(lookback * right_frac)
+        ax.set_xlim(df.index[-lookback], df.index[-1] + right_pad)
+
 def _atr_fast(df):
     try:
         h,l,c = df["high"].values, df["low"].values, df["close"].values
@@ -10789,14 +10826,22 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         df_fb = df.tail(120)
         _draw_candles(ax, df_fb, tf)
         ax.set_xlim(df_fb.index[0], df_fb.index[-1])
-    # axis/ticks (after xlim)
+    # === axis/ticks (after xlim) ===
+    axis_scale = os.getenv("STRUCT_AXIS_SCALE_VISUAL", "log").lower()
+    ax.set_yscale("log" if axis_scale == "log" else "linear")
+
     locator = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+
     if str(tf).lower() == "15m":
-        ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.MinuteLocator(interval=30)))
-    for lab in ax.get_xticklabels(): lab.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
+        loc = mdates.AutoDateLocator(minticks=5,
+                                     maxticks=env_int("STRUCT_XTICK_MAX", 12))
+        ax.xaxis.set_major_locator(loc)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
+    for lab in ax.get_xticklabels():
+        lab.set_rotation(int(os.getenv("STRUCT_XTICK_ROT", "0")))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if env_bool("STRUCT_DRAW_SR", True):
@@ -10862,11 +10907,12 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         _safe_legend(ax)
     except Exception as e:
         err_flags.append(("legend", e))
+    _apply_right_pad(ax, df, tf)
     out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
     try:
 
         fig.tight_layout(rect=[0.02,0.02,0.98,0.98])
-        fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches='tight', pad_inches=0.1)
+        fig.savefig(out, dpi=env_int("STRUCT_DPI", 140), bbox_inches=None)
     except Exception as e:
         plt.close(fig)
         log(f"[STRUCT_OVERLAY_ERR] {symbol} {tf} {type(e).__name__}: {e}")
