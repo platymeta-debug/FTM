@@ -1006,6 +1006,28 @@ def _draw_reg_channel(ax, df, k=None, tf: str=None):
         ax.plot(df.index, up, color=col, linewidth=0.9, linestyle=":", alpha=0.8, label="+1.0σ", zorder=1)
         ax.plot(df.index, dn, color=col, linewidth=0.9, linestyle=":", alpha=0.8, label="-1.0σ", zorder=1)
 
+def _pick_swing_highs(df, width=7, min_sep=20):
+    """Simple pivot high detection."""
+    highs = df["high"].values
+    idxs = []
+    n = len(highs)
+    for i in range(width, n - width):
+        if highs[i] == np.max(highs[i-width:i+width+1]):
+            if (not idxs) or (i - idxs[-1] >= min_sep):
+                idxs.append(i)
+    return idxs
+
+def _choose_fib_base(df, tf):
+    mode = os.getenv("STRUCT_FIB_BASE_MODE", "ph_ph")
+    if mode == "ph_ph":
+        w = int(os.getenv("STRUCT_FIB_SWING_WIDTH", "7"))
+        sep = int(os.getenv("STRUCT_FIB_SWING_MIN_SEP", "20"))
+        hs = _pick_swing_highs(df, width=w, min_sep=sep)
+        if len(hs) >= 2:
+            return (hs[-2], hs[-1])
+    i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
+    return (i0, i1)
+
 def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
     """
     Base trend (two points) + parallel offsets measured in transformed space (log-safe).
@@ -1036,12 +1058,12 @@ def _draw_fib_channel(ax, df, base=None, levels=None, tf: str=None):
     calc = _calc_scale() or _decide_scale(tf)
     y_t = _to_scale(y, calc)
 
-    # base
+    # === base selection ===
     if not base:
-        i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
-        if i0 == i1: return
-        base = (i0, i1)
+        base = _choose_fib_base(df, tf)
     i0, i1 = base
+    if i0 == i1:
+        return
     m = (y_t[i1]-y_t[i0])/(x[i1]-x[i0] + 1e-9); b = y_t[i0] - m*x[i0]
     y0_t = m*x + b
 
@@ -1173,8 +1195,8 @@ def _draw_hline(ax, df, price, color, label, lw=1.6, alpha=0.9, z=2):
     ax.hlines(price, df.index[0], df.index[-1], colors=color, linewidths=lw, alpha=alpha, label=label, zorder=z)
 
 def _draw_avwap_items(ax, df):
-    """Draw YTD/ATH AVWAP as level or series depending on env."""
-    style = (os.getenv("STRUCT_AVWAP_STYLE","level") or "level").lower()  # 'level'|'series'
+    """Draw YTD/ATH AVWAP as series or final level."""
+    mode = (os.getenv("STRUCT_AVWAP_MODE","series") or "series").lower()
     lw = env_float("STRUCT_LW_AVWAP", 1.6)
     px_src = os.getenv("STRUCT_AVWAP_PRICE","hlc3")
     draw_ytd = env_bool("STRUCT_DRAW_AVWAP_YTD", True)
@@ -1182,31 +1204,31 @@ def _draw_avwap_items(ax, df):
 
     if draw_ytd:
         i0 = _ytd_anchor_idx(df)
-
         ret = _calc_avwap_xy(df, i0, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
-            if style == "series":
-                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
-
-                        linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
+            if mode == "level":
+                ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
+                           linewidth=lw, alpha=0.95,
+                           label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
             else:
-                _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
-                            os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), lw=lw, alpha=0.95, z=2)
+                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
+                        linewidth=lw, alpha=0.95,
+                        label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=2)
 
     if draw_ath:
         i1 = _ath_anchor_idx(df)
-
         ret = _calc_avwap_xy(df, i1, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
-            if style == "series":
-                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
-
-                        linewidth=lw, alpha=0.95, label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
+            if mode == "level":
+                ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
+                           linewidth=lw, alpha=0.95,
+                           label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
             else:
-                _draw_hline(ax, df, float(s[-1]), os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
-                            os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), lw=lw, alpha=0.95, z=2)
+                ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
+                        linewidth=lw, alpha=0.95,
+                        label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=2)
 
 
 # === Big-figure levels (round numbers near price) =============================
@@ -10789,14 +10811,23 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         df_fb = df.tail(120)
         _draw_candles(ax, df_fb, tf)
         ax.set_xlim(df_fb.index[0], df_fb.index[-1])
-    # axis/ticks (after xlim)
+    # === axis/ticks (after xlim) ===
+    axis_scale = os.getenv("STRUCT_AXIS_SCALE_VISUAL", "log").lower()
+    ax.set_yscale("log" if axis_scale == "log" else "linear")
+
     locator = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-    if str(tf).lower() == "15m":
-        ax.xaxis.set_major_locator(mdates.MinuteLocator(interval=30))
-        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.MinuteLocator(interval=30)))
-    for lab in ax.get_xticklabels(): lab.set_rotation(env_int("STRUCT_XTICK_ROT", 0))
+
+    tf_l = str(tf).lower()
+    if tf_l == "15m":
+        iv = int(os.getenv("STRUCT_15M_XTICK_MIN", "60"))
+        loc = mdates.HourLocator(interval=max(1, iv // 60))
+        ax.xaxis.set_major_locator(loc)
+        ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
+    for lab in ax.get_xticklabels():
+        lab.set_rotation(int(os.getenv("STRUCT_XTICK_ROT","0")))
     ax.yaxis.set_major_locator(MaxNLocator(nbins=6, prune='both'))
     try:
         if env_bool("STRUCT_DRAW_SR", True):
