@@ -1050,7 +1050,9 @@ def _choose_fib_base(df, tf):
     i0 = int(np.argmin(df["low"].values)); i1 = int(np.argmax(df["high"].values))
     return (i0, i1)
 
+
 def _draw_fib_channel_auto(ax, df, base=None, levels=None, tf: str=None):
+
     """
     Base trend (two points) + parallel offsets measured in transformed space (log-safe).
     """
@@ -1082,10 +1084,12 @@ def _draw_fib_channel_auto(ax, df, base=None, levels=None, tf: str=None):
 
     # === base selection ===
     if not base:
+
         i0, i1 = _env_idxpair("STRUCT_FIB_BASE_OVERRIDE_IDX", default=(None, None))
         if i0 is not None and i1 is not None:
             base = (int(i0), int(i1))
     if not base:
+
         base = _choose_fib_base(df, tf)
     i0, i1 = base
     if i0 == i1:
@@ -1270,8 +1274,10 @@ def _draw_hline(ax, df, price, color, label, lw=1.6, alpha=0.9, z=2):
     ax.hlines(price, df.index[0], df.index[-1], colors=color, linewidths=lw, alpha=alpha, label=label, zorder=z)
 
 def _draw_avwap_items(ax, df):
+
     """Draw YTD/ATH AVWAP either as curve or flat level."""
     mode = (os.getenv("STRUCT_AVWAP_MODE", "curve") or "curve").lower()
+
     lw = env_float("STRUCT_LW_AVWAP", 1.6)
     px_src = os.getenv("STRUCT_AVWAP_PRICE", "hlc3")
     draw_ytd = env_bool("STRUCT_DRAW_AVWAP_YTD", True)
@@ -1282,6 +1288,7 @@ def _draw_avwap_items(ax, df):
         ret = _calc_avwap_xy(df, i0, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
+
             if mode == "flat":
                 ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_YTD","#ff7f0e"),
                            linewidth=lw, alpha=0.95,
@@ -1291,11 +1298,13 @@ def _draw_avwap_items(ax, df):
                         linewidth=lw, alpha=0.95,
                         label=os.getenv("STRUCT_LBL_AVWAP_YTD","YTD AVWAP"), zorder=1)
 
+
     if draw_ath:
         i1 = _ath_anchor_idx(df)
         ret = _calc_avwap_xy(df, i1, price_src=px_src)
         if ret is not None:
             x, s = _ensure_xy(ret)
+
             if mode == "flat":
                 ax.axhline(y=float(s[-1]), color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
                            linewidth=lw, alpha=0.95,
@@ -1304,6 +1313,7 @@ def _draw_avwap_items(ax, df):
                 ax.plot(x, s, color=os.getenv("STRUCT_COL_AVWAP_ATH","#8c564b"),
                         linewidth=lw, alpha=0.95,
                         label=os.getenv("STRUCT_LBL_AVWAP_ATH","ATH AVWAP"), zorder=1)
+
 
 
 # === Big-figure levels (round numbers near price) =============================
@@ -10814,6 +10824,7 @@ def _tf_timefmt(tf: str) -> str:
     return m.get(tf, "%m-%d %H:%M")
 
 
+
 def _atr_fast(df):
     try:
         h,l,c = df["high"].values, df["low"].values, df["close"].values
@@ -10894,6 +10905,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         _draw_candles(ax, df_fb, tf)
         ax.set_xlim(df_fb.index[0], df_fb.index[-1])
     # === axis/ticks (after xlim) ===
+
     tf_l = str(tf).lower()
     axis_scale = os.getenv("STRUCT_AXIS_SCALE_VISUAL", "log").lower()
     ax.set_yscale("log" if axis_scale == "log" else "linear")
@@ -10907,6 +10919,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         loc = mdates.AutoDateLocator()
     ax.xaxis.set_major_locator(loc)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(loc))
+
 
     for lab in ax.get_xticklabels():
         lab.set_rotation(int(os.getenv("STRUCT_XTICK_ROT", "0")))
@@ -10979,6 +10992,7 @@ def render_struct_overlay(symbol: str, tf: str, df, struct_info=None, *, mode: s
         _safe_legend(ax)
     except Exception as e:
         err_flags.append(("legend", e))
+    _apply_right_pad(ax, df, tf)
     out = os.path.join(save_dir, f"struct_{symbol.replace('/', '-')}_{tf}_{mode}_{int(time.time())}.png")
     try:
 
