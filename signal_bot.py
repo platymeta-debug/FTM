@@ -749,16 +749,24 @@ def _finalize_layout(fig, ax, *, cfg):
         pass
     try:
         if engine == "constrained":
-            fig.set_constrained_layout(True)
-            fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
-        elif engine == "tight":
-            fig.tight_layout()
-        fig.subplots_adjust(
-            left=pad_left, right=1.0 - pad_right,
-            top=1.0 - pad_top, bottom=pad_bottom
-        )
+            try:
+                fig.set_constrained_layout(True)
+                fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+            except Exception:
+                pass
+        else:
+            fig.subplots_adjust(
+                left=pad_left, right=1.0 - pad_right,
+                top=1.0 - pad_top, bottom=pad_bottom
+            )
     except Exception:
         pass
+    engine = os.getenv("STRUCT_LAYOUT_ENGINE", "").lower()
+    if engine != "constrained":
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
 
 
 def _fib_base_from_env(df: pd.DataFrame):
