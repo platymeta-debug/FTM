@@ -29,6 +29,10 @@ class Snapshot:
     indicators: Dict[str, pd.DataFrame]
     rules: Dict[str, Any]
 
+    # ✅ 과거 코드 호환용 alias
+    @property
+    def tfs(self):
+        return self.tf_scores
 
 def _parse_tf_weights(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
