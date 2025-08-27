@@ -1,7 +1,7 @@
 from decimal import Decimal
 
-from ..exchange.binance_client import BinanceClient
-from ..exchange.quantize import ExchangeFilters
+from ftm2.exchange.binance_client import BinanceClient
+from ftm2.exchange.quantize import ExchangeFilters
 
 
 class OrderRouter:

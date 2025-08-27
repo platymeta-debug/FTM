@@ -5,8 +5,8 @@ from typing import Any, Dict
 from urllib.parse import urlencode
 import httpx
 
-from ..config.settings import load_env_chain
-from .quantize import ExchangeFilters
+from ftm2.config.settings import load_env_chain
+from ftm2.exchange.quantize import ExchangeFilters
 
 CFG = load_env_chain()
 
@@ -48,7 +48,11 @@ class BinanceClient:
     # --- user data stream (listenKey) ---
     def create_listen_key(self) -> str:
         r = self.session.post("/fapi/v1/listenKey")
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            print(f"[LISTEN_KEY][ERR] status={r.status_code} body={r.text}")
+            raise
         return r.json()["listenKey"]
 
     def keepalive_listen_key(self, listen_key: str) -> None:

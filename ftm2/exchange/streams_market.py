@@ -1,6 +1,6 @@
 
 import asyncio, json, websockets
-from ..config.settings import load_env_chain
+from ftm2.config.settings import load_env_chain
 CFG = load_env_chain()
 WS_BASE = "wss://fstream.binance.com" if CFG.MODE == "live" else "wss://fstream.binancefuture.com"
 

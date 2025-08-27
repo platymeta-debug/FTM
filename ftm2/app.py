@@ -1,9 +1,9 @@
 import asyncio
 
-from .config.settings import load_env_chain
-from .exchange.binance_client import BinanceClient
-from .exchange.streams_market import market_stream
-from .exchange.streams_user import user_stream
+from ftm2.config.settings import load_env_chain
+from ftm2.exchange.binance_client import BinanceClient
+from ftm2.exchange.streams_market import market_stream
+from ftm2.exchange.streams_user import user_stream
 
 
 CFG = load_env_chain()
@@ -23,6 +23,7 @@ async def on_user(msg):
 
 async def main():
     print(f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}")
+    print(f"[FTM2] APIKEY={(CFG.BINANCE_API_KEY[:4] + '…') if CFG.BINANCE_API_KEY else 'EMPTY'}")
     bx = BinanceClient()
     t = bx.server_time()
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
