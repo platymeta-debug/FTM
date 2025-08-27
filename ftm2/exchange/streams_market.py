@@ -6,7 +6,6 @@ WS_BASE = "wss://fstream.binance.com" if CFG.MODE == "live" else "wss://fstream.
 
 
 def kline_stream(symbol: str, interval: str) -> str:
-
     return f"{symbol.lower()}@kline_{interval}"
 
 
