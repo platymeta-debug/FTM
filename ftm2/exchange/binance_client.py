@@ -1,12 +1,15 @@
+
 from __future__ import annotations
 import os, time, hmac, hashlib
 from typing import Any, Dict
 from urllib.parse import urlencode
 import httpx
+
 from ..config.settings import load_env_chain
 from .quantize import ExchangeFilters
 
 CFG = load_env_chain()
+
 
 REST_BASE = "https://fapi.binance.com" if CFG.MODE == "live" else "https://testnet.binancefuture.com"  # docs
 HEADERS = {"X-MBX-APIKEY": CFG.BINANCE_API_KEY}
@@ -68,4 +71,5 @@ class BinanceClient:
         # Rate-limit headers visible via r.headers.get("X-MBX-USED-WEIGHT-1m")
         r.raise_for_status()
         return r.json()
+
 
