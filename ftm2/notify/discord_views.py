@@ -1,6 +1,5 @@
 # [ANCHOR:M5_DISCORD_VIEWS]
 import time, discord
-from ftm2.notify.discord_bot import send_log
 
 def fmt(v, n): 
     try: return f"{v:.{n}f}"
