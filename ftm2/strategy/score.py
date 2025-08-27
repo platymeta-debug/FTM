@@ -66,6 +66,7 @@ class Snapshot:
         return self.tf_scores
 
 
+
 def _parse_tf_weights(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for part in s.split(","):
@@ -83,6 +84,7 @@ def _score_row(row: pd.Series) -> List[Contribution]:
     c: List[Contribution] = []
     rsi_v = float(row.get("rsi", 50.0))
     c.append(Contribution("RSI(14)", rsi_v - 50, reasons.interpret_rsi(rsi_v)))
+
 
     close = float(row.get("close", 0.0))
     ema_fast = float(row.get("ema_fast", 0.0))
