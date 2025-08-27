@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 
 import pandas as pd
+import numpy as np
 
 # --- add_indicators 안전 임포트 ---
 try:  # pragma: no cover - 런타임 방어
@@ -44,6 +45,7 @@ class Snapshot:
     indicators: Dict[str, pd.DataFrame]
     rules: Dict[str, Any]
     plan: Optional[Dict[str, Any]] = None
+    trend_state: str = "UNKNOWN"
 
     # ✅ 과거 코드 호환 (app.py에서 snap.tfs를 쓰는 부분)
     @property
@@ -66,7 +68,6 @@ class Snapshot:
         return self.tf_scores
 
 
-
 def _parse_tf_weights(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for part in s.split(","):
@@ -78,6 +79,7 @@ def _parse_tf_weights(s: str) -> Dict[str, float]:
         except ValueError:
             continue
     return out
+
 
 
 def _score_row(row: pd.Series) -> List[Contribution]:
@@ -108,6 +110,28 @@ def _score_row(row: pd.Series) -> List[Contribution]:
     c.append(Contribution("CCI(20)", cci_v / 2.0, reasons.interpret_cci(cci_v)))
 
     return c
+
+
+
+def _compute_trend_state(dfi: Optional[pd.DataFrame]) -> str:
+    """주도 타임프레임의 ADX/+DI/-DI로 추세 상태 계산."""
+    if dfi is None or len(dfi) == 0:
+        return "UNKNOWN"
+    row = dfi.iloc[-1]
+    adx = row.get("adx", np.nan)
+    plus_di = row.get("plus_di", np.nan)
+    minus_di = row.get("minus_di", np.nan)
+    try:
+        if pd.notna(adx) and float(adx) > 25:
+            if pd.notna(plus_di) and pd.notna(minus_di):
+                if float(plus_di) > float(minus_di):
+                    return "UPTREND"
+                elif float(minus_di) > float(plus_di):
+                    return "DOWNTREND"
+        return "RANGE"
+    except Exception:
+        return "UNKNOWN"
+
 
 
 def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], tf_weights: Dict[str, float]) -> Snapshot:
@@ -144,6 +168,12 @@ def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], 
 
     confidence = min(1.0, abs(total) / 100.0)
 
+
+    primary_tf = tfs[0] if tfs else None
+    primary_df = indicators.get(primary_tf) if primary_tf else None
+    trend_state = _compute_trend_state(primary_df)
+
+
     snap = Snapshot(
         symbol=symbol,
         total_score=total,
@@ -153,5 +183,7 @@ def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], 
         contribs=contribs,
         indicators=indicators,
         rules={},
+        plan=None,
+        trend_state=trend_state,
     )
     return snap
