@@ -8,6 +8,7 @@ _cfg = None
 _client: Optional[discord.Client] = None
 _ch_logs = _ch_trades = _ch_signals = None
 
+
 # 외부에서 주입할 훅(한국어 명령용)
 _hooks = {
     "force_flat": None,   # def func(symbol:str) -> str
