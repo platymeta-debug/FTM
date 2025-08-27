@@ -81,10 +81,12 @@ def _parse_tf_weights(s: str) -> Dict[str, float]:
     return out
 
 
+
 def _score_row(row: pd.Series) -> List[Contribution]:
     c: List[Contribution] = []
     rsi_v = float(row.get("rsi", 50.0))
     c.append(Contribution("RSI(14)", rsi_v - 50, reasons.interpret_rsi(rsi_v)))
+
 
     close = float(row.get("close", 0.0))
     ema_fast = float(row.get("ema_fast", 0.0))
@@ -110,6 +112,7 @@ def _score_row(row: pd.Series) -> List[Contribution]:
     return c
 
 
+
 def _compute_trend_state(dfi: Optional[pd.DataFrame]) -> str:
     """주도 타임프레임의 ADX/+DI/-DI로 추세 상태 계산."""
     if dfi is None or len(dfi) == 0:
@@ -128,6 +131,7 @@ def _compute_trend_state(dfi: Optional[pd.DataFrame]) -> str:
         return "RANGE"
     except Exception:
         return "UNKNOWN"
+
 
 
 def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], tf_weights: Dict[str, float]) -> Snapshot:
@@ -164,9 +168,11 @@ def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], 
 
     confidence = min(1.0, abs(total) / 100.0)
 
+
     primary_tf = tfs[0] if tfs else None
     primary_df = indicators.get(primary_tf) if primary_tf else None
     trend_state = _compute_trend_state(primary_df)
+
 
     snap = Snapshot(
         symbol=symbol,
