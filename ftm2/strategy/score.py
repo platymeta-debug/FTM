@@ -6,6 +6,29 @@ from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 import pandas as pd
 
+
+# --- add_indicators 안전 임포트 ---
+try:  # pragma: no cover - 런타임 방어
+    from ftm2.indicators.all import add_indicators
+except Exception:  # pragma: no cover
+    try:
+        from ..indicators.all import add_indicators
+    except Exception as e:  # pragma: no cover
+        print(f"[INDICATORS][IMPORT_ERR] add_indicators import 실패: {e}")
+
+        def add_indicators(df):  # type: ignore
+            return df
+
+# --- reasons 안전 임포트 ---
+try:  # pragma: no cover
+    import ftm2.strategy.reasons as reasons
+except Exception:  # pragma: no cover
+    from . import reasons
+
+
+
+
+    
 @dataclass
 class Contribution:
     name: str
@@ -35,23 +58,15 @@ class Snapshot:
     def scores(self):
         return self.tf_scores
 
-try:
-    # __init__.py가 add_indicators를 re-export하지 않는 경우
-    from ftm2.indicators.all import add_indicators
-except Exception:
-    # 만약 __init__.py에서 re-export 했다면 이 경로도 시도 가능
-    try:
-        from ftm2.indicators import add_indicators
-    except Exception as e:
-        print(f"[INDICATORS][IMPORT_ERR] add_indicators import 실패: {e}")
-        # 최소한의 폴백(계산 안 하고 원본 반환)
-        def add_indicators(df):
-            return df
-try:
-    import ftm2.strategy.reasons as reasons     # 절대경로
-except Exception:
-    from . import reasons                       # 상대경로 (패키지 내부)
-      
+
+    @property
+    def scores(self):
+        """과거 호환: snap.scores 사용 시 tf_scores 반환"""
+        return self.tf_scores
+
+
+
+
 def _parse_tf_weights(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for part in s.split(","):
@@ -69,6 +84,13 @@ def _score_row(row: pd.Series) -> List[Contribution]:
     c: List[Contribution] = []
     rsi_v = float(row.get("rsi", 50.0))
     c.append(Contribution("RSI(14)", rsi_v - 50, reasons.interpret_rsi(rsi_v)))
+
+
+def _score_row(row: pd.Series) -> List[Contribution]:
+    c: List[Contribution] = []
+    rsi_v = float(row.get("rsi", 50.0))
+    c.append(Contribution("RSI(14)", rsi_v - 50, reasons.interpret_rsi(rsi_v)))
+
 
     close = float(row.get("close", 0.0))
     ema_fast = float(row.get("ema_fast", 0.0))
