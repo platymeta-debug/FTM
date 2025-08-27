@@ -212,6 +212,7 @@ async def main():
             CFG.ANALYZE_INTERVAL_S,
             view=snap_v,
         )
+
         INTQ.on_snapshot(snap_v)
         CSV.log(
             "ANALYSIS_SNAPSHOT",

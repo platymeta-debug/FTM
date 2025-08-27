@@ -135,6 +135,7 @@ async def edit_trade_card(symbol: str, tracker: PositionTracker, cfg, force: boo
 
 
 # [ANCHOR:M6_ANALYSIS_MSG_API]
+
 async def update_analysis(
     symbol: str,
     snapshot,
@@ -218,6 +219,7 @@ async def update_analysis(
         ids["text"] = msg.id
         _analysis_cards[symbol] = ids
         save_analysis_cards(_analysis_cards)
+
 
 async def _resolve_guild_and_channels(client: discord.Client):
     global _ch_logs, _ch_trades, _ch_signals

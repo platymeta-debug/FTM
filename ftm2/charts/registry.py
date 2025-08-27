@@ -58,7 +58,7 @@ def _get(snapshot, key, default=0.0):
     return getattr(snapshot, key, default)
 
 
-def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
+def should_render(cfg, snapshot, divergence_bps: float | None = None) -> tuple[bool, Dict[str, Any]]:
     reg = _load()
     sym = _get(snapshot, "symbol")
     now = _now()
@@ -69,22 +69,27 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
 
     # 괴리도 게이트
     if abs(divergence_bps) < cfg.CHART_MIN_DIVERGENCE_BPS:
+
         ent["counter"] = ent.get("counter", 0) + 1
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
+
             reason = (
                 f"divergence {divergence_bps:.2f}bps < {cfg.CHART_MIN_DIVERGENCE_BPS}"
             )
             return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 최소 간격
     if now - ent["last_ts"] < cfg.CHART_MIN_INTERVAL_S:
         ent["counter"] = ent.get("counter", 0) + 1
         reg[sym] = ent
         _save(reg)
+
         reason = f"interval {now - ent['last_ts']:.1f}s < {cfg.CHART_MIN_INTERVAL_S}"
         return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 점수 변화
     prev_score = ent.get("last_score", 0.0)
@@ -94,10 +99,12 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
+
             reason = (
                 f"score Δ{cur_score - float(prev_score):.2f} < {cfg.CHART_MIN_SCORE_DELTA}"
             )
             return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 지문 비교
     try:
@@ -110,8 +117,10 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
+
             reason = f"fingerprint same {fp}"
             return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 통과 → 상태 갱신
     ent.update({
@@ -122,5 +131,7 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
     })
     reg[sym] = ent
     _save(reg)
+
     return True, {"reason": "render", "counter": 0}
+
 

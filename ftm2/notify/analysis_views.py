@@ -2,6 +2,7 @@ from __future__ import annotations
 import discord
 
 
+
 def build_analysis_embed(view: dict, divergence_bps: float, next_s: int) -> discord.Embed:
     """Build a rich analysis embed for Discord from lightweight view data."""
     title = f"{view.get('symbol')} 분석"
@@ -12,6 +13,7 @@ def build_analysis_embed(view: dict, divergence_bps: float, next_s: int) -> disc
     emb = discord.Embed(title=title, description=desc)
 
     order = ["15m", "4h", "1h", "1d"]
+
     contribs = view.get("contribs", {})
     for tf in order:
         cs = contribs.get(tf) or []
@@ -19,5 +21,6 @@ def build_analysis_embed(view: dict, divergence_bps: float, next_s: int) -> disc
             continue
         lines = [f"• {c['name']}: {c['text']} ({c['score']:+.1f})" for c in cs[:8]]
         emb.add_field(name=f"{tf} 해석", value="\n".join(lines) if lines else "-", inline=False)
+
 
     return emb
