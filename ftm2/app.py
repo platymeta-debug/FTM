@@ -27,6 +27,7 @@ from ftm2.reconcile.income_poll import income_poll_loop
 from ftm2.analysis.divergence import DivergenceMonitor
 from ftm2.analysis.engine import run_analysis_loop
 from ftm2.notify.analysis_views import build_analysis_embed  # 내부에서 사용
+from ftm2.charts.janitor import run_chart_janitor
 from ftm2.trade.intent_queue import IntentQueue
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 
@@ -198,9 +199,10 @@ async def main():
     ]
     tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
 
-    market_cache = None
+    market_cache = {}
 
     async def on_snapshot(sym, snap):
+        # [ANCHOR:M6_APP_ON_SNAPSHOT_PATCH]
         await DB.update_analysis(sym, snap, div.get_bps(sym), CFG.ANALYZE_INTERVAL_S)
         INTQ.on_snapshot(snap)
         CSV.log(
@@ -220,6 +222,7 @@ async def main():
 
     tasks.append(asyncio.create_task(run_analysis_loop(CFG, CFG.SYMBOLS, market_cache, div, on_snapshot)))
     tasks.append(asyncio.create_task(INTQ.tick()))
+    tasks.append(asyncio.create_task(run_chart_janitor(CFG)))
 
     async def snapshot_loop():
         while True:
