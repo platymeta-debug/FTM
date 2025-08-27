@@ -1,3 +1,4 @@
+from typing import Optional
 from pydantic import BaseModel
 import os
 from pathlib import Path
@@ -137,6 +138,8 @@ class Settings(BaseModel):
     DISCORD_CHANNEL_SIGNALS: int | None = None
     DISCORD_CHANNEL_TRADES: int | None = None
     DISCORD_CHANNEL_LOGS: int | None = None
+    DISCORD_CHANNEL_ANALYSIS_BTC: Optional[int] = None
+    DISCORD_CHANNEL_ANALYSIS_ETH: Optional[int] = None
     DISCORD_PREFIX: str = "!"
     DISCORD_TEST_ON_BOOT: bool = True
     DISCORD_UPDATE_INTERVAL_S: int = 5
