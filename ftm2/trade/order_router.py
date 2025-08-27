@@ -6,8 +6,20 @@ from ftm2.exchange.binance_client import BinanceClient
 from ftm2.notify.discord_bot import send_log, send_trade
 from ftm2.trade.position_sizer import SizingDecision
 from ftm2.exchange.quantize import ExchangeFilters
+from ftm2.strategy.trace import DecisionTrace
 
 CSV = None
+
+
+def log_decision(trace: DecisionTrace):
+    print(
+        f"[DECISION][{trace.symbol}] dir={trace.direction} "
+        f"score={trace.decision_score:+.1f} reasons={trace.reasons} gates={trace.gates}"
+    )
+    send_log(
+        f"{trace.symbol} 결정: {trace.direction} / {trace.decision_score:+.1f} "
+        f"사유: {', '.join(trace.reasons)} / 게이트: {trace.gates}"
+    )
 
 def _cid(sym: str, side: str) -> str:
     return f"FTM2_{int(time.time()*1000)}_{sym}_{side}"
@@ -25,27 +37,39 @@ class OrderRouter:
     def allow_live(self):
         self.live_allowed = True
 
-    def _live_guard(self, symbol: str, qty: float, price: float):
+    def _live_guard(self, symbol: str, qty: float, price: float, trace: DecisionTrace | None = None):
         if self.cfg.TRADE_MODE != "live" or not self.cfg.LIVE_GUARD_ENABLE:
             return True
         if not self.live_allowed:
             send_log("🚫 실매매 허용 플래그가 꺼져 있습니다.")
             return False
         notional = qty * price
+        if trace:
+            trace.gates.update({
+                "MIN_NOTIONAL_USDT": self.cfg.LIVE_MIN_NOTIONAL_USDT,
+                "NOTIONAL_USDT": notional,
+            })
         if notional < self.cfg.LIVE_MIN_NOTIONAL_USDT:
+            if trace:
+                trace.reasons.append("below min notional")
             send_log(f"❗ 최소 명목 미만: {symbol} {notional:.2f} USDT")
             return False
         return True
 
-    def place_entry(self, symbol: str, dec: SizingDecision, mark_price: float):
+    def place_entry(self, symbol: str, dec: SizingDecision, mark_price: float, trace: DecisionTrace | None = None):
         p, q = dec.sl, dec.qty
         entry_price = mark_price
-        if not self._live_guard(symbol, q, entry_price):
+        if not self._live_guard(symbol, q, entry_price, trace):
+            if trace:
+                log_decision(trace)
             return None
         # limit 오더면 틱 오프셋 반영
         if dec.entry_type == "limit":
             tick = self.filters.tick_size(symbol)
-            entry_price = mark_price * (1 - dec.limit_offset_ticks*tick) if dec.side=="LONG" else mark_price * (1 + dec.limit_offset_ticks*tick)
+            if dec.side == "LONG":
+                entry_price = mark_price * (1 - dec.limit_offset_ticks * tick)
+            else:
+                entry_price = mark_price * (1 + dec.limit_offset_ticks * tick)
         q_price, q_qty = quantize(self.filters, entry_price, q)
         if q_qty <= 0:
             send_log(f"❗[{symbol}] 수량이 0으로 정량화됨(필터 위반)."); return None
@@ -58,6 +82,9 @@ class OrderRouter:
         try:
             od = self.bx.new_order(**params)
             send_trade(f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {q_qty} / {dec.reason}")
+            if trace:
+                trace.reasons.append("ENTER")
+                log_decision(trace)
             if CSV:
                 CSV.log("ORDER_NEW", symbol=symbol, side=dec.side, price=entry_price, qty=q_qty,
                         sl=dec.sl, tp=dec.tp, leverage=self.cfg.LEVERAGE, margin=self.cfg.MARGIN_TYPE,

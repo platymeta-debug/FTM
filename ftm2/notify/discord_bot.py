@@ -135,7 +135,6 @@ async def edit_trade_card(symbol: str, tracker: PositionTracker, cfg, force: boo
 
 
 # [ANCHOR:M6_ANALYSIS_MSG_API]
-
 async def update_analysis(
     symbol: str,
     snapshot,
@@ -151,6 +150,37 @@ async def update_analysis(
 
     from ftm2.charts.registry import should_render
     from ftm2.charts.builder import render_analysis_charts
+
+
+    if view is None:
+        try:
+            from ftm2.strategy.compat import to_viewdict  # type: ignore
+        except Exception:
+            to_viewdict = None  # type: ignore
+        if to_viewdict:
+            view = to_viewdict(snapshot)
+        else:
+            tf_scores = getattr(snapshot, "tf_scores", {})
+            total = 0.0
+            if isinstance(tf_scores, dict):
+                try:
+                    total = sum(float(v) for v in tf_scores.values())
+                except Exception:
+                    total = 0.0
+            view = {
+                "symbol": getattr(snapshot, "symbol", symbol),
+                "decision_score": getattr(snapshot, "total_score", 0.0),
+                "total_score": total,
+                "direction": getattr(snapshot, "direction", "NEUTRAL"),
+                "confidence": getattr(snapshot, "confidence", 0.0),
+                "tf_scores": tf_scores,
+            }
+
+    _load_analysis_persist()
+    ch = _ch_analysis.get(symbol)
+    if not ch:
+        return
+
 
     if view is None:
         try:
@@ -179,6 +209,8 @@ async def update_analysis(
     else:
         paths = render_analysis_charts(_cfg, snapshot, _cfg.CHART_DIR)
         if paths:
+            print(f"[CHART][RENDER] {symbol} saved={paths}")
+
             ids = _analysis_cards.get(symbol, {})
             old_id = ids.get("chart")
             if old_id:
@@ -189,6 +221,10 @@ async def update_analysis(
                     pass
             files = [discord.File(p) for p in paths if os.path.exists(p)]
             new_msg = await ch.send(files=files)
+            print(
+                f"[DISCORD][CHART][SEND] {symbol} msg_id={new_msg.id} paths={paths}"
+            )
+
             ids["chart"] = new_msg.id
             _analysis_cards[symbol] = ids
             save_analysis_cards(_analysis_cards)
@@ -202,6 +238,7 @@ async def update_analysis(
     embed = build_analysis_embed(view, divergence_bps, interval_s)
     now_txt = time.strftime("%H:%M:%S", time.localtime())
     embed.set_footer(text=f"마지막 갱신 {now_txt} | 다음 갱신까지 {interval_s}s")
+
 
     ids = _analysis_cards.get(symbol, {})
     text_id = ids.get("text")
