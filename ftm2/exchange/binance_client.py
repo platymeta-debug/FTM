@@ -48,7 +48,11 @@ class BinanceClient:
     # --- user data stream (listenKey) ---
     def create_listen_key(self) -> str:
         r = self.session.post("/fapi/v1/listenKey")
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            print(f"[LISTEN_KEY][ERR] status={r.status_code} body={r.text}")
+            raise
         return r.json()["listenKey"]
 
     def keepalive_listen_key(self, listen_key: str) -> None:

@@ -23,6 +23,7 @@ async def on_user(msg):
 
 async def main():
     print(f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}")
+    print(f"[FTM2] APIKEY={(CFG.BINANCE_API_KEY[:4] + '…') if CFG.BINANCE_API_KEY else 'EMPTY'}")
     bx = BinanceClient()
     t = bx.server_time()
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
