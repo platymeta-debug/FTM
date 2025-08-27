@@ -12,18 +12,20 @@ class IntentQueue:
         self.intents: dict[str, dict] = {}
 
     def on_snapshot(self, snap):
-        sym = snap.symbol
+        sym = snap["symbol"] if isinstance(snap, dict) else snap.symbol
         if self.divergence and self.divergence.too_wide(sym):
             return
+        direction = snap["direction"] if isinstance(snap, dict) else snap.direction
+        score = snap["total_score"] if isinstance(snap, dict) else snap.total_score
         self.intents[sym] = {
             "state": "pending",
-            "dir": snap.direction,
-            "score": snap.total_score,
+            "dir": direction,
+            "score": score,
             "created": time.time(),
             "expire": time.time() + self.cfg.CONFIRM_TIMEOUT_S,
         }
         if self.csv:
-            self.csv.log("TRADE_INTENT_NEW", symbol=sym, score=snap.total_score)
+            self.csv.log("TRADE_INTENT_NEW", symbol=sym, score=score)
 
     async def tick(self):
         while True:

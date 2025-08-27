@@ -30,6 +30,7 @@ from ftm2.notify.analysis_views import build_analysis_embed  # 내부에서 사�
 from ftm2.charts.janitor import run_chart_janitor
 from ftm2.trade.intent_queue import IntentQueue
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
+from ftm2.strategy.compat import to_viewdict
 
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
@@ -203,21 +204,22 @@ async def main():
 
     async def on_snapshot(sym, snap):
         # [ANCHOR:M6_APP_ON_SNAPSHOT_PATCH]
-        await DB.update_analysis(sym, snap, div.get_bps(sym), CFG.ANALYZE_INTERVAL_S)
-        INTQ.on_snapshot(snap)
+        snap_v = to_viewdict(snap)
+        await DB.update_analysis(sym, snap_v, div.get_bps(sym), CFG.ANALYZE_INTERVAL_S)
+        INTQ.on_snapshot(snap_v)
         CSV.log(
             "ANALYSIS_SNAPSHOT",
             symbol=sym,
             data_feed=CFG.DATA_FEED,
             trade_mode=CFG.TRADE_MODE,
             divergence_bps=div.get_bps(sym),
-            analysis={"tfs": snap.tfs, "confidence": snap.confidence},
-            rule=snap.rules,
-            plan=snap.plan,
-            score_total=snap.total_score,
-            scores=snap.scores,
-            mtf=snap.mtf_summary,
-            trend_state=snap.trend_state,
+            analysis={"tfs": snap_v.get("tf_scores"), "confidence": snap_v.get("confidence")},
+            rule=snap_v.get("rules"),
+            plan=snap_v.get("plan"),
+            score_total=snap_v.get("total_score"),
+            scores=snap_v.get("tf_scores"),
+            mtf=snap_v.get("tf_scores"),
+            trend_state=snap_v.get("trend_state"),
         )
 
     tasks.append(asyncio.create_task(run_analysis_loop(CFG, CFG.SYMBOLS, market_cache, div, on_snapshot)))
