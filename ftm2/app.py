@@ -17,6 +17,7 @@ from ftm2.risk.guardrails import GuardRails
 from ftm2.notify.discord_bot import start_notifier, register_hooks
 
 
+
 CFG = load_env_chain()
 
 BUFFERS: dict[str, pd.DataFrame] = {}
@@ -123,7 +124,9 @@ async def main():
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
     # --- Discord notifier 시작 (비동기) ---
+
     asyncio.create_task(start_notifier(CFG))  # on_ready에서 부팅 메시지 보냄
+
     # 라우터/가드 초기화
     global ROUTER, GUARD, BX
     ROUTER = OrderRouter(CFG, bx.filters)

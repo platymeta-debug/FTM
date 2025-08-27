@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv, dotenv_values
 
+
 PROTECT_KEYS = {"BINANCE_API_KEY", "BINANCE_API_SECRET", "DISCORD_TOKEN"}
 
 def _norm_key(k: str) -> str:
@@ -22,6 +23,7 @@ def _apply_env_from(p: Path) -> bool:
             ok = True
     return ok
 
+
 ENV_FILES_ORDER = [
     "token.env", ".env", ".env.strategy", ".env.risk", ".env.trade", ".env.notify"
 ]
@@ -30,11 +32,13 @@ def _load_env_series(root: Path, profile: str | None):
     loaded = []
     for f in ENV_FILES_ORDER:
         p = root / f
+
         if _apply_env_from(p):
             loaded.append(str(p))
         if profile and f.startswith(".env"):
             pp = root / f"{f}.{profile}"
             if _apply_env_from(pp):
+
                 loaded.append(str(pp))
     print(f"[ENV] loaded={len(loaded)} files={loaded}")
     return loaded
@@ -111,6 +115,7 @@ class Settings(BaseModel):
     MTF_CONFLUENCE_BOOST: float = float(os.getenv("MTF_CONFLUENCE_BOOST", "1.08"))
     MTF_CONTRA_DAMP: float = float(os.getenv("MTF_CONTRA_DAMP", "0.88"))
 
+
     # --- Discord (KR only) ---
     DISCORD_TOKEN: str | None = None
     DISCORD_GUILD_ID: int | None = None
@@ -120,6 +125,7 @@ class Settings(BaseModel):
     DISCORD_PREFIX: str = "!"
     DISCORD_TEST_ON_BOOT: bool = True
     DISCORD_UPDATE_INTERVAL_S: int = 5
+
 
     # --- 진입/라우팅 ---
     ENTRY_ORDER: str = os.getenv("ENTRY_ORDER", "market")
@@ -157,6 +163,7 @@ def load_env_chain() -> Settings:
         v = os.getenv(k)
         if v is not None and v != "":
             setattr(s, k, v)
+
     for k in ("DISCORD_GUILD_ID","DISCORD_CHANNEL_SIGNALS","DISCORD_CHANNEL_TRADES","DISCORD_CHANNEL_LOGS"):
         v = os.getenv(k)
         if v and v.strip().isdigit():
@@ -172,3 +179,4 @@ def load_env_chain() -> Settings:
     print(f"[ENV][CHK] BINANCE_API_KEY={(ak[:4]+'…') if ak else 'EMPTY'}  DISCORD_TOKEN={(dt[:6]+'…') if dt else 'EMPTY'}")
     print(f"[ENV][DISCORD] guild={s.DISCORD_GUILD_ID}  logs={s.DISCORD_CHANNEL_LOGS}  trades={s.DISCORD_CHANNEL_TRADES}  signals={s.DISCORD_CHANNEL_SIGNALS}")
     return s
+
