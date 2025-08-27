@@ -24,6 +24,11 @@ from ftm2.strategy.scorer import score_row
 from ftm2.storage.csv_logger import CsvLogger
 from ftm2.risk.ledger import DailyLedger, LossCutController
 from ftm2.reconcile.income_poll import income_poll_loop
+from ftm2.analysis.divergence import DivergenceMonitor
+from ftm2.analysis.engine import run_analysis_loop
+from ftm2.notify.analysis_views import build_analysis_embed  # 내부에서 사용
+from ftm2.trade.intent_queue import IntentQueue
+from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
@@ -41,6 +46,8 @@ GUARD: GuardRails | None = None
 BX: BinanceClient | None = None
 CSV = None
 LEDGER = None
+div: DivergenceMonitor | None = None
+INTQ: IntentQueue | None = None
 
 
 
@@ -128,7 +135,10 @@ async def on_market(msg):
     elif st.endswith("@markPrice@1s"):
         sym = data.get("s")
         mark = float(data.get("p", 0) or 0)
-        await streams_market.on_mark_price(sym, mark, CFG)
+        if CFG.DATA_FEED == "live":
+            await streams_market.on_mark_live(sym, mark, CFG)
+        else:
+            streams_market.on_mark_test(sym, mark)
 
 
 async def main():
@@ -141,7 +151,7 @@ async def main():
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
 
     # 라우터/가드/트래커 초기화
-    global ROUTER, GUARD, BX, CSV, LEDGER
+    global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ
     ROUTER = OrderRouter(CFG, bx.filters)
     GUARD = GuardRails(CFG)
     BX = bx
@@ -162,6 +172,9 @@ async def main():
     MS.CSV = CSV; MS.LEDGER = LEDGER
     ST.CSV = CSV
 
+    div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
+    MS.DIVERGENCE = div
+
     async def _notify(text):
         try:
             DB.send_log(text)
@@ -172,17 +185,41 @@ async def main():
         from ftm2.trade import order_router as OR
         return await OR.close_position_all(sym)
 
+    INTQ = IntentQueue(CFG, div, ROUTER, CSV, _notify)
+
     LC = LossCutController(CFG, LEDGER, tracker, router=type("R",(),{"close_all":_close_all}), notify=_notify, csv_logger=CSV)
 
     # 동시에 WS 시작
     tasks = [
         asyncio.create_task(start_notifier(CFG)),
-
         asyncio.create_task(streams_market.market_stream(CFG.SYMBOLS, CFG.INTERVAL, on_market)),
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
     tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
+
+    market_cache = None
+
+    async def on_snapshot(sym, snap):
+        await DB.update_analysis(sym, snap, div.get_bps(sym), CFG.ANALYZE_INTERVAL_S)
+        INTQ.on_snapshot(snap)
+        CSV.log(
+            "ANALYSIS_SNAPSHOT",
+            symbol=sym,
+            data_feed=CFG.DATA_FEED,
+            trade_mode=CFG.TRADE_MODE,
+            divergence_bps=div.get_bps(sym),
+            analysis={"tfs": snap.tfs, "confidence": snap.confidence},
+            rule=snap.rules,
+            plan=snap.plan,
+            score_total=snap.total_score,
+            scores=snap.scores,
+            mtf=snap.mtf_summary,
+            trend_state=snap.trend_state,
+        )
+
+    tasks.append(asyncio.create_task(run_analysis_loop(CFG, CFG.SYMBOLS, market_cache, div, on_snapshot)))
+    tasks.append(asyncio.create_task(INTQ.tick()))
 
     async def snapshot_loop():
         while True:

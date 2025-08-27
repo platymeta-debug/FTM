@@ -44,7 +44,17 @@ def _load_env_series(root: Path, profile: str | None):
     return loaded
 
 class Settings(BaseModel):
-    MODE: str = os.getenv("MODE", "testnet")  # testnet | live
+    MODE: str = os.getenv("MODE", "testnet")  # legacy field
+    TRADE_MODE: str = os.getenv("TRADE_MODE", MODE)  # testnet | live
+    DATA_FEED: str = os.getenv("DATA_FEED", "live")  # live | testnet
+    WORKING_PRICE: str = os.getenv("WORKING_PRICE", "MARK_PRICE")
+    LIVE_GUARD_ENABLE: bool = os.getenv("LIVE_GUARD_ENABLE", "true").lower() == "true"
+    LIVE_MIN_NOTIONAL_USDT: float = float(os.getenv("LIVE_MIN_NOTIONAL_USDT", "10"))
+    LIVE_CONFIRM_MODE: str = os.getenv("LIVE_CONFIRM_MODE", "auto")
+    CONFIRM_TIMEOUT_S: int = int(os.getenv("CONFIRM_TIMEOUT_S", "15"))
+    ANALYZE_INTERVAL_S: int = int(os.getenv("ANALYZE_INTERVAL_S", "30"))
+    ANALYSIS_TF: str = os.getenv("ANALYSIS_TF", "1m,5m,1h")
+    MAX_DIVERGENCE_BPS: int = int(os.getenv("MAX_DIVERGENCE_BPS", "15"))
     # 민감키는 import 시점 os.getenv 사용을 피한다
     BINANCE_API_KEY: str | None = None
     BINANCE_API_SECRET: str | None = None
@@ -187,7 +197,14 @@ def load_env_chain() -> Settings:
         if v is not None and v != "":
             setattr(s, k, v)
 
-    for k in ("DISCORD_GUILD_ID","DISCORD_CHANNEL_SIGNALS","DISCORD_CHANNEL_TRADES","DISCORD_CHANNEL_LOGS"):
+    for k in (
+        "DISCORD_GUILD_ID",
+        "DISCORD_CHANNEL_SIGNALS",
+        "DISCORD_CHANNEL_TRADES",
+        "DISCORD_CHANNEL_LOGS",
+        "DISCORD_CHANNEL_ANALYSIS_BTC",
+        "DISCORD_CHANNEL_ANALYSIS_ETH",
+    ):
         v = os.getenv(k)
         if v and v.strip().isdigit():
             setattr(s, k, int(v.strip()))
