@@ -27,6 +27,11 @@ DEFAULT_HEADER = [
     "risk.tier","risk.leverage","risk.max_loss","risk.daily_cut",
     "risk.bracket_r","risk.size_pct",
     "route.slippage","route.post_only","route.reduce_only","route.type",
+    # 분석 확장 필드
+    "data_feed","trade_mode","divergence_bps",
+    "analysis.tfs","analysis.confidence",
+    "rule.entry_th","rule.exit_th","rule.cooldown_left","rule.allowed",
+    "plan.lev","plan.size_pct","plan.sl","plan.tp",
     # 기타
     "elapsed_sec"
 ]
