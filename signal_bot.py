@@ -749,16 +749,24 @@ def _finalize_layout(fig, ax, *, cfg):
         pass
     try:
         if engine == "constrained":
-            fig.set_constrained_layout(True)
-            fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
-        elif engine == "tight":
-            fig.tight_layout()
-        fig.subplots_adjust(
-            left=pad_left, right=1.0 - pad_right,
-            top=1.0 - pad_top, bottom=pad_bottom
-        )
+            try:
+                fig.set_constrained_layout(True)
+                fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.02, hspace=0.02)
+            except Exception:
+                pass
+        else:
+            fig.subplots_adjust(
+                left=pad_left, right=1.0 - pad_right,
+                top=1.0 - pad_top, bottom=pad_bottom
+            )
     except Exception:
         pass
+    engine = os.getenv("STRUCT_LAYOUT_ENGINE", "").lower()
+    if engine != "constrained":
+        try:
+            fig.tight_layout()
+        except Exception:
+            pass
 
 
 def _fib_base_from_env(df: pd.DataFrame):
@@ -2719,7 +2727,7 @@ async def _futures_exec_delta(symbol: str, tf: str, side: str, delta_usdt: float
                 res = await futures_place_order(symbol, ord_side, qty, order_type="market", reduce_only=reduce_only, comment=f"REALLOC/{tf}/{note}")
             else:
                 if reduce_only and 'futures_close_symbol_tf' in globals():
-                    await futures_close_symbol_tf(symbol, tf, sideU, ref_price, reason=f"REALLOC-{note}")
+                    await futures_close_symbol_tf(symbol, tf, reason=f"REALLOC-{note}")
                     res = {"status": "closed"}
                 else:
                     res = {"status": "logged"}
@@ -10467,16 +10475,22 @@ async def _notify_trade_exit(symbol: str, tf: str, *,
         log(f"⏸ post-close paused {symbol} {tf}")
 
 
-async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool:
+async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> tuple[bool, str]:
     ex = FUT_EXCHANGE
     if not (AUTO_TRADE and TRADE_MODE == "futures" and ex):
-        return False
+        return False, "guard"
     ok = False
+    fail_reason = ""
     pos = FUT_POS.get(symbol) or {}
     try:
         qty, side, entry = await _fetch_pos_qty(ex, symbol)
         if not side or abs(qty) <= 0:
-            return False
+            return False, "no-position"
+        # cancel protective orders first to avoid duplicate fills
+        try:
+            await _cancel_all_orders(ex, symbol)
+        except Exception as e:
+            log(f"[FUT] cancel before close warn {symbol}: {e}")
         close_side = 'sell' if side == 'LONG' else 'buy'
         await _market(ex, symbol, close_side, abs(qty), reduceOnly=True)
         import time  # 이미 상단에 있으면 생략
@@ -10563,6 +10577,7 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
         ok = True
     except Exception as e:
         log(f"[FUT] close_all error {symbol} {tf}: {e}")
+        fail_reason = str(e)
         ok = False
     finally:
         # 열린 주문 정리 + 마진 전환 재시도(있다면) + 상태 초기화
@@ -10580,7 +10595,7 @@ async def futures_close_all(symbol, tf, exit_price=None, reason="CLOSE") -> bool
         # IDEMP: allow re-entry after manual/forced close
         try: idem_clear_symbol_tf(symbol, tf)
         except Exception: pass
-    return ok
+    return ok, ("" if ok else (fail_reason or "error"))
 
 async def futures_close_symbol_tf(symbol, tf, reason="MANUAL"):
     return await futures_close_all(symbol, tf, reason=reason)
@@ -10635,7 +10650,7 @@ async def _auto_close_and_notify_eth(
     ep = float(entry_price or 0.0)
 
     # 선물 청산 먼저
-    executed = await futures_close_all(symbol_eth, tf, exit_price=exit_price, reason=action_reason)
+    executed, _r = await futures_close_all(symbol_eth, tf, exit_price=exit_price, reason=action_reason)
     status_text = "✅ 선물 청산" if executed else "🧪 시뮬레이션/미실행"
     is_futures = executed
 
@@ -10724,7 +10739,7 @@ async def _auto_close_and_notify_btc(
     # 선물 청산 시도
     status = "🧪 시뮬레이션/미실행"
     try:
-        executed = await futures_close_all(symbol, tf, exit_price=xp, reason=action_reason)
+        executed, _r = await futures_close_all(symbol, tf, exit_price=xp, reason=action_reason)
         status = "✅ 선물 청산" if executed else "🧪 시뮬레이션/미실행"
     except Exception as e:
         log(f"[NOTIFY] paper/fut exit (BTC) warn {symbol} {tf}: {e}")
@@ -14049,6 +14064,66 @@ async def cmd_pause_all():
     await _set_pause("ALL", "ALL", None)
 
 
+async def command_close(symbol: str, tf: str, ch=None) -> tuple[bool, str]:
+    """Handle manual close command with guards and logging.
+
+    Returns (executed, reason).
+    """
+    sym = _normalize_symbol(symbol)
+    tfx = _normalize_tf(tf)
+    valid_tfs = {"15m", "1h", "4h", "1d"}
+    if ch is None:
+        ch = client.get_channel(int(os.getenv("TRADE_CHANNEL_ID", "0") or 0))
+    if tfx not in valid_tfs:
+        reason = f"invalid_tf={tf}"
+        await ch.send(f"🧪 시뮬레이션/미실행: 이유={reason}")
+        log(f"[CMD_CLOSE] {sym} {tfx} {reason}")
+        return False, reason
+
+    # Paper trading path
+    if TRADE_MODE == "paper":
+        info = await _paper_close(sym, tfx, get_last_price(sym, 0.0), "MANUAL")
+        if info:
+            msg = f"🧪 시뮬레이션: Paper 개별 청산 완료: {sym} {tfx}"
+            await ch.send(msg)
+            log(f"[CMD_CLOSE] paper {sym} {tfx} qty={info.get('qty')}")
+            return True, "paper"
+        reason = "no-position"
+        await ch.send(f"🧪 시뮬레이션/미실행: 이유={reason}")
+        log(f"[CMD_CLOSE] paper {sym} {tfx} {reason}")
+        return False, reason
+
+    # Futures path guards
+    guards = []
+    if TRADE_MODE != "futures":
+        guards.append(f"TRADE_MODE={TRADE_MODE}")
+    if AUTO_TRADE != 1:
+        guards.append(f"AUTO_TRADE={AUTO_TRADE}")
+    if not FUT_EXCHANGE:
+        guards.append("FUT_EXCHANGE=None")
+    api_key = (os.getenv("BINANCE_API_KEY") or os.getenv("API_KEY") or "").strip()
+    secret = (os.getenv("BINANCE_SECRET") or os.getenv("API_SECRET") or "").strip()
+    if not api_key or not secret:
+        guards.append("API key invalid")
+    if guards:
+        reason = ",".join(guards)
+        await ch.send(f"🧪 시뮬레이션/미실행: 이유={reason}")
+        log(f"[CMD_CLOSE] guard {sym} {tfx}: {reason}")
+        return False, reason
+
+    executed, r = await futures_close_all(sym, tfx, exit_price=get_last_price(sym, 0.0), reason="MANUAL")
+    if executed:
+        msg = f"✅ [Futures] 개별 청산 완료: {sym} {tfx} @시장가 (reduceOnly)"
+        await ch.send(msg)
+        log(f"[CMD_CLOSE] futures {sym} {tfx} closed")
+        return True, ""
+    else:
+        reason = r or "unknown"
+        await ch.send(f"🧪 시뮬레이션/미실행: 이유={reason}")
+        log(f"[CMD_CLOSE] futures {sym} {tfx} fail: {reason}")
+        return False, reason
+
+
 @client.event
 async def on_message(message):
     if message.author == client.user:
@@ -14270,23 +14345,13 @@ async def on_message(message):
     if content.startswith(("!close ","!청산 ")):
         try:
             parts = content.split()
-            # allow: !close SYMBOL TF [SIDE]
-            _, sym, tfx, *opt = parts
-            side = (opt[0].upper() if opt else None)
-            if TRADE_MODE == "paper":
-                symU = sym.upper()
-                if not side:
-                    both = [s for s in ("LONG","SHORT") if PAPER_POS.get(_pp_key(symU, tfx, s))]
-                    if len(both) > 1:
-                        await message.channel.send(f"⚠️ need side (LONG|SHORT) for {symU} {tfx}")
-                        return
-                    side = (both[0] if both else None)
-                await _paper_close(symU, tfx, get_last_price(symU, 0.0), "MANUAL", side=side)
-            else:
-                await futures_close_symbol_tf(sym.upper(), tfx)
-
-            await message.channel.send(f"🟢 청산 완료: {sym.upper()} {tfx}" + (f" {side}" if side else ""))
-
+            if len(parts) < 3:
+                await message.channel.send("⚠️ 사용법: !청산 SYMBOL TF")
+                return
+            _, sym_raw, tf_raw, *rest = parts
+            sym = _normalize_symbol(sym_raw)
+            tfx = _normalize_tf(tf_raw)
+            await command_close(sym, tfx, message.channel)
         except Exception as e:
             await message.channel.send(f"⚠️ close error: {e}")
         return
