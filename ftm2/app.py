@@ -1,4 +1,11 @@
+# [ANCHOR:APP_MARKET_PIPELINE]
 import asyncio, os
+import pandas as pd
+from collections import defaultdict
+from ftm2.indicators.core import add_indicators
+from ftm2.strategy.scorer import score_row
+from datetime import timezone
+
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -8,12 +15,79 @@ from ftm2.exchange.streams_user import user_stream
 
 CFG = load_env_chain()
 
+BUFFERS: dict[str, pd.DataFrame] = {}
 
+
+
+def _append_kline(symbol, k):
+    # close-only bar on close (x=True)
+    ts = pd.to_datetime(int(k["T"]), unit="ms", utc=True)
+    row = {
+        "open":  float(k["o"]),
+        "high":  float(k["h"]),
+        "low":   float(k["l"]),
+        "close": float(k["c"]),
+        "volume":float(k["v"]),
+    }
+    df = BUFFERS.get(symbol)
+    if df is None:
+        df = pd.DataFrame(columns=["open","high","low","close","volume"])
+    df.loc[ts] = row
+    # tail keep
+    df = df.iloc[-CFG.LOOKBACK:]
+    BUFFERS[symbol] = df
+    return df
+
+def _mtf_context(df_1m: pd.DataFrame, cfg):
+    """
+    1m OHLCV DataFrame(UTC index) -> higher TF contexts dict
+    keys from cfg.MTF_HIGHERS e.g. ["5m","15m"]
+    returns {tf: {close, ema_fast, ema_slow, senkou_a, senkou_b}}
+    """
+    out = {}
+    if not cfg.MTF_USE or df_1m is None or df_1m.empty:
+        return out
+    base = df_1m.copy()
+    for tf in cfg.MTF_HIGHERS:
+        try:
+            r = base.resample(tf, label="right", closed="right").agg({
+                "open":"first","high":"max","low":"min","close":"last","volume":"sum"
+            }).dropna()
+            if len(r) < max(cfg.EMA_SLOW, cfg.ICHI_KIJUN)+2:
+                out[tf] = None; continue
+            feat = add_indicators(r, cfg)
+            last = feat.iloc[-1]
+            out[tf] = dict(
+                close=float(last["close"]),
+                ema_fast=float(last.get("ema_fast", float("nan"))),
+                ema_slow=float(last.get("ema_slow", float("nan"))),
+                senkou_a=float(last.get("senkou_a", float("nan"))),
+                senkou_b=float(last.get("senkou_b", float("nan"))),
+            )
+        except Exception:
+            out[tf] = None
+    return out
 
 async def on_market(msg):
-    # TODO: kline/markPrice 라우팅 → 인디케이터 파이프라인으로 전달
-    if "stream" in msg and "data" in msg:
-        pass
+    if "stream" not in msg: return
+    st = msg["stream"]
+    data = msg.get("data", {})
+    if st.endswith("kline_"+CFG.INTERVAL):
+        k = data.get("k", {})
+        sym = k.get("s")
+        if not k.get("x"):  # only on closed candle
+            return
+        df = _append_kline(sym, k)
+        if len(df) < max(CFG.EMA_SLOW, CFG.EMA_TREND, CFG.BB_LEN, CFG.ATR_LEN, CFG.ADX_LEN, CFG.DONCHIAN_LEN, CFG.ICHI_SENKOUB)+2:
+            return
+        feat = add_indicators(df, CFG)
+        # prevs for slope-like features
+        feat['macd_hist_prev'] = feat['macd_hist'].shift(1)
+        feat['kama_prev'] = feat['kama'].shift(1)
+        last = feat.iloc[-1].to_dict()
+        mtf_ctx = _mtf_context(df, CFG)
+        L,S,is_trend = score_row(last, CFG, mtf_ctx)
+        print(f"[SCORE][{sym}] close={last['close']:.2f} | Long={L} Short={S} | ADX={last['adx']:.1f} RSI={last['rsi']:.1f} Z={last['z']:.2f} MTF={mtf_ctx and 'ON' or 'OFF'} TREND={is_trend}")
 
 
 async def on_user(msg):
