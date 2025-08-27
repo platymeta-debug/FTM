@@ -33,7 +33,12 @@ def compute_fingerprint(snapshot) -> str:
     else:
         snap = snapshot.__dict__
     indicators = snap.get("indicators", {}) or {}
-    df = indicators.get("1m") or indicators.get("main")
+    df = None
+    for key in ("1m", "15m", "4h", "main"):
+        df = indicators.get(key)
+        if df is not None:
+            break
+
     ts = 0
     bb = 0.0
     rsi = 0.0
@@ -51,7 +56,6 @@ def compute_fingerprint(snapshot) -> str:
     score = round(float(snap.get("total_score", 0.0)), 1)
     return f"{ts}:{score}:{int(bb*100)}:{int(rsi)}"
 
-
 def _get(snapshot, key, default=0.0):
     if isinstance(snapshot, dict):
         return snapshot.get(key, default)
@@ -66,6 +70,12 @@ def should_render(cfg, snapshot, divergence_bps: float | None = None) -> tuple[b
 
     rules = getattr(snapshot, "rules", {}) if not isinstance(snapshot, dict) else snapshot.get("rules", {})
     divergence_bps = float(rules.get("divergence_bps", 0.0))
+
+    if cfg.CHART_FORCE_FIRST_RENDER and ent.get("last_ts", 0) == 0:
+        ent.update({"last_ts": now, "last_fp": "", "last_score": _get(snapshot, "total_score"), "counter": 0})
+        reg[sym] = ent
+        _save(reg)
+        return True, {"reason": "force_first", "counter": 0}
 
     # 괴리도 게이트
     if abs(divergence_bps) < cfg.CHART_MIN_DIVERGENCE_BPS:
@@ -86,7 +96,6 @@ def should_render(cfg, snapshot, divergence_bps: float | None = None) -> tuple[b
         ent["counter"] = ent.get("counter", 0) + 1
         reg[sym] = ent
         _save(reg)
-
         reason = f"interval {now - ent['last_ts']:.1f}s < {cfg.CHART_MIN_INTERVAL_S}"
         return False, {"reason": reason, "counter": ent["counter"]}
 

@@ -37,6 +37,7 @@ class Settings(BaseModel):
     CHART_MIN_SCORE_DELTA: float = float(os.getenv("CHART_MIN_SCORE_DELTA", "2.0"))
     CHART_MIN_DIVERGENCE_BPS: float = float(os.getenv("CHART_MIN_DIVERGENCE_BPS", "2.0"))
     CHART_FORCE_N_CYCLES: int = int(os.getenv("CHART_FORCE_N_CYCLES", "10"))
+    CHART_FORCE_FIRST_RENDER: bool = os.getenv("CHART_FORCE_FIRST_RENDER", "false").lower() == "true"
     # 민감키는 import 시점 os.getenv 사용을 피한다
     BINANCE_API_KEY: str | None = None
     BINANCE_API_SECRET: str | None = None
