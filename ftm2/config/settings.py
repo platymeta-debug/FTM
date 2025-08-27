@@ -1,6 +1,7 @@
 from pydantic import BaseModel
 import os
-
+from pathlib import Path
+from dotenv import load_dotenv
 
 class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # testnet | live
@@ -30,12 +31,13 @@ class Settings(BaseModel):
     DISCORD_CHANNEL_TRADES: int = int(os.getenv("DISCORD_CHANNEL_TRADES", "0"))
     DISCORD_CHANNEL_LOGS: int = int(os.getenv("DISCORD_CHANNEL_LOGS", "0"))
     DISCORD_UPDATE_INTERVAL_S: float = float(os.getenv("DISCORD_UPDATE_INTERVAL_S", "5"))
-
-
+    
 def load_env_chain() -> Settings:
-    """Load settings from environment chain.
-
-    token.env and .env are assumed to be loaded by runtime infra before
-    this function executes.
-    """
+    # 리포 루트에서 token.env → .env 순서로 로드(.env가 덮어씀)
+    root = Path(__file__).resolve().parents[2]  # .../FTM
+    load_dotenv(root / "token.env", override=False)
+    load_dotenv(root / ".env", override=True)
+    # 실행 디렉터리에 같은 이름의 파일이 있으면 추가로 로드(옵션)
+    load_dotenv("token.env", override=False)
+    load_dotenv(".env", override=True)
     return Settings()
