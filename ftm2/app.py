@@ -1,4 +1,4 @@
-import asyncio
+import asyncio, os
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -35,7 +35,14 @@ async def main():
         asyncio.create_task(market_stream(CFG.SYMBOLS, CFG.INTERVAL, on_market)),
         asyncio.create_task(user_stream(on_user)),
     ]
-    await asyncio.gather(*tasks)
+    smoke = int(os.getenv("SMOKE_SECONDS", "0"))
+    if smoke > 0:
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=smoke)
+        except asyncio.TimeoutError:
+            print("[SMOKE] timed out; exiting")
+    else:
+        await asyncio.gather(*tasks)
 
 
 
