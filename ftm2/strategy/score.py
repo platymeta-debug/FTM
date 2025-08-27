@@ -4,20 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
-
-
 import pandas as pd
-
-from ftm2.indicators.all import add_indicators
-from . import reasons
-
 
 @dataclass
 class Contribution:
     name: str
     score: float
     text: str
-
 
 @dataclass
 class Snapshot:
@@ -29,14 +22,36 @@ class Snapshot:
     contribs: Dict[str, List[Contribution]]
     indicators: Dict[str, pd.DataFrame]
     rules: Dict[str, Any]
+    # 없을 수 있으니 기본 None
     plan: Optional[Dict[str, Any]] = None
 
-    # ✅ 과거 코드 호환 (app.py에서 snap.tfs를 쓰는 부분)
+    # ✅ 과거 호환: snap.tfs
     @property
     def tfs(self):
         return self.tf_scores
 
+    # ✅ 과거 호환: snap.scores
+    @property
+    def scores(self):
+        return self.tf_scores
 
+try:
+    # __init__.py가 add_indicators를 re-export하지 않는 경우
+    from ftm2.indicators.all import add_indicators
+except Exception:
+    # 만약 __init__.py에서 re-export 했다면 이 경로도 시도 가능
+    try:
+        from ftm2.indicators import add_indicators
+    except Exception as e:
+        print(f"[INDICATORS][IMPORT_ERR] add_indicators import 실패: {e}")
+        # 최소한의 폴백(계산 안 하고 원본 반환)
+        def add_indicators(df):
+            return df
+try:
+    import ftm2.strategy.reasons as reasons     # 절대경로
+except Exception:
+    from . import reasons                       # 상대경로 (패키지 내부)
+      
 def _parse_tf_weights(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for part in s.split(","):
@@ -78,7 +93,7 @@ def _score_row(row: pd.Series) -> List[Contribution]:
 
     return c
 
-
+      
 def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], tf_weights: Dict[str, float]) -> Snapshot:
     tf_scores: Dict[str, float] = {}
     contribs: Dict[str, List[Contribution]] = {}
