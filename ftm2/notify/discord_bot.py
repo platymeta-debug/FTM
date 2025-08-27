@@ -1,3 +1,4 @@
+
 # [ANCHOR:DISCORD_BOT]
 import asyncio, os, traceback
 from typing import Optional, Callable
@@ -114,3 +115,4 @@ async def start_notifier(cfg):
         await _client.start(cfg.DISCORD_TOKEN)
     except Exception:
         traceback.print_exc()
+

@@ -125,6 +125,7 @@ async def main():
     # --- Discord notifier 시작 (비동기) ---
     asyncio.create_task(start_notifier(CFG))
     send_log("FTM2 앱이 시작되었습니다.")
+
     # 라우터/가드 초기화
     global ROUTER, GUARD, BX
     ROUTER = OrderRouter(CFG, bx.filters)
