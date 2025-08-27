@@ -125,6 +125,18 @@ class Settings(BaseModel):
     DISCORD_PREFIX: str = "!"
     DISCORD_TEST_ON_BOOT: bool = True
     DISCORD_UPDATE_INTERVAL_S: int = 5
+    PNL_CHANGE_BPS: int = int(os.getenv("PNL_CHANGE_BPS", "5"))
+    EMBED_DECIMALS_PRICE: int = int(os.getenv("EMBED_DECIMALS_PRICE", "2"))
+    EMBED_DECIMALS_QTY: int = int(os.getenv("EMBED_DECIMALS_QTY", "6"))
+    EMBED_DECIMALS_USDT: int = int(os.getenv("EMBED_DECIMALS_USDT", "2"))
+    EMBED_SHOW_FUNDING: bool = os.getenv("EMBED_SHOW_FUNDING", "true").lower() == "true"
+    EMBED_SHOW_LIQ: bool = os.getenv("EMBED_SHOW_LIQ", "true").lower() == "true"
+    EMBED_SHOW_EQUITY: bool = os.getenv("EMBED_SHOW_EQUITY", "true").lower() == "true"
+
+    # --- User stream / REST sync ---
+    LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
+    REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))
+    WALLET_REFRESH_SEC: int = int(os.getenv("WALLET_REFRESH_SEC", "20"))
 
 
     # --- 진입/라우팅 ---
