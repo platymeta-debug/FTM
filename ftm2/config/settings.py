@@ -136,8 +136,5 @@ def load_env_chain() -> Settings:
     profile = os.getenv("ENV_PROFILE", None)
     _load_env_series(root, profile)
     _load_env_series(Path.cwd(), profile)
-    # === 디버그: 키 마스킹 출력 ===
-    ak = os.getenv("BINANCE_API_KEY") or ""
-    dtok = os.getenv("DISCORD_TOKEN") or ""
-    print(f"[ENV][CHK] BINANCE_API_KEY={(ak[:4]+'…') if ak else 'EMPTY'}  DISCORD_TOKEN={(dtok[:6]+'…') if dtok else 'EMPTY'}")
+
     return Settings()

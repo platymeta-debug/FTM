@@ -14,7 +14,8 @@ from ftm2.exchange.streams_user import user_stream
 from ftm2.trade.position_sizer import sizing_decision
 from ftm2.trade.order_router import OrderRouter
 from ftm2.risk.guardrails import GuardRails
-from ftm2.notify.discord_bot import start_notifier, send_log, send_signal, send_trade, register_hooks
+from ftm2.notify.discord_bot import start_notifier, register_hooks
+
 
 
 CFG = load_env_chain()
@@ -123,8 +124,8 @@ async def main():
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
     # --- Discord notifier 시작 (비동기) ---
-    asyncio.create_task(start_notifier(CFG))
-    send_log("FTM2 앱이 시작되었습니다.")
+
+    asyncio.create_task(start_notifier(CFG))  # on_ready에서 부팅 메시지 보냄
 
     # 라우터/가드 초기화
     global ROUTER, GUARD, BX

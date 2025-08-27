@@ -1,4 +1,3 @@
-
 # [ANCHOR:DISCORD_BOT]
 import asyncio, os, traceback
 from typing import Optional, Callable
@@ -8,6 +7,7 @@ _send_queue: "asyncio.Queue[tuple[str,str]]" = asyncio.Queue()
 _cfg = None
 _client: Optional[discord.Client] = None
 _ch_logs = _ch_trades = _ch_signals = None
+
 
 # 외부에서 주입할 훅(한국어 명령용)
 _hooks = {
@@ -38,23 +38,49 @@ async def _sender_loop():
         except Exception:
             traceback.print_exc()
 
-async def _on_ready(client: discord.Client):
+async def _resolve_guild_and_channels(client: discord.Client):
     global _ch_logs, _ch_trades, _ch_signals
     gid = _cfg.DISCORD_GUILD_ID
     guild = client.get_guild(gid) if gid else None
+    if not guild and gid:
+        try:
+            guild = await client.fetch_guild(gid)
+        except discord.Forbidden:
+            print(f"[DISCORD][ERR] 길드({gid}) 접근 권한 없음."); return False
+        except discord.NotFound:
+            print(f"[DISCORD][ERR] 길드({gid})를 찾을 수 없음."); return False
+        except Exception as e:
+            print(f"[DISCORD][ERR] 길드({gid}) 조회 실패: {e}"); return False
     if not guild:
-        print("[DISCORD] 길드 ID가 없거나 접근 불가. 콘솔 모드로 동작합니다.")
-        return
-    if _cfg.DISCORD_CHANNEL_LOGS:
-        _ch_logs = guild.get_channel(_cfg.DISCORD_CHANNEL_LOGS)
-    if _cfg.DISCORD_CHANNEL_TRADES:
-        _ch_trades = guild.get_channel(_cfg.DISCORD_CHANNEL_TRADES)
-    if _cfg.DISCORD_CHANNEL_SIGNALS:
-        _ch_signals = guild.get_channel(_cfg.DISCORD_CHANNEL_SIGNALS)
-    print("[DISCORD] 연결 완료.")
-    if _cfg.DISCORD_TEST_ON_BOOT:
+        print("[DISCORD][ERR] 길드 ID 미설정 또는 미접근. .env.notify의 DISCORD_GUILD_ID 확인")
+        return False
+
+    async def bind_channel(cid: int, label: str):
+        ch = client.get_channel(cid)
+        if ch is None:
+            try:
+                ch = await client.fetch_channel(cid)
+            except discord.Forbidden:
+                print(f"[DISCORD][ERR] {label} 채널({cid}) 권한 없음."); return None
+            except discord.NotFound:
+                print(f"[DISCORD][ERR] {label} 채널({cid}) 없음(잘못된 ID)."); return None
+            except Exception as e:
+                print(f"[DISCORD][ERR] {label} 채널({cid}) 조회 실패: {e}"); return None
+        return ch
+
+    _ch_logs = await bind_channel(_cfg.DISCORD_CHANNEL_LOGS, "logs") if _cfg.DISCORD_CHANNEL_LOGS else None
+    _ch_trades = await bind_channel(_cfg.DISCORD_CHANNEL_TRADES, "trades") if _cfg.DISCORD_CHANNEL_TRADES else None
+    _ch_signals = await bind_channel(_cfg.DISCORD_CHANNEL_SIGNALS, "signals") if _cfg.DISCORD_CHANNEL_SIGNALS else None
+
+    print(f"[DISCORD] 연결 완료. guild={guild.name} "
+          f"logs={'OK' if _ch_logs else 'X'} trades={'OK' if _ch_trades else 'X'} signals={'OK' if _ch_signals else 'X'}")
+    return True
+
+async def _on_ready(client: discord.Client):
+    ok = await _resolve_guild_and_channels(client)
+    if ok and _cfg.DISCORD_TEST_ON_BOOT:
+        # 이제 채널 바인딩이 끝났으니 반드시 채널로 전송됨
         send_log("FTM2 봇이 부팅되었습니다. (테스트 메시지)")
-        # 환경 요약
         send_log(f"환경: MODE={_cfg.MODE}, 심볼={_cfg.SYMBOLS}, 인터벌={_cfg.INTERVAL}, 프로파일={os.getenv('ENV_PROFILE','-')}")
 
 async def _handle_message(msg: discord.Message):
@@ -86,6 +112,17 @@ async def _handle_message(msg: discord.Message):
     elif cmd == "로그테스트":
         send_log("이것은 로그 테스트입니다.")
         await msg.add_reaction("✅")
+    elif cmd == "채널테스트":
+        send_log("logs 채널 테스트 메시지")
+        send_trade("trades 채널 테스트 메시지")
+        send_signal("signals 채널 테스트 메시지")
+        await msg.channel.send("📨 테스트 메시지 전송 시도 완료 (권한/바인딩 확인은 콘솔 로그 참조)")
+    elif cmd == "디버그":
+        await msg.channel.send(f"🔧 디버그: "
+                               f"GUILD_ID={_cfg.DISCORD_GUILD_ID}, "
+                               f"LOGS={_cfg.DISCORD_CHANNEL_LOGS}, "
+                               f"TRADES={_cfg.DISCORD_CHANNEL_TRADES}, "
+                               f"SIGNALS={_cfg.DISCORD_CHANNEL_SIGNALS}")
     else:
         await msg.channel.send("❓ 지원하지 않는 명령입니다. (상태, 전량청산 심볼, 킬스위치 켜|꺼, 신호 심볼, 로그테스트)")
 
@@ -95,13 +132,12 @@ async def start_notifier(cfg):
     _cfg = cfg
     # 송신 루프는 항상 가동 (토큰 없어도 콘솔 출력)
     asyncio.create_task(_sender_loop())
-    token = (cfg.DISCORD_TOKEN or os.getenv("DISCORD_TOKEN") or "").strip()
-    if not token:
-        print("[DISCORD] 토큰 없음. 콘솔 로그만 출력합니다. (token.env 의 DISCORD_TOKEN 키를 확인하세요)")
+    if not cfg.DISCORD_TOKEN:
+        print("[DISCORD] 토큰 없음. 콘솔 로그만 출력합니다.")
         return
 
     intents = discord.Intents.default()
-    intents.message_content = True
+    intents.message_content = True  # 포털에서 Message Content Intent 켜야 함
     _client = discord.Client(intents=intents)
 
     @_client.event
@@ -113,8 +149,6 @@ async def start_notifier(cfg):
         await _handle_message(message)
 
     try:
-        print(f"[DISCORD] 토큰 감지: {token[:6]}… (길이={len(token)})")
-        await _client.start(token)
+        await _client.start(cfg.DISCORD_TOKEN)
     except Exception:
         traceback.print_exc()
-
