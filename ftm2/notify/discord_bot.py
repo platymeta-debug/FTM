@@ -7,7 +7,6 @@ from ftm2.notify.analysis_views import build_analysis_embed
 from ftm2.storage.persistence import load_trade_cards, save_trade_cards
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 from ftm2.trade.position_tracker import PositionTracker
-from ftm2.charts.builder import render_analysis_charts
 from ftm2.analysis.state import AnalysisSnapshot
 
 _send_queue: "asyncio.Queue[tuple[str,str]]" = asyncio.Queue()
@@ -162,8 +161,7 @@ async def ensure_analysis_pair(symbol: str) -> tuple[discord.Message, discord.Me
     save_analysis_cards(_analysis_cards)
     return cur, prev
 
-
-async def update_analysis(symbol: str, snapshot: AnalysisSnapshot, divergence_bps: float, next_eta: int):
+async def _edit_embed_only(symbol: str, embed: discord.Embed):
     cur, prev = await ensure_analysis_pair(symbol)
     if not cur or not prev:
         return
@@ -172,14 +170,44 @@ async def update_analysis(symbol: str, snapshot: AnalysisSnapshot, divergence_bp
             await prev.edit(embed=cur.embeds[0])
     except Exception:
         pass
-    emb = build_analysis_embed(_cfg, snapshot, divergence_bps, next_eta)
-    try:
-        paths = render_analysis_charts(snapshot, "storage/charts")
-    except Exception:
-        paths = []
-    files = [discord.File(p) for p in paths if os.path.exists(p)]
-    await cur.edit(embed=emb, attachments=files)
+    await cur.edit(embed=embed)
     save_analysis_cards(_analysis_cards)
+
+
+async def _edit_embed_with_attachments(symbol: str, embed: discord.Embed, paths: list[str]):
+    cur, prev = await ensure_analysis_pair(symbol)
+    if not cur or not prev:
+        return
+    try:
+        if cur.embeds:
+            await prev.edit(embed=cur.embeds[0])
+    except Exception:
+        pass
+    files = [discord.File(p) for p in paths if os.path.exists(p)]
+    await cur.edit(embed=embed, attachments=files)
+    save_analysis_cards(_analysis_cards)
+
+
+async def update_analysis(symbol: str, snapshot: AnalysisSnapshot, divergence_bps: float, next_eta: int):
+    embed = build_analysis_embed(_cfg, snapshot, divergence_bps, next_eta)
+
+    # [ANCHOR:M6_ANALYSIS_RENDER_GUARD]
+    from ftm2.charts.registry import should_render
+    from ftm2.charts.builder import render_analysis_charts
+
+    ok, meta = should_render(_cfg, snapshot)
+    if not ok:
+        await _edit_embed_only(symbol, embed)
+        return
+
+    paths = render_analysis_charts(_cfg, snapshot, _cfg.CHART_DIR)
+    await _edit_embed_with_attachments(symbol, embed, paths)
+    if _cfg.CHART_MODE == "none":
+        for p in paths:
+            try:
+                os.remove(p)
+            except Exception:
+                pass
 
 async def _resolve_guild_and_channels(client: discord.Client):
     global _ch_logs, _ch_trades, _ch_signals
