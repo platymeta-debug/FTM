@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 
+
 import pandas as pd
 
 # --- add_indicators 안전 임포트 ---
@@ -24,6 +25,7 @@ try:  # pragma: no cover
     import ftm2.strategy.reasons as reasons
 except Exception:  # pragma: no cover
     from . import reasons
+
 
 
 @dataclass
@@ -50,10 +52,12 @@ class Snapshot:
     def tfs(self):
         return self.tf_scores
 
+
     @property
     def scores(self):
         """과거 호환: snap.scores 사용 시 tf_scores 반환"""
         return self.tf_scores
+
 
 
 def _parse_tf_weights(s: str) -> Dict[str, float]:
@@ -73,6 +77,13 @@ def _score_row(row: pd.Series) -> List[Contribution]:
     c: List[Contribution] = []
     rsi_v = float(row.get("rsi", 50.0))
     c.append(Contribution("RSI(14)", rsi_v - 50, reasons.interpret_rsi(rsi_v)))
+
+
+def _score_row(row: pd.Series) -> List[Contribution]:
+    c: List[Contribution] = []
+    rsi_v = float(row.get("rsi", 50.0))
+    c.append(Contribution("RSI(14)", rsi_v - 50, reasons.interpret_rsi(rsi_v)))
+
 
     close = float(row.get("close", 0.0))
     ema_fast = float(row.get("ema_fast", 0.0))
