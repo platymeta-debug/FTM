@@ -5,5 +5,8 @@ httpx>=0.27
 discord.py>=2.3
 ujson>=5
 python-dateutil>=2.9
-# Binance 공식 모듈러 커넥터(USDⓈ-Futures)
-binance-sdk-derivatives-trading-usds-futures>=1.0
+
+# Binance 커넥터 (모듈러 구조, USDⓈ-Futures 전용 패키지 병행)
+binance-connector>=3.12      # 루트 커넥터 메타패키지
+binance-sdk-derivatives-trading-usds-futures>=1.0  # USDⓈ-M 전용(문서 안내)
+

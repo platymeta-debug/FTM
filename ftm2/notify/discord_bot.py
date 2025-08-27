@@ -25,6 +25,12 @@ class DiscordBot(discord.Client):
             await self.signals_chan.send(content)
 
 
+    async def send_log(self, content: str):
+        if self.logs_chan:
+            await self.logs_chan.send(content)
+
+
+
 async def run_bot():
     bot = DiscordBot()
     await bot.start(CFG.DISCORD_TOKEN)
