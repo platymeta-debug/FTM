@@ -1,8 +1,11 @@
+
 import asyncio, json, websockets, contextlib
+
 from ..config.settings import load_env_chain
 from .binance_client import BinanceClient
 
 CFG = load_env_chain()
+
 WS_BASE = "wss://fstream.binance.com" if CFG.MODE == "live" else "wss://fstream.binancefuture.com"  # docs
 
 
@@ -26,4 +29,5 @@ async def user_stream(on_event):
         ka.cancel()
         with contextlib.suppress(Exception):
             bx.delete_listen_key(listen_key)
+
 
