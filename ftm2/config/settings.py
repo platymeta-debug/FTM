@@ -129,7 +129,7 @@ class Settings(BaseModel):
     EMBED_DECIMALS_PRICE: int = int(os.getenv("EMBED_DECIMALS_PRICE", "2"))
     EMBED_DECIMALS_QTY: int = int(os.getenv("EMBED_DECIMALS_QTY", "6"))
     EMBED_DECIMALS_USDT: int = int(os.getenv("EMBED_DECIMALS_USDT", "2"))
-    EMBED_SHOW_FUNDING: bool = os.getenv("EMBED_SHOW_FUNDING", "true").lower() == "true"
+    EMBED_SHOW_FUNDING: bool = os.getenv("EMBED_SHOW_FUNDING", "false").lower() == "true"
     EMBED_SHOW_LIQ: bool = os.getenv("EMBED_SHOW_LIQ", "true").lower() == "true"
     EMBED_SHOW_EQUITY: bool = os.getenv("EMBED_SHOW_EQUITY", "true").lower() == "true"
 

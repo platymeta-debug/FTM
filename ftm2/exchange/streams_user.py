@@ -1,6 +1,6 @@
 # [ANCHOR:M5_USER_STREAM]
 import asyncio, json, time
-from ftm2.notify.discord_bot import send_log
+from ftm2.notify.discord_bot import send_log, edit_trade_card
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.exchange.binance_client import BinanceClient
 
@@ -47,7 +47,7 @@ async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
             await asyncio.sleep(1.0)
 
 async def on_user_event(evt, bx: BinanceClient, cfg):
-    from ftm2.notify.discord_bot import edit_trade_card
+
     et = evt.get("e")
     if et == "ORDER_TRADE_UPDATE":
         x = evt.get("o", {})

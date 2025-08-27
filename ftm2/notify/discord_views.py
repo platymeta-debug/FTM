@@ -16,7 +16,7 @@ def build_trade_embed(cfg, symbol: str, ps, acct) -> discord.Embed:
 
     if ps:
         emb.add_field(name="진입가 / 마크가", value=f"{fmt(ps.entry_price,cfg.EMBED_DECIMALS_PRICE)} / {fmt(ps.mark_price,cfg.EMBED_DECIMALS_PRICE)}", inline=True)
-        emb.add_field(name="UPNL / ROE", value=f"{fmt(ps.upnl,cfg.EMBED_DECIMALS_USDT)} USDT / {fmt(ps.roe,2)}%", inline=True)
+        emb.add_field(name="UPNL / ROE", value=f"{fmt(ps.upnl,cfg.EMBED_DECIMALS_USDT)} / {fmt(ps.roe,2)}%", inline=True)
         emb.add_field(name="실현손익 / 수수료", value=f"{fmt(ps.realized_pnl,cfg.EMBED_DECIMALS_USDT)} / {fmt(ps.fee_paid,cfg.EMBED_DECIMALS_USDT)}", inline=True)
         emb.add_field(name="SL / TP", value=f"{fmt(ps.sl_price,cfg.EMBED_DECIMALS_PRICE)} / {fmt(ps.tp_price,cfg.EMBED_DECIMALS_PRICE)}", inline=True)
         if cfg.EMBED_SHOW_LIQ and ps.liq_price:

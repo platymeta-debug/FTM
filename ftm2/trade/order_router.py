@@ -73,3 +73,17 @@ class OrderRouter:
             return entry + (cfg.SL_MULT - tighten)*atr
         else:
             return entry - (cfg.SL_MULT - tighten)*atr
+
+
+def close_position_all(symbol: str) -> str:
+    """간단한 reduceOnly 시장가 청산."""
+    bx = BinanceClient()
+    try:
+        # 양방향 모두 reduceOnly 시장가 시도
+        bx.new_order(symbol=symbol, side="BUY", type="MARKET", reduceOnly=True)
+        bx.new_order(symbol=symbol, side="SELL", type="MARKET", reduceOnly=True)
+        send_trade(f"🔻 {symbol} 전량 청산 주문 전송")
+        return f"{symbol} 청산 주문 전송"
+    except Exception as e:
+        send_log(f"⚠️ {symbol} 청산 실패: {e}")
+        return f"{symbol} 청산 실패: {e}"

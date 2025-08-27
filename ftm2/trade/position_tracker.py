@@ -1,6 +1,6 @@
 # [ANCHOR:M5_POSITION_TRACKER]
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 from time import time
 from ftm2.trade.pnl_calc import upnl_usdm, initial_margin, roe_pct
@@ -29,19 +29,22 @@ class PositionState:
 
 @dataclass
 class AccountState:
-    wallet_balance: float = 0.0     # 총 지갑잔고(USDT)
-    available_balance: float = 0.0  # 사용 가능 잔고
-    total_upnl: float = 0.0         # 모든 포지션 upnl 합
-    equity: float = 0.0             # 총자본=지갑잔고+total_upnl
-    maker_commission: float = 0.0   # 선택: 커미션율 캐시
+    wallet_balance: float = 0.0
+    available_balance: float = 0.0
+    total_upnl: float = 0.0
+    equity: float = 0.0
+    funding_fee_total: float = 0.0   # (옵션) 펀딩 누적
+    maker_commission: float = 0.0
     taker_commission: float = 0.0
 
 class PositionTracker:
     def __init__(self):
         self.pos: Dict[str, PositionState] = {}         # key: f"{symbol}:{side}"
         self.account = AccountState()
-        self.msg_ids: Dict[str, int] = {}              # symbol -> discord message id
+        self.msg_ids: Dict[str, int] = {}         # symbol -> discord message id
         self._disabled_edit = False
+        self._last_upnl: Dict[str, float] = {}
+
 
     def key(self, symbol: str, side: str) -> str: return f"{symbol}:{side}"
 
@@ -114,6 +117,19 @@ class PositionTracker:
             ps = self.pos.get(self.key(symbol, side))
             if ps and ps.qty != 0: return ps
         return None
+
+    def should_edit(self, symbol: str, pnl_change_bps: int) -> bool:
+        """UPNL 변동률 임계치(bps) 체크. 0이면 항상 True."""
+        if pnl_change_bps <= 0: return True
+        ps = self.get_symbol_view(symbol)
+        cur = ps.upnl if ps else 0.0
+        last = self._last_upnl.get(symbol, None)
+        self._last_upnl[symbol] = cur
+        if last is None: return True
+        denom = max(abs(ps.initial_margin), 1e-9) if ps else 1.0
+        delta_bps = abs(cur - last) / denom * 1e4
+        return delta_bps >= pnl_change_bps
+
 
     def disable_edits(self, b: bool): self._disabled_edit = b
     def edits_disabled(self) -> bool: return self._disabled_edit

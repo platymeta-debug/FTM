@@ -4,10 +4,8 @@ from __future__ import annotations
 
 def upnl_usdm(entry: float, mark: float, qty: float, side: str, contract_size: float=1.0) -> float:
     if qty == 0 or entry <= 0 or mark <= 0: return 0.0
-    if side == "LONG":
-        return (mark - entry) * qty * contract_size
-    else:
-        return (entry - mark) * qty * contract_size
+    return ((mark - entry) if side=="LONG" else (entry - mark)) * qty * contract_size
+
 
 
 def initial_margin(entry: float, qty: float, lev: float) -> float:

@@ -16,8 +16,8 @@ from ftm2.trade.order_router import OrderRouter
 from ftm2.risk.guardrails import GuardRails
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.reconcile.reconciler import resync_loop
-from ftm2.notify.discord_bot import start_notifier, register_hooks, edit_trade_card
-from ftm2.notify import discord_bot
+from ftm2.notify.discord_bot import start_notifier, register_hooks, register_tracker
+from ftm2.trade import order_router
 
 
 
@@ -125,9 +125,6 @@ async def main():
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
-    # --- Discord notifier 시작 (비동기) ---
-
-    asyncio.create_task(start_notifier(CFG))  # on_ready에서 부팅 메시지 보냄
 
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX
@@ -135,11 +132,17 @@ async def main():
     GUARD = GuardRails(CFG)
     BX = bx
     tracker = PositionTracker()
-    discord_bot.inject_tracker(tracker)
-    streams_market.TRACKER = tracker
+    register_tracker(tracker)
+    register_hooks(
+        close_all=lambda sym: order_router.close_position_all(sym),
+        get_status=lambda: f"심볼={CFG.SYMBOLS}, 모드={CFG.MODE}",
+    )
+    streams_market.TRACKER_REF = tracker
 
     # 동시에 WS 시작
     tasks = [
+        asyncio.create_task(start_notifier(CFG)),
+
         asyncio.create_task(streams_market.market_stream(CFG.SYMBOLS, CFG.INTERVAL, on_market)),
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),

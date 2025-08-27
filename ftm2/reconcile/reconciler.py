@@ -1,5 +1,5 @@
 # [ANCHOR:M5_RECONCILER]
-import asyncio, time
+import asyncio
 from ftm2.notify.discord_bot import send_log
 
 async def resync_loop(bx, tracker, cfg, symbols):

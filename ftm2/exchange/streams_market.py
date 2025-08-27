@@ -6,13 +6,16 @@ from ftm2.trade.position_tracker import PositionTracker
 CFG = load_env_chain()
 WS_BASE = "wss://fstream.binance.com" if CFG.MODE == "live" else "wss://fstream.binancefuture.com"
 
-TRACKER: PositionTracker | None = None
+
+TRACKER_REF: PositionTracker | None = None
 
 async def on_mark_price(symbol: str, mark: float, cfg):
-    if not TRACKER: return
+    global TRACKER_REF
+    if not TRACKER_REF: return
     for side in ("LONG","SHORT"):
-        TRACKER.update_mark(symbol, side, mark)
-    await edit_trade_card(symbol, TRACKER, cfg, force=False)
+        TRACKER_REF.update_mark(symbol, side, mark)
+    await edit_trade_card(symbol, TRACKER_REF, cfg, force=False)
+
 
 
 def kline_stream(symbol: str, interval: str) -> str:
