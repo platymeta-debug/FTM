@@ -7,6 +7,8 @@ from ftm2.notify.discord_bot import send_log, send_trade
 from ftm2.trade.position_sizer import SizingDecision
 from ftm2.exchange.quantize import ExchangeFilters
 
+CSV = None
+
 def _cid(sym: str, side: str) -> str:
     return f"FTM2_{int(time.time()*1000)}_{sym}_{side}"
 
@@ -38,6 +40,11 @@ class OrderRouter:
         try:
             od = self.bx.new_order(**params)
             send_trade(f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {q_qty} / {dec.reason}")
+            if CSV:
+                CSV.log("ORDER_NEW", symbol=symbol, side=dec.side, price=entry_price, qty=q_qty,
+                        sl=dec.sl, tp=dec.tp, leverage=self.cfg.LEVERAGE, margin=self.cfg.MARGIN_TYPE,
+                        reason=dec.reason,
+                        route={"slippage":0, "post_only":self.cfg.POST_ONLY, "reduce_only":False, "type":params.get("type")})
             return od
         except Exception as e:
             send_log(f"🚫 진입 주문 실패: {symbol} {e}")
@@ -83,6 +90,8 @@ def close_position_all(symbol: str) -> str:
         bx.new_order(symbol=symbol, side="BUY", type="MARKET", reduceOnly=True)
         bx.new_order(symbol=symbol, side="SELL", type="MARKET", reduceOnly=True)
         send_trade(f"🔻 {symbol} 전량 청산 주문 전송")
+        if CSV:
+            CSV.log("POSITION_CLOSE", symbol=symbol, side="", exit="", realized="", fee="", roe="", elapsed_sec="", reason="close_all")
         return f"{symbol} 청산 주문 전송"
     except Exception as e:
         send_log(f"⚠️ {symbol} 청산 실패: {e}")

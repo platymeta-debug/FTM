@@ -5,6 +5,8 @@ from ftm2.trade.position_tracker import PositionTracker
 from ftm2.exchange.binance_client import BinanceClient
 
 TRACKER: PositionTracker | None = None
+CSV = None
+LEDGER = None
 
 async def keepalive_loop(bx: BinanceClient, listen_key: str, interval_sec: int):
     while True:
@@ -61,6 +63,19 @@ async def on_user_event(evt, bx: BinanceClient, cfg):
         if ex_type == "TRADE" and last_qty:
             TRACKER.apply_fill(sym, side, last_price, last_qty if side=="LONG" else -last_qty, realized, fee)
             await edit_trade_card(sym, TRACKER, cfg, force=True)
+            # [ANCHOR:M5P_USERSTREAM_LOG]
+            win = None
+            ps = TRACKER.get_symbol_view(sym) if TRACKER.get_symbol_view(sym) else None
+            if ps:
+                win = (ps.upnl >= 0)
+            if LEDGER:
+                LEDGER.on_realized(realized, fee, win)
+            if CSV:
+                CSV.log("ORDER_FILL", symbol=sym, side=side, price=last_price,
+                        qty=last_qty if side=="LONG" else -last_qty,
+                        realized=realized, fee=fee, reason="fill", order_id=x.get("i"), client_id=x.get("c"),
+                        entry=ps.entry_price if ps else "", mark=ps.mark_price if ps else "",
+                        wallet=TRACKER.account.wallet_balance, equity=TRACKER.account.equity, avail=TRACKER.account.available_balance)
     elif et == "ACCOUNT_UPDATE":
         a = evt.get("a", {})
         # 지갑/가용잔고
@@ -79,3 +94,6 @@ async def on_user_event(evt, bx: BinanceClient, cfg):
             # liq는 AccountUpdate에 없음 → 주기적 REST로 보정
             TRACKER.set_snapshot(sym, side, qty, entry, lev, mt)
             await edit_trade_card(sym, TRACKER, cfg, force=True)
+        if CSV:
+            CSV.log("SNAPSHOT", symbol=sym if 'sym' in locals() else "", reason="account_update",
+                    wallet=TRACKER.account.wallet_balance, equity=TRACKER.account.equity, avail=TRACKER.account.available_balance)

@@ -95,4 +95,11 @@ class BinanceClient:
     def get_commission_rate(self, symbol: str):
         return self._signed("GET", "/fapi/v1/commissionRate", params={"symbol": symbol}).json()
 
+    # [ANCHOR:M5P_INCOME_API]
+    def get_income(self, incomeType: str|None=None, startTime: int|None=None):
+        params = {}
+        if incomeType: params["incomeType"] = incomeType
+        if startTime: params["startTime"] = startTime
+        return self._signed("GET", "/fapi/v1/income", params=params).json()
+
 

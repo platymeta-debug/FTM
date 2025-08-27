@@ -5,7 +5,8 @@ from collections import defaultdict
 from ftm2.indicators.core import add_indicators
 from ftm2.strategy.scorer import score_row
 from datetime import timezone
-
+import asyncio
+import pandas as pd
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -18,6 +19,17 @@ from ftm2.trade.position_tracker import PositionTracker
 from ftm2.reconcile.reconciler import resync_loop
 from ftm2.notify.discord_bot import start_notifier, register_hooks, register_tracker
 from ftm2.trade import order_router
+from ftm2.indicators.all import add_indicators
+from ftm2.strategy.scorer import score_row
+from ftm2.storage.csv_logger import CsvLogger
+from ftm2.risk.ledger import DailyLedger, LossCutController
+from ftm2.reconcile.income_poll import income_poll_loop
+
+# 전역 주입 포인트(간단)
+from ftm2.notify import discord_bot as DB
+from ftm2.exchange import streams_user as US
+from ftm2.exchange import streams_market as MS
+from ftm2 import strategy as ST
 
 
 
@@ -27,6 +39,8 @@ BUFFERS: dict[str, pd.DataFrame] = {}
 ROUTER: OrderRouter | None = None
 GUARD: GuardRails | None = None
 BX: BinanceClient | None = None
+CSV = None
+LEDGER = None
 
 
 
@@ -127,7 +141,7 @@ async def main():
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
 
     # 라우터/가드/트래커 초기화
-    global ROUTER, GUARD, BX
+    global ROUTER, GUARD, BX, CSV, LEDGER
     ROUTER = OrderRouter(CFG, bx.filters)
     GUARD = GuardRails(CFG)
     BX = bx
@@ -139,6 +153,27 @@ async def main():
     )
     streams_market.TRACKER_REF = tracker
 
+    CSV = CsvLogger(CFG)
+    await CSV.start()
+    LEDGER = DailyLedger(CFG, CSV)
+
+    DB.CSV = CSV; DB.LEDGER = LEDGER
+    US.CSV = CSV; US.LEDGER = LEDGER
+    MS.CSV = CSV; MS.LEDGER = LEDGER
+    ST.CSV = CSV
+
+    async def _notify(text):
+        try:
+            DB.send_log(text)
+        except Exception:
+            print("[NOTIFY_FALLBACK]", text)
+
+    async def _close_all(sym):
+        from ftm2.trade import order_router as OR
+        return await OR.close_position_all(sym)
+
+    LC = LossCutController(CFG, LEDGER, tracker, router=type("R",(),{"close_all":_close_all}), notify=_notify, csv_logger=CSV)
+
     # 동시에 WS 시작
     tasks = [
         asyncio.create_task(start_notifier(CFG)),
@@ -147,6 +182,26 @@ async def main():
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
+    tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
+
+    async def snapshot_loop():
+        while True:
+            if CFG.CSV_MARK_SNAPSHOT_SEC and any(p.qty!=0 for p in tracker.pos.values()):
+                for k, ps in tracker.pos.items():
+                    if ps.qty==0: continue
+                    CSV.log("SNAPSHOT", symbol=ps.symbol, side=ps.side, entry=ps.entry_price,
+                            mark=ps.mark_price, upnl=ps.upnl, roe=ps.roe,
+                            wallet=tracker.account.wallet_balance, equity=tracker.account.equity, avail=tracker.account.available_balance)
+            await asyncio.sleep(max(5, int(CFG.CSV_MARK_SNAPSHOT_SEC) or 60))
+    tasks.append(asyncio.create_task(snapshot_loop()))
+
+    async def ledger_guard_loop():
+        while True:
+            LEDGER.rollover_if_needed(tracker.account.equity)
+            LEDGER.on_equity_tick(tracker.account.equity)
+            await LC.check_and_fire()
+            await asyncio.sleep(5)
+    tasks.append(asyncio.create_task(ledger_guard_loop()))
     smoke = int(os.getenv("SMOKE_SECONDS", "0"))
     if smoke > 0:
         try:
