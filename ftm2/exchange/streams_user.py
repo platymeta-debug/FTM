@@ -1,8 +1,8 @@
 
 import asyncio, json, websockets, contextlib
 
-from ..config.settings import load_env_chain
-from .binance_client import BinanceClient
+from ftm2.config.settings import load_env_chain
+from ftm2.exchange.binance_client import BinanceClient
 
 CFG = load_env_chain()
 

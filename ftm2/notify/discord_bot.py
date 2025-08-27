@@ -1,7 +1,7 @@
 import asyncio
 import discord
 
-from ..config.settings import load_env_chain
+from ftm2.config.settings import load_env_chain
 
 CFG = load_env_chain()
 
