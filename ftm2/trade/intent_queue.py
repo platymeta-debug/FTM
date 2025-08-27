@@ -19,11 +19,18 @@ class IntentQueue:
         direction = snap["direction"] if isinstance(snap, dict) else snap.direction
         score = snap["total_score"] if isinstance(snap, dict) else snap.total_score
         trace = DecisionTrace(symbol=sym, decision_score=score, total_score=score, direction=direction)
-        trace.gates["ENTER_TH"] = self.cfg.ENTRY_TH
-
+        trace.gates.update({
+            "ENTER_TH": self.cfg.ENTRY_TH,
+            "abs(score)": abs(score),
+        })
         if self.divergence and self.divergence.too_wide(sym):
             trace.reasons.append("divergence too wide")
             log_decision(trace)
+            return
+        if abs(score) < self.cfg.ENTRY_TH:
+            trace.reasons.append("below enter threshold")
+            log_decision(trace)
+
             return
         if abs(score) < self.cfg.ENTRY_TH:
             trace.reasons.append("below enter threshold")

@@ -45,18 +45,18 @@ def TRACKER_REF():
     return _tracker_ref
 
 # 동기 호출 가능: 내부 큐에 적재
-def send_log(text: str):    _send_queue.put_nowait(("logs", text))
-def send_trade(text: str):  _send_queue.put_nowait(("trades", text))
-def send_signal(text: str): _send_queue.put_nowait(("signals", text))
+def send_log(text: str, embed=None):    _send_queue.put_nowait(("logs", text, embed))
+def send_trade(text: str, embed=None):  _send_queue.put_nowait(("trades", text, embed))
+def send_signal(text: str, embed=None): _send_queue.put_nowait(("signals", text, embed))
 
 async def _sender_loop():
     global _ch_logs, _ch_trades, _ch_signals
     while True:
-        chan, text = await _send_queue.get()
+        chan, text, embed = await _send_queue.get()
         try:
-            if chan=="logs" and _ch_logs:    await _ch_logs.send(f"🧩 {text}")
-            elif chan=="trades" and _ch_trades: await _ch_trades.send(f"💹 {text}")
-            elif chan=="signals" and _ch_signals: await _ch_signals.send(f"📡 {text}")
+            if chan=="logs" and _ch_logs:    await _ch_logs.send(content=f"🧩 {text}", embed=embed)
+            elif chan=="trades" and _ch_trades: await _ch_trades.send(content=f"💹 {text}", embed=embed)
+            elif chan=="signals" and _ch_signals: await _ch_signals.send(content=f"📡 {text}", embed=embed)
             else:
                 print(f"[DISCORD][DRY] {chan}: {text}")  # 채널 미설정 시 콘솔로
         except Exception:
@@ -181,27 +181,6 @@ async def update_analysis(
     if not ch:
         return
 
-
-    if view is None:
-        try:
-            from ftm2.strategy.compat import to_viewdict  # type: ignore
-        except Exception:
-            to_viewdict = None  # type: ignore
-        if to_viewdict:
-            view = to_viewdict(snapshot)
-        else:
-            view = {
-                "symbol": getattr(snapshot, "symbol", symbol),
-                "total_score": getattr(snapshot, "total_score", 0.0),
-                "direction": getattr(snapshot, "direction", "NEUTRAL"),
-                "confidence": getattr(snapshot, "confidence", 0.0),
-                "tf_scores": getattr(snapshot, "tf_scores", {}),
-            }
-
-    _load_analysis_persist()
-    ch = _ch_analysis.get(symbol)
-    if not ch:
-        return
 
     ok, meta = should_render(_cfg, snapshot)
     if not ok:
