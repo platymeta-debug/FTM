@@ -5,8 +5,8 @@ from typing import Any, Dict
 from urllib.parse import urlencode
 import httpx
 
-from ..config.settings import load_env_chain
-from .quantize import ExchangeFilters
+from ftm2.config.settings import load_env_chain
+from ftm2.exchange.quantize import ExchangeFilters
 
 CFG = load_env_chain()
 
