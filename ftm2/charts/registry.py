@@ -28,35 +28,42 @@ def _save(reg: Dict[str, Any]):
 
 def compute_fingerprint(snapshot) -> str:
     """
-    값 몇 개만 취합해서 가벼운 지문 생성(그림을 그리기 전 중복 판단).
-    총점, 마지막 종가/EMA/RSI/ADX/CCI 등.
+
+    경량 메타(심볼/총점/방향/신뢰도 + 마지막 캔들 몇 값)로 지문 생성.
+    DataFrame의 진릿값 평가(or/and) 절대 사용하지 않음.
     """
     x = {
         "sym": snapshot.symbol,
-        "score": round(snapshot.total_score, 2),
+        "score": round(float(snapshot.total_score), 2),
         "dir": snapshot.direction,
-        "conf": round(snapshot.confidence, 3),
+        "conf": round(float(snapshot.confidence), 3),
     }
-    df = snapshot.indicators.get("1m") or snapshot.indicators.get("main")
+
+    indicators = getattr(snapshot, "indicators", {}) or {}
+    df = indicators.get("1m")
+    if df is None:
+        df = indicators.get("main")
+
+
     if df is not None and len(df) > 0:
         last = df.iloc[-1]
         for k in ("close", "ema_fast", "ema_slow", "rsi", "adx", "cci", "obv"):
             if k in df.columns:
-                x[k] = float(last.get(k, 0.0))
-    raw = json.dumps(x, sort_keys=True).encode()
+                try:
+                    x[k] = float(last[k])
+                except Exception:
+                    pass
+
+    raw = json.dumps(x, sort_keys=True, ensure_ascii=False).encode()
     return hashlib.sha1(raw).hexdigest()
 
 
 def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
-    """
-    - 최소 간격/점수 변화/강제 주기 체크
-    - True면 렌더, False면 스킵
-    returns: (ok, meta) where meta contains 'reason' / 'counter'
-    """
     reg = _load()
     sym = snapshot.symbol
     now = _now()
     ent = reg.get(sym, {"last_ts": 0, "last_fp": "", "counter": 0})
+
     # 최소 간격
     if now - ent["last_ts"] < cfg.CHART_MIN_INTERVAL_S:
         ent["counter"] += 1
@@ -66,16 +73,22 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
 
     # 점수 변화
     prev_score = ent.get("last_score", 0.0)
-    if abs(snapshot.total_score - prev_score) < cfg.CHART_MIN_SCORE_DELTA:
-        # 강제 주기 조건
+    if abs(float(snapshot.total_score) - float(prev_score)) < cfg.CHART_MIN_SCORE_DELTA:
         ent["counter"] = ent.get("counter", 0) + 1
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
             return False, {"reason": "score-delta", "counter": ent["counter"]}
 
-    # 지문(fingerprint) 중복
-    fp = compute_fingerprint(snapshot)
+
+    # 지문 비교 (여기서도 DataFrame 진릿값을 절대 쓰지 않음)
+    try:
+        fp = compute_fingerprint(snapshot)
+    except Exception:
+        # 어떤 이유로든 fingerprint 실패하면 렌더 1회 허용해서 진행
+        fp = f"{sym}:{time.time():.0f}"
+
+
     if fp == ent.get("last_fp", ""):
         ent["counter"] += 1
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
@@ -83,7 +96,8 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
             _save(reg)
             return False, {"reason": "fingerprint", "counter": ent["counter"]}
 
-    # 렌더 승인
+
+    # 통과 → 상태 갱신
     ent.update({
         "last_ts": now,
         "last_fp": fp,
