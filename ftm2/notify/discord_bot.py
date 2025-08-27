@@ -135,56 +135,61 @@ async def edit_trade_card(symbol: str, tracker: PositionTracker, cfg, force: boo
 
 
 # [ANCHOR:M6_ANALYSIS_MSG_API]
-async def ensure_analysis_text(symbol: str) -> discord.Message | None:
-    if not _ch_analysis:
-        return None
-    _load_analysis_persist()
-    ch = _ch_analysis.get(symbol)
-    if not ch:
-        return None
-    ids = _analysis_cards.get(symbol, {})
-    msg = None
-    text_id = ids.get("text") or ids.get("current")
-    if text_id:
-        try:
-            msg = await ch.fetch_message(text_id)
-        except Exception:
-            msg = None
-    if msg is None:
-        msg = await ch.send(embed=discord.Embed(title=f"{symbol} 분석", description="-"))
-    ids.update({"text": msg.id})
-    _analysis_cards[symbol] = ids
-    save_analysis_cards(_analysis_cards)
-    return msg
 
+async def update_analysis(
+    symbol: str,
+    snapshot,
+    divergence_bps: float,
+    interval_s: int,
+    view: dict | None = None,
+):
+    """Update analysis messages for a symbol.
 
-async def update_analysis(symbol: str, snapshot, divergence_bps: float, next_eta: int):
-    embed = build_analysis_embed(_cfg, snapshot, divergence_bps, next_eta)
+    snapshot: Snapshot 객체 (차트 렌더용)
+    view:     dict 가공본 (텍스트 임베드용)
+    """
 
-    # [ANCHOR:M6_ANALYSIS_RENDER_GUARD]
     from ftm2.charts.registry import should_render
     from ftm2.charts.builder import render_analysis_charts
 
-    text_msg = await ensure_analysis_text(symbol)
-    if text_msg is None:
+    if view is None:
+        try:
+            from ftm2.strategy.compat import to_viewdict  # type: ignore
+        except Exception:
+            to_viewdict = None  # type: ignore
+        if to_viewdict:
+            view = to_viewdict(snapshot)
+        else:
+            view = {
+                "symbol": getattr(snapshot, "symbol", symbol),
+                "total_score": getattr(snapshot, "total_score", 0.0),
+                "direction": getattr(snapshot, "direction", "NEUTRAL"),
+                "confidence": getattr(snapshot, "confidence", 0.0),
+                "tf_scores": getattr(snapshot, "tf_scores", {}),
+            }
+
+    _load_analysis_persist()
+    ch = _ch_analysis.get(symbol)
+    if not ch:
         return
 
-    ok, meta = should_render(_cfg, snapshot, divergence_bps)
-    if ok:
+    ok, meta = should_render(_cfg, snapshot)
+    if not ok:
+        print(f"[CHART][SKIP] {symbol} {meta.get('reason','')}")
+    else:
         paths = render_analysis_charts(_cfg, snapshot, _cfg.CHART_DIR)
-        ch = _ch_analysis.get(symbol)
-        if ch and paths:
+        if paths:
             ids = _analysis_cards.get(symbol, {})
-            prev_id = ids.get("chart") or ids.get("prev")
-            if prev_id:
+            old_id = ids.get("chart")
+            if old_id:
                 try:
-                    old = await ch.fetch_message(prev_id)
+                    old = await ch.fetch_message(old_id)
                     await old.delete()
                 except Exception:
                     pass
             files = [discord.File(p) for p in paths if os.path.exists(p)]
             new_msg = await ch.send(files=files)
-            ids.update({"chart": new_msg.id})
+            ids["chart"] = new_msg.id
             _analysis_cards[symbol] = ids
             save_analysis_cards(_analysis_cards)
             if _cfg.CHART_MODE == "none":
@@ -194,7 +199,27 @@ async def update_analysis(symbol: str, snapshot, divergence_bps: float, next_eta
                     except Exception:
                         pass
 
-    await text_msg.edit(embed=embed)
+    embed = build_analysis_embed(view, divergence_bps, interval_s)
+    now_txt = time.strftime("%H:%M:%S", time.localtime())
+    embed.set_footer(text=f"마지막 갱신 {now_txt} | 다음 갱신까지 {interval_s}s")
+
+    ids = _analysis_cards.get(symbol, {})
+    text_id = ids.get("text")
+    if text_id:
+        try:
+            msg = await ch.fetch_message(text_id)
+            await msg.edit(embed=embed)
+        except Exception:
+            msg = await ch.send(embed=embed)
+            ids["text"] = msg.id
+            _analysis_cards[symbol] = ids
+            save_analysis_cards(_analysis_cards)
+    else:
+        msg = await ch.send(embed=embed)
+        ids["text"] = msg.id
+        _analysis_cards[symbol] = ids
+        save_analysis_cards(_analysis_cards)
+
 
 async def _resolve_guild_and_channels(client: discord.Client):
     global _ch_logs, _ch_trades, _ch_signals

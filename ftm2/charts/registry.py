@@ -64,22 +64,32 @@ def should_render(cfg, snapshot, divergence_bps: float | None = None) -> tuple[b
     now = _now()
     ent = reg.get(sym, {"last_ts": 0, "last_fp": "", "counter": 0, "last_score": 0.0})
 
+    rules = getattr(snapshot, "rules", {}) if not isinstance(snapshot, dict) else snapshot.get("rules", {})
+    divergence_bps = float(rules.get("divergence_bps", 0.0))
+
     # 괴리도 게이트
-    if divergence_bps is not None and abs(divergence_bps) < cfg.CHART_MIN_DIVERGENCE_BPS:
+    if abs(divergence_bps) < cfg.CHART_MIN_DIVERGENCE_BPS:
+
         ent["counter"] = ent.get("counter", 0) + 1
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
-            print(f"[CHART][SKIP] {sym} divergence {divergence_bps:.2f}bps < {cfg.CHART_MIN_DIVERGENCE_BPS}")
-            return False, {"reason": "divergence", "counter": ent["counter"]}
+
+            reason = (
+                f"divergence {divergence_bps:.2f}bps < {cfg.CHART_MIN_DIVERGENCE_BPS}"
+            )
+            return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 최소 간격
     if now - ent["last_ts"] < cfg.CHART_MIN_INTERVAL_S:
         ent["counter"] = ent.get("counter", 0) + 1
         reg[sym] = ent
         _save(reg)
-        print(f"[CHART][SKIP] {sym} interval {now - ent['last_ts']:.1f}s < {cfg.CHART_MIN_INTERVAL_S}")
-        return False, {"reason": "interval", "counter": ent["counter"]}
+
+        reason = f"interval {now - ent['last_ts']:.1f}s < {cfg.CHART_MIN_INTERVAL_S}"
+        return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 점수 변화
     prev_score = ent.get("last_score", 0.0)
@@ -89,8 +99,12 @@ def should_render(cfg, snapshot, divergence_bps: float | None = None) -> tuple[b
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
-            print(f"[CHART][SKIP] {sym} score Δ{cur_score - float(prev_score):.2f} < {cfg.CHART_MIN_SCORE_DELTA}")
-            return False, {"reason": "score-delta", "counter": ent["counter"]}
+
+            reason = (
+                f"score Δ{cur_score - float(prev_score):.2f} < {cfg.CHART_MIN_SCORE_DELTA}"
+            )
+            return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 지문 비교
     try:
@@ -103,8 +117,10 @@ def should_render(cfg, snapshot, divergence_bps: float | None = None) -> tuple[b
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
-            print(f"[CHART][SKIP] {sym} fingerprint same {fp}")
-            return False, {"reason": "fingerprint", "counter": ent["counter"]}
+
+            reason = f"fingerprint same {fp}"
+            return False, {"reason": reason, "counter": ent["counter"]}
+
 
     # 통과 → 상태 갱신
     ent.update({
@@ -115,6 +131,7 @@ def should_render(cfg, snapshot, divergence_bps: float | None = None) -> tuple[b
     })
     reg[sym] = ent
     _save(reg)
-    print(f"[CHART][RENDER] {sym} fp={fp}")
-    return True, {"reason": "ok", "counter": 0}
+
+    return True, {"reason": "render", "counter": 0}
+
 

@@ -205,7 +205,14 @@ async def main():
     async def on_snapshot(sym, snap):
         # [ANCHOR:M6_APP_ON_SNAPSHOT_PATCH]
         snap_v = to_viewdict(snap)
-        await DB.update_analysis(sym, snap_v, div.get_bps(sym), CFG.ANALYZE_INTERVAL_S)
+        await DB.update_analysis(
+            sym,
+            snap,
+            div.get_bps(sym),
+            CFG.ANALYZE_INTERVAL_S,
+            view=snap_v,
+        )
+
         INTQ.on_snapshot(snap_v)
         CSV.log(
             "ANALYSIS_SNAPSHOT",
