@@ -3,13 +3,19 @@ import asyncio, os, traceback, time
 from typing import Optional
 import discord
 from ftm2.notify.discord_views import build_trade_embed
+from ftm2.notify.analysis_views import build_analysis_embed
 from ftm2.storage.persistence import load_trade_cards, save_trade_cards
+from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 from ftm2.trade.position_tracker import PositionTracker
+from ftm2.charts.builder import render_analysis_charts
+from ftm2.analysis.state import AnalysisSnapshot
 
 _send_queue: "asyncio.Queue[tuple[str,str]]" = asyncio.Queue()
 _cfg = None
 _client: Optional[discord.Client] = None
 _ch_logs = _ch_trades = _ch_signals = None
+_ch_analysis: dict[str, discord.TextChannel] = {}
+_analysis_cards: dict[str, dict] = {}
 
 
 # 외부에서 주입할 훅(한국어 명령용)
@@ -61,6 +67,7 @@ async def _sender_loop():
 # [ANCHOR:M5_TRADE_CARD]
 _persist_loaded = False
 _last_edit_ts: dict[str, float] = {}
+_analysis_loaded = False
 
 
 def _load_persist(tracker: PositionTracker):
@@ -70,6 +77,16 @@ def _load_persist(tracker: PositionTracker):
     if isinstance(data, dict):
         tracker.msg_ids.update({k: int(v) for k, v in data.items() if str(v).isdigit()})
     _persist_loaded = True
+
+
+def _load_analysis_persist():
+    global _analysis_loaded, _analysis_cards
+    if _analysis_loaded:
+        return
+    data = load_analysis_cards()
+    if isinstance(data, dict):
+        _analysis_cards.update(data)
+    _analysis_loaded = True
 
 
 
@@ -116,6 +133,54 @@ async def edit_trade_card(symbol: str, tracker: PositionTracker, cfg, force: boo
     except Exception as e:
         print("[DISCORD][EDIT_ERR]", e)
 
+
+# [ANCHOR:M6_ANALYSIS_MSG_API]
+async def ensure_analysis_pair(symbol: str) -> tuple[discord.Message, discord.Message]:
+    if not _ch_analysis:
+        return None, None
+    _load_analysis_persist()
+    ch = _ch_analysis.get(symbol)
+    if not ch:
+        return None, None
+    ids = _analysis_cards.get(symbol, {})
+    cur = prev = None
+    if ids.get("current"):
+        try:
+            cur = await ch.fetch_message(ids["current"])
+        except Exception:
+            cur = None
+    if ids.get("prev"):
+        try:
+            prev = await ch.fetch_message(ids["prev"])
+        except Exception:
+            prev = None
+    if cur is None:
+        cur = await ch.send(embed=discord.Embed(title=f"{symbol} 분석", description="-"))
+    if prev is None:
+        prev = await ch.send(embed=discord.Embed(title=f"{symbol} 분석(이전)", description="-"))
+    _analysis_cards[symbol] = {"current": cur.id, "prev": prev.id}
+    save_analysis_cards(_analysis_cards)
+    return cur, prev
+
+
+async def update_analysis(symbol: str, snapshot: AnalysisSnapshot, divergence_bps: float, next_eta: int):
+    cur, prev = await ensure_analysis_pair(symbol)
+    if not cur or not prev:
+        return
+    try:
+        if cur.embeds:
+            await prev.edit(embed=cur.embeds[0])
+    except Exception:
+        pass
+    emb = build_analysis_embed(_cfg, snapshot, divergence_bps, next_eta)
+    try:
+        paths = render_analysis_charts(snapshot, "storage/charts")
+    except Exception:
+        paths = []
+    files = [discord.File(p) for p in paths if os.path.exists(p)]
+    await cur.edit(embed=emb, attachments=files)
+    save_analysis_cards(_analysis_cards)
+
 async def _resolve_guild_and_channels(client: discord.Client):
     global _ch_logs, _ch_trades, _ch_signals
     gid = _cfg.DISCORD_GUILD_ID
@@ -149,9 +214,17 @@ async def _resolve_guild_and_channels(client: discord.Client):
     _ch_logs = await bind_channel(_cfg.DISCORD_CHANNEL_LOGS, "logs") if _cfg.DISCORD_CHANNEL_LOGS else None
     _ch_trades = await bind_channel(_cfg.DISCORD_CHANNEL_TRADES, "trades") if _cfg.DISCORD_CHANNEL_TRADES else None
     _ch_signals = await bind_channel(_cfg.DISCORD_CHANNEL_SIGNALS, "signals") if _cfg.DISCORD_CHANNEL_SIGNALS else None
+    if _cfg.DISCORD_CHANNEL_ANALYSIS_BTC:
+        ch = await bind_channel(_cfg.DISCORD_CHANNEL_ANALYSIS_BTC, "analysis_btc")
+        if ch:
+            _ch_analysis["BTCUSDT"] = ch
+    if _cfg.DISCORD_CHANNEL_ANALYSIS_ETH:
+        ch = await bind_channel(_cfg.DISCORD_CHANNEL_ANALYSIS_ETH, "analysis_eth")
+        if ch:
+            _ch_analysis["ETHUSDT"] = ch
 
     print(f"[DISCORD] 연결 완료. guild={guild.name} "
-          f"logs={'OK' if _ch_logs else 'X'} trades={'OK' if _ch_trades else 'X'} signals={'OK' if _ch_signals else 'X'}")
+          f"logs={'OK' if _ch_logs else 'X'} trades={'OK' if _ch_trades else 'X'} signals={'OK' if _ch_signals else 'X'} analysis={len(_ch_analysis)}")
     return True
 
 async def _on_ready(client: discord.Client):
@@ -183,6 +256,8 @@ async def _handle_message(msg: discord.Message):
         f = _hooks.get("get_signal")
         text = f(sym) if f else f"{sym} 신호 훅 미연결"
         await msg.channel.send(f"📡 {text}")
+    elif cmd == "모드":
+        await msg.channel.send(f"⚙️ TRADE_MODE={_cfg.TRADE_MODE} DATA_FEED={_cfg.DATA_FEED} WORKING_PRICE={_cfg.WORKING_PRICE}")
     elif cmd == "포지션":
 
         tr = _hooks.get("tracker_ref")

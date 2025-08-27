@@ -31,8 +31,7 @@ async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
             lk = bx.create_listen_key()
             print(f"[USER_WS] listenKey={lk[:8]}… created")
             keep = asyncio.create_task(keepalive_loop(bx, lk, cfg.LISTENKEY_KEEPALIVE_SEC))
-            url = f"{bx.WS_USER_BASE}/{lk}"
-            async with bx.ws_connect(url) as ws:
+            async with bx.ws_connect_user(f"/{lk}") as ws:
                 print("[USER_WS] connected")
                 async for raw in ws:
                     msg = json.loads(raw)

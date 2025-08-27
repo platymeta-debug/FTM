@@ -20,10 +20,28 @@ class OrderRouter:
         self.cfg = cfg
         self.filters = filters
         self.bx = BinanceClient()
+        self.live_allowed = False
+
+    def allow_live(self):
+        self.live_allowed = True
+
+    def _live_guard(self, symbol: str, qty: float, price: float):
+        if self.cfg.TRADE_MODE != "live" or not self.cfg.LIVE_GUARD_ENABLE:
+            return True
+        if not self.live_allowed:
+            send_log("🚫 실매매 허용 플래그가 꺼져 있습니다.")
+            return False
+        notional = qty * price
+        if notional < self.cfg.LIVE_MIN_NOTIONAL_USDT:
+            send_log(f"❗ 최소 명목 미만: {symbol} {notional:.2f} USDT")
+            return False
+        return True
 
     def place_entry(self, symbol: str, dec: SizingDecision, mark_price: float):
         p, q = dec.sl, dec.qty
         entry_price = mark_price
+        if not self._live_guard(symbol, q, entry_price):
+            return None
         # limit 오더면 틱 오프셋 반영
         if dec.entry_type == "limit":
             tick = self.filters.tick_size(symbol)
@@ -60,11 +78,11 @@ class OrderRouter:
             if self.cfg.SL_ORDER=="market":
                 self.bx.new_order(symbol=symbol, side=reduce_side, type="STOP_MARKET",
                                   stopPrice=sl_price, reduceOnly=True,
-                                  workingType=self.cfg.WORKING_TYPE, newClientOrderId=_cid(symbol,"SL"))
+                                  workingType=self.cfg.WORKING_PRICE, newClientOrderId=_cid(symbol,"SL"))
             if self.cfg.TP_ORDER=="limit":
                 self.bx.new_order(symbol=symbol, side=reduce_side, type="TAKE_PROFIT",
-                                  price=tp_price, stopPrice=tp_price, timeInForce=self.cfg.TIME_IN_FORCE,
-                                  reduceOnly=True, workingType=self.cfg.WORKING_TYPE, newClientOrderId=_cid(symbol,"TP"))
+                                    price=tp_price, stopPrice=tp_price, timeInForce=self.cfg.TIME_IN_FORCE,
+                                    reduceOnly=True, workingType=self.cfg.WORKING_PRICE, newClientOrderId=_cid(symbol,"TP"))
             send_trade(f"📎 브래킷 설정: SL≈{sl_price}, TP≈{tp_price} (reduceOnly)")
         except Exception as e:
             send_log(f"⚠️ 브래킷 설정 실패: {e}")
