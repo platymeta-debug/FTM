@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
-import pandas as pd
 
+import pandas as pd
 
 # --- add_indicators 안전 임포트 ---
 try:  # pragma: no cover - 런타임 방어
@@ -26,14 +26,12 @@ except Exception:  # pragma: no cover
     from . import reasons
 
 
-
-
-    
 @dataclass
 class Contribution:
     name: str
     score: float
     text: str
+
 
 @dataclass
 class Snapshot:
@@ -45,25 +43,27 @@ class Snapshot:
     contribs: Dict[str, List[Contribution]]
     indicators: Dict[str, pd.DataFrame]
     rules: Dict[str, Any]
-    # 없을 수 있으니 기본 None
     plan: Optional[Dict[str, Any]] = None
 
-    # ✅ 과거 호환: snap.tfs
+    # ✅ 과거 코드 호환 (app.py에서 snap.tfs를 쓰는 부분)
     @property
     def tfs(self):
         return self.tf_scores
-
-    # ✅ 과거 호환: snap.scores
-    @property
-    def scores(self):
-        return self.tf_scores
-
 
     @property
     def scores(self):
         """과거 호환: snap.scores 사용 시 tf_scores 반환"""
         return self.tf_scores
 
+    @property
+    def mtf_summary(self) -> Dict[str, float]:
+        """멀티타임프레임 요약 점수 맵 반환."""
+        return self.tf_scores
+
+    @property
+    def mtf(self) -> Dict[str, float]:
+        """과거 호환: snap.mtf 사용 시 tf_scores 반환"""
+        return self.tf_scores
 
 
 
@@ -78,12 +78,6 @@ def _parse_tf_weights(s: str) -> Dict[str, float]:
         except ValueError:
             continue
     return out
-
-
-def _score_row(row: pd.Series) -> List[Contribution]:
-    c: List[Contribution] = []
-    rsi_v = float(row.get("rsi", 50.0))
-    c.append(Contribution("RSI(14)", rsi_v - 50, reasons.interpret_rsi(rsi_v)))
 
 
 def _score_row(row: pd.Series) -> List[Contribution]:
@@ -115,7 +109,7 @@ def _score_row(row: pd.Series) -> List[Contribution]:
 
     return c
 
-      
+
 def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], tf_weights: Dict[str, float]) -> Snapshot:
     tf_scores: Dict[str, float] = {}
     contribs: Dict[str, List[Contribution]] = {}
