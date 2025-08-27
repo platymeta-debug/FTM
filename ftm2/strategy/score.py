@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, List, Any, Optional
 
+
 import pandas as pd
 
 from ftm2.indicators.all import add_indicators
