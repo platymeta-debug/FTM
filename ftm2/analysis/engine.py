@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import pandas as pd
 import asyncio
 
-from ftm2.analysis.state import AnalysisSnapshot
+from ftm2.strategy.score import score_snapshot, _parse_tf_weights
 
 BOOT_LIMIT = 500  # 초기 캔들 개수 (필요시 .env로 빼도 됨)
 
@@ -51,50 +51,35 @@ def _need_more(df: pd.DataFrame, min_len: int = 200) -> bool:
 
 
 async def run_analysis_loop(cfg, symbols, market_cache, divergence, on_snapshot):
-    """
-    cfg.ANALYZE_INTERVAL_S 마다 스냅샷 생성.
-    market_cache: 심볼/TF별 df를 저장/업데이트하는 dict 같은 간단 캐시 객체면 충분.
-    """
-    tfs = [s.strip() for s in cfg.ANALYSIS_TF.split(",")]
+    """심볼별 멀티타임프레임 분석 루프."""
+    tfs = [s.strip() for s in cfg.ANALYSIS_TF.split(",") if s.strip()]
+    tf_weights = _parse_tf_weights(getattr(cfg, "TF_WEIGHTS", ""))
     from ftm2.exchange.binance_client import BinanceClient
 
     bx = BinanceClient()
 
-    # 1) 처음에 캔들 부트스트랩
+    # [ANCHOR:M6_ENGINE_BOOT] 최초 캔들 부트스트랩
     for sym in symbols:
-        market_cache.setdefault(sym, {})
-        for iv in tfs:
-            if _need_more(market_cache[sym].get(iv)):
-                boot = await bootstrap_candles(bx, sym, [iv])
-                market_cache[sym][iv] = boot[iv]
-                print(f"[ANALYSIS][BOOT] {sym} {iv} bars={len(boot[iv])}")
+        cache = market_cache.setdefault(sym, {})
+        for tf in tfs:
+            df = cache.get(tf)
+            if _need_more(df):
+                boot = await bootstrap_candles(bx, sym, [tf])
+                cache[tf] = boot[tf]
+                print(f"[ANALYSIS][BOOT] {sym} {tf} bars={len(boot[tf])}")
 
-    # 2) 루프: 매 주기 스냅샷
+    # [ANCHOR:M6_ENGINE_LOOP] 분석 루프
     while True:
         started = datetime.now(timezone.utc).timestamp()
         for sym in symbols:
-            from ftm2.indicators import add_indicators
-
-            iv_main = tfs[0]
-            df = market_cache[sym][iv_main].copy()
-
-            # 안전장치: 데이터가 너무 적으면 스킵하지 말고 재부트
-            if _need_more(df, 100):
-                boot = await bootstrap_candles(bx, sym, tfs)
-                for iv in tfs:
-                    market_cache[sym][iv] = boot[iv]
-                df = market_cache[sym][iv_main].copy()
-                print(f"[ANALYSIS][REBOOT] {sym} bars={len(df)}")
-
-            df = add_indicators(df)
-
-            from ftm2.strategy.score import score_snapshot as _score_snap
-
-            snap = _score_snap(sym, df, market_cache[sym], tfs)
-
+            cache = market_cache.setdefault(sym, {})
+            for tf in tfs:
+                if _need_more(cache.get(tf), 100):
+                    boot = await bootstrap_candles(bx, sym, [tf])
+                    cache[tf] = boot[tf]
+            snap = score_snapshot(sym, cache, tfs, tf_weights)
             bps = divergence.get_bps(sym)
             snap.rules["divergence_bps"] = bps
-
             await on_snapshot(sym, snap)
 
         elapsed = datetime.now(timezone.utc).timestamp() - started
