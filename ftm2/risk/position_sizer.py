@@ -1,7 +1,7 @@
 from decimal import Decimal
 
-from ..config.settings import load_env_chain
-from ..exchange.quantize import ExchangeFilters
+from ftm2.config.settings import load_env_chain
+from ftm2.exchange.quantize import ExchangeFilters
 
 CFG = load_env_chain()
 
