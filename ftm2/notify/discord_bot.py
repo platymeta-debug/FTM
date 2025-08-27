@@ -151,6 +151,7 @@ async def update_analysis(
     from ftm2.charts.registry import should_render
     from ftm2.charts.builder import render_analysis_charts
 
+
     if view is None:
         try:
             from ftm2.strategy.compat import to_viewdict  # type: ignore
@@ -180,6 +181,7 @@ async def update_analysis(
     if not ch:
         return
 
+
     ok, meta = should_render(_cfg, snapshot)
     if not ok:
         print(f"[CHART][SKIP] {symbol} {meta.get('reason','')}")
@@ -187,6 +189,7 @@ async def update_analysis(
         paths = render_analysis_charts(_cfg, snapshot, _cfg.CHART_DIR)
         if paths:
             print(f"[CHART][RENDER] {symbol} saved={paths}")
+
             ids = _analysis_cards.get(symbol, {})
             old_id = ids.get("chart")
             if old_id:
@@ -200,6 +203,7 @@ async def update_analysis(
             print(
                 f"[DISCORD][CHART][SEND] {symbol} msg_id={new_msg.id} paths={paths}"
             )
+
             ids["chart"] = new_msg.id
             _analysis_cards[symbol] = ids
             save_analysis_cards(_analysis_cards)
@@ -213,6 +217,7 @@ async def update_analysis(
     embed = build_analysis_embed(view, divergence_bps, interval_s)
     now_txt = time.strftime("%H:%M:%S", time.localtime())
     embed.set_footer(text=f"마지막 갱신 {now_txt} | 다음 갱신까지 {interval_s}s")
+
 
     ids = _analysis_cards.get(symbol, {})
     text_id = ids.get("text")
@@ -230,6 +235,7 @@ async def update_analysis(
         ids["text"] = msg.id
         _analysis_cards[symbol] = ids
         save_analysis_cards(_analysis_cards)
+
 
 async def _resolve_guild_and_channels(client: discord.Client):
     global _ch_logs, _ch_trades, _ch_signals

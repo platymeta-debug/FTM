@@ -16,6 +16,7 @@ def log_decision(trace: DecisionTrace):
         f"[DECISION][{trace.symbol}] dir={trace.direction} "
         f"score={trace.decision_score:+.1f} reasons={trace.reasons} gates={trace.gates}"
     )
+
     if "ENTER" in trace.reasons:
         send_signal(
             f"{trace.symbol} 진입 신호 → {trace.direction} / {trace.decision_score:+.1f}"
@@ -25,6 +26,7 @@ def log_decision(trace: DecisionTrace):
             f"{trace.symbol} 의도만: {trace.direction} / {trace.decision_score:+.1f} "
             f"/ 사유: {', '.join(trace.reasons)}"
         )
+
 
 def _cid(sym: str, side: str) -> str:
     return f"FTM2_{int(time.time()*1000)}_{sym}_{side}"
@@ -58,6 +60,7 @@ class OrderRouter:
         if notional < self.cfg.LIVE_MIN_NOTIONAL_USDT:
             if trace:
                 trace.reasons.append("below min notional")
+
             return False
         return True
 

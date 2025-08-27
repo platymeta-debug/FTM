@@ -25,6 +25,7 @@ def to_viewdict(snapshot) -> Dict[str, Any]:
     )
     data["tf_scores"] = tf_scores
 
+
     # expose both weighted decision score and raw total score
     decision = float(data.get("decision_score", data.get("total_score", 0.0)))
     decision = max(min(decision, 100.0), -100.0)
@@ -36,6 +37,7 @@ def to_viewdict(snapshot) -> Dict[str, Any]:
             total = 0.0
     data["decision_score"] = decision
     data["total_score"] = total
+
 
     if not data.get("trend_state"):
         indicators = data.get("indicators", {}) or {}
