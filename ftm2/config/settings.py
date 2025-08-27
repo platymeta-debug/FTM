@@ -57,10 +57,18 @@ class Settings(BaseModel):
     ANALYSIS_TF: str = os.getenv("ANALYSIS_TF", "1m,5m,1h")
     MAX_DIVERGENCE_BPS: int = int(os.getenv("MAX_DIVERGENCE_BPS", "15"))
     # [ANCHOR:M6_SETTINGS_CHART]
+    CHART_TFS: str = os.getenv("CHART_TFS", "15m,4h")
+    CHART_PRICE_OVERLAYS: str = os.getenv("CHART_PRICE_OVERLAYS", "ema50,ema200,bb20_2")
+    CHART_PANELS_15m: str = os.getenv("CHART_PANELS_15m", "price,RSI,ROTATE")
+    CHART_PANELS_4h: str = os.getenv("CHART_PANELS_4h", "price,ADXDI,ROTATE")
+    CHART_ROTATE_SET: str = os.getenv("CHART_ROTATE_SET", "CCI,OBV,KAMA")
+    CHART_ATTACH_MAX: int = int(os.getenv("CHART_ATTACH_MAX", "4"))
+    CHART_ZOOM_LAST_N: int = int(os.getenv("CHART_ZOOM_LAST_N", "250"))
+
     CHART_MODE: str = os.getenv("CHART_MODE", "overwrite")
     CHART_DIR: str = os.getenv("CHART_DIR", "storage/charts")
     CHART_KEEP_PER_SYMBOL: int = int(os.getenv("CHART_KEEP_PER_SYMBOL", "10"))
-    CHART_MIN_INTERVAL_S: int = int(os.getenv("CHART_MIN_INTERVAL_S", "60"))
+    CHART_MIN_INTERVAL_S: int = int(os.getenv("CHART_MIN_INTERVAL_S", "120"))
     CHART_MIN_SCORE_DELTA: float = float(os.getenv("CHART_MIN_SCORE_DELTA", "2.0"))
     CHART_FORCE_N_CYCLES: int = int(os.getenv("CHART_FORCE_N_CYCLES", "10"))
     # 민감키는 import 시점 os.getenv 사용을 피한다
