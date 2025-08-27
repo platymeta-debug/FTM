@@ -35,7 +35,9 @@ class Settings(BaseModel):
     CHART_KEEP_PER_SYMBOL: int = int(os.getenv("CHART_KEEP_PER_SYMBOL", "10"))
     CHART_MIN_INTERVAL_S: int = int(os.getenv("CHART_MIN_INTERVAL_S", "120"))
     CHART_MIN_SCORE_DELTA: float = float(os.getenv("CHART_MIN_SCORE_DELTA", "2.0"))
+    CHART_MIN_DIVERGENCE_BPS: float = float(os.getenv("CHART_MIN_DIVERGENCE_BPS", "2.0"))
     CHART_FORCE_N_CYCLES: int = int(os.getenv("CHART_FORCE_N_CYCLES", "10"))
+    CHART_FORCE_FIRST_RENDER: bool = os.getenv("CHART_FORCE_FIRST_RENDER", "false").lower() == "true"
     # 민감키는 import 시점 os.getenv 사용을 피한다
     BINANCE_API_KEY: str | None = None
     BINANCE_API_SECRET: str | None = None
@@ -122,6 +124,7 @@ class Settings(BaseModel):
     DISCORD_PREFIX: str = "!"
     DISCORD_TEST_ON_BOOT: bool = True
     DISCORD_UPDATE_INTERVAL_S: int = 5
+    TRADE_HEARTBEAT_S: int = int(os.getenv("TRADE_HEARTBEAT_S", "30"))
     PNL_CHANGE_BPS: int = int(os.getenv("PNL_CHANGE_BPS", "5"))
     EMBED_DECIMALS_PRICE: int = int(os.getenv("EMBED_DECIMALS_PRICE", "2"))
     EMBED_DECIMALS_QTY: int = int(os.getenv("EMBED_DECIMALS_QTY", "6"))

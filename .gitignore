@@ -1,3 +1,4 @@
 *.env
 token.env
 __pycache__/
+storage/analysis_cards.json

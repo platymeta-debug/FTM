@@ -1,6 +1,6 @@
 # [ANCHOR:M5_USER_STREAM]
 import asyncio, json, time
-from ftm2.notify.discord_bot import send_log, edit_trade_card
+from ftm2.notify.discord_bot import edit_trade_card
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.exchange.binance_client import BinanceClient
 
