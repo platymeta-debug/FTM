@@ -53,6 +53,15 @@ def add_indicators(
     minus_di = 100 * (pd.Series(minus_dm, index=df.index).rolling(adx_len).sum() / tr_n)
     dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)
     df["adx"] = dx.rolling(adx_len).mean()
+    df["plus_di"] = plus_di
+    df["minus_di"] = minus_di
+
+    # Bollinger Bands
+    bb_mid = close.rolling(20).mean()
+    bb_std = close.rolling(20).std()
+    df["bb_mid"] = bb_mid
+    df["bb_up"] = bb_mid + 2 * bb_std
+    df["bb_dn"] = bb_mid - 2 * bb_std
 
     # CCI
     tp = (high + low + close) / 3.0
