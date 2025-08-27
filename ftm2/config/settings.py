@@ -1,12 +1,49 @@
 from pydantic import BaseModel
 import os
 from pathlib import Path
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
+
+PROTECT_KEYS = {"BINANCE_API_KEY", "BINANCE_API_SECRET", "DISCORD_TOKEN"}
+
+def _norm_key(k: str) -> str:
+    return k.lstrip("\ufeff").strip() if k else k
+
+def _apply_env_from(p: Path) -> bool:
+    if not p.exists():
+        return False
+    data = dotenv_values(p)
+    ok = False
+    for k, v in data.items():
+        nk = _norm_key(k)
+        if nk in PROTECT_KEYS and (v is None or v == ""):
+            continue
+        if v is not None:
+            os.environ[nk] = v
+            ok = True
+    return ok
+
+ENV_FILES_ORDER = [
+    "token.env", ".env", ".env.strategy", ".env.risk", ".env.trade", ".env.notify"
+]
+
+def _load_env_series(root: Path, profile: str | None):
+    loaded = []
+    for f in ENV_FILES_ORDER:
+        p = root / f
+        if _apply_env_from(p):
+            loaded.append(str(p))
+        if profile and f.startswith(".env"):
+            pp = root / f"{f}.{profile}"
+            if _apply_env_from(pp):
+                loaded.append(str(pp))
+    print(f"[ENV] loaded={len(loaded)} files={loaded}")
+    return loaded
 
 class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # testnet | live
-    BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
-    BINANCE_API_SECRET: str = os.getenv("BINANCE_API_SECRET", "")
+    # 민감키는 import 시점 os.getenv 사용을 피한다
+    BINANCE_API_KEY: str | None = None
+    BINANCE_API_SECRET: str | None = None
     RECV_WINDOW_MS: int = int(os.getenv("RECV_WINDOW_MS", "5000"))
     HTTP_TIMEOUT_S: float = float(os.getenv("HTTP_TIMEOUT_S", "5"))
 
@@ -18,6 +55,8 @@ class Settings(BaseModel):
     CORR_LOOKBACK: int = int(os.getenv("CORR_LOOKBACK", "240"))
 
     LEVERAGE: int = int(os.getenv("LEVERAGE", "5"))
+    MARGIN_TYPE: str = os.getenv("MARGIN_TYPE", "ISOLATED")
+    HEDGE_MODE: bool = os.getenv("HEDGE_MODE", "false").lower() == "true"
     RISK_MODE: str = os.getenv("RISK_MODE", "atr_unit")
     RISK_TARGET_USDT: float = float(os.getenv("RISK_TARGET_USDT", "30"))
     ATR_LOOKBACK: int = int(os.getenv("ATR_LOOKBACK", "14"))
@@ -25,6 +64,8 @@ class Settings(BaseModel):
     SL_MULT: float = float(os.getenv("SL_MULT", "1.5"))
     TP_MULT: float = float(os.getenv("TP_MULT", "3.0"))
     MAX_POS_PER_SIDE: int = int(os.getenv("MAX_POS_PER_SIDE", "1"))
+    MAX_DAILY_LOSS_USDT: float = float(os.getenv("MAX_DAILY_LOSS_USDT", "200"))
+    MAX_OPEN_ORDERS: int = int(os.getenv("MAX_OPEN_ORDERS", "10"))
 
     # --- Indicator lengths/params ---
     EMA_FAST: int = int(os.getenv("EMA_FAST", "20"))
@@ -62,6 +103,7 @@ class Settings(BaseModel):
     ENTRY_SCORE: int = int(os.getenv("ENTRY_SCORE", "70"))
     EXIT_SCORE: int = int(os.getenv("EXIT_SCORE", "50"))
     OPPOSITE_MAX: int = int(os.getenv("OPPOSITE_MAX", "40"))
+    COOLDOWN_S: int = int(os.getenv("COOLDOWN_S", "15"))
 
     # --- MTF (multi-timeframe) ---
     MTF_USE: bool = os.getenv("MTF_USE", "true").lower() == "true"
@@ -69,18 +111,53 @@ class Settings(BaseModel):
     MTF_CONFLUENCE_BOOST: float = float(os.getenv("MTF_CONFLUENCE_BOOST", "1.08"))
     MTF_CONTRA_DAMP: float = float(os.getenv("MTF_CONTRA_DAMP", "0.88"))
 
-    DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
-    DISCORD_CHANNEL_SIGNALS: int = int(os.getenv("DISCORD_CHANNEL_SIGNALS", "0"))
-    DISCORD_CHANNEL_TRADES: int = int(os.getenv("DISCORD_CHANNEL_TRADES", "0"))
-    DISCORD_CHANNEL_LOGS: int = int(os.getenv("DISCORD_CHANNEL_LOGS", "0"))
-    DISCORD_UPDATE_INTERVAL_S: float = float(os.getenv("DISCORD_UPDATE_INTERVAL_S", "5"))
+    # --- Discord (KR only) ---
+    DISCORD_TOKEN: str | None = None
+    DISCORD_GUILD_ID: int | None = int(os.getenv("DISCORD_GUILD_ID", "0")) or None
+    DISCORD_CHANNEL_SIGNALS: int | None = int(os.getenv("DISCORD_CHANNEL_SIGNALS", "0")) or None
+    DISCORD_CHANNEL_TRADES: int | None = int(os.getenv("DISCORD_CHANNEL_TRADES", "0")) or None
+    DISCORD_CHANNEL_LOGS: int | None = int(os.getenv("DISCORD_CHANNEL_LOGS", "0")) or None
+    DISCORD_PREFIX: str = os.getenv("DISCORD_PREFIX", "!")
+    DISCORD_TEST_ON_BOOT: bool = os.getenv("DISCORD_TEST_ON_BOOT","true").lower()=="true"
+    DISCORD_UPDATE_INTERVAL_S: int = int(os.getenv("DISCORD_UPDATE_INTERVAL_S","5"))
+
+    # --- 진입/라우팅 ---
+    ENTRY_ORDER: str = os.getenv("ENTRY_ORDER", "market")
+    LIMIT_OFFSET_TICKS: int = int(os.getenv("LIMIT_OFFSET_TICKS", "2"))
+    BRACKET_MODE: str = os.getenv("BRACKET_MODE", "reduce")
+    TP_ORDER: str = os.getenv("TP_ORDER", "limit")
+    SL_ORDER: str = os.getenv("SL_ORDER", "market")
+    WORKING_TYPE: str = os.getenv("WORKING_TYPE", "MARK_PRICE")
+    POST_ONLY: bool = os.getenv("POST_ONLY", "false").lower() == "true"
+    TIME_IN_FORCE: str = os.getenv("TIME_IN_FORCE", "GTC")
+    MAX_SLIPPAGE_BPS: int = int(os.getenv("MAX_SLIPPAGE_BPS", "10"))
+    RETRY_MAX: int = int(os.getenv("RETRY_MAX", "3"))
+    BACKOFF_429_MS: int = int(os.getenv("BACKOFF_429_MS", "800"))
+    BACKOFF_NET_MS: int = int(os.getenv("BACKOFF_NET_MS", "500"))
+    KILL_SWITCH_ON: bool = os.getenv("KILL_SWITCH_ON", "true").lower() == "true"
+
+    # --- 점수 기반 "비율적" 포지션/추가진입 ---
+    TIER_BINS: list[str] = os.getenv("TIER_BINS", "60,70,80,90").split(",")
+    TIER_WEIGHTS: list[str] = os.getenv("TIER_WEIGHTS", "0.5,1.0,1.5,2.0").split(",")
+    SCALE_IN_MAX_ADDS: int = int(os.getenv("SCALE_IN_MAX_ADDS", "2"))
+    SCALE_IN_STEP_ATR: float = float(os.getenv("SCALE_IN_STEP_ATR", "0.8"))
+    PULLBACK_ADD_ATR: float = float(os.getenv("PULLBACK_ADD_ATR", "0.7"))
+    DCA_USE_PULLBACK: bool = os.getenv("DCA_USE_PULLBACK", "true").lower() == "true"
+    TRAIL_START_R: float = float(os.getenv("TRAIL_START_R", "1.5"))
+    TRAIL_STEP_R: float = float(os.getenv("TRAIL_STEP_R", "0.5"))
+    TRAIL_BACK_R: float = float(os.getenv("TRAIL_BACK_R", "0.8"))
     
 def load_env_chain() -> Settings:
-    # 리포 루트에서 token.env → .env 순서로 로드(.env가 덮어씀)
-    root = Path(__file__).resolve().parents[2]  # .../FTM
-    load_dotenv(root / "token.env", override=False)
-    load_dotenv(root / ".env", override=True)
-    # 실행 디렉터리에 같은 이름의 파일이 있으면 추가로 로드(옵션)
-    load_dotenv("token.env", override=False)
-    load_dotenv(".env", override=True)
-    return Settings()
+    root = Path(__file__).resolve().parents[2]
+    profile = os.getenv("ENV_PROFILE", None)
+    _load_env_series(root, profile)
+    _load_env_series(Path.cwd(), profile)
+    s = Settings()
+    for k in ("BINANCE_API_KEY","BINANCE_API_SECRET","DISCORD_TOKEN"):
+        v = os.getenv(k)
+        if v is not None and v != "":
+            setattr(s, k, v)
+    ak = s.BINANCE_API_KEY or ""
+    dt = s.DISCORD_TOKEN or ""
+    print(f"[ENV][CHK] BINANCE_API_KEY={(ak[:4]+'…') if ak else 'EMPTY'}  DISCORD_TOKEN={(dt[:6]+'…') if dt else 'EMPTY'}")
+    return s

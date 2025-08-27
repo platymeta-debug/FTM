@@ -11,11 +11,18 @@ from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
 from ftm2.exchange.streams_market import market_stream
 from ftm2.exchange.streams_user import user_stream
+from ftm2.trade.position_sizer import sizing_decision
+from ftm2.trade.order_router import OrderRouter
+from ftm2.risk.guardrails import GuardRails
+from ftm2.notify.discord_bot import start_notifier, register_hooks
 
 
 CFG = load_env_chain()
 
 BUFFERS: dict[str, pd.DataFrame] = {}
+ROUTER: OrderRouter | None = None
+GUARD: GuardRails | None = None
+BX: BinanceClient | None = None
 
 
 
@@ -88,6 +95,18 @@ async def on_market(msg):
         mtf_ctx = _mtf_context(df, CFG)
         L,S,is_trend = score_row(last, CFG, mtf_ctx)
         print(f"[SCORE][{sym}] close={last['close']:.2f} | Long={L} Short={S} | ADX={last['adx']:.1f} RSI={last['rsi']:.1f} Z={last['z']:.2f} MTF={mtf_ctx and 'ON' or 'OFF'} TREND={is_trend}")
+        # --- 라우팅: 임계값/대칭/쿨다운/데일리컷 체크 후 진입 ---
+        if ROUTER and GUARD and BX:
+            side = "LONG" if L>=S else "SHORT"
+            sc = L if side=="LONG" else S
+            sc_opp = S if side=="LONG" else L
+            if sc >= CFG.ENTRY_SCORE and sc_opp <= CFG.OPPOSITE_MAX and GUARD.cooldown_ok(sym) and GUARD.daily_ok():
+                dec = sizing_decision(sym, side, L, S, last['close'], last['atr'], BX.filters,
+                                      pos_state=None, cfg=CFG, is_trend=is_trend,
+                                      mtf_bias=(1 if (mtf_ctx and True) else 0))
+                if dec and dec.qty>0:
+                    ROUTER.place_entry(sym, dec, mark_price=last['close'])
+                    GUARD.arm_cooldown(sym)
 
 
 async def on_user(msg):
@@ -103,6 +122,13 @@ async def main():
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
+    # --- Discord notifier 시작 (비동기) ---
+    asyncio.create_task(start_notifier(CFG))  # on_ready에서 부팅 메시지 보냄
+    # 라우터/가드 초기화
+    global ROUTER, GUARD, BX
+    ROUTER = OrderRouter(CFG, bx.filters)
+    GUARD = GuardRails(CFG)
+    BX = bx
 
     # 동시에 WS 시작
     tasks = [
