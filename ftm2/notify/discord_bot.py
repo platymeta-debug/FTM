@@ -2,6 +2,9 @@
 import asyncio, os, traceback, time
 from typing import Optional
 import discord
+from ftm2.charts.registry import render_ready
+from ftm2.signals.dedupe import should_emit
+from ftm2.config.settings import load_env_chain
 from ftm2.notify.discord_views import build_trade_embed
 from ftm2.notify.analysis_views import build_analysis_embed
 from ftm2.storage.persistence import load_trade_cards, save_trade_cards
@@ -28,6 +31,7 @@ _hooks = {
 
 CSV = None
 LEDGER = None
+SETTINGS = load_env_chain()
 
 
 def register_hooks(**kwargs):
@@ -48,6 +52,43 @@ def TRACKER_REF():
 def send_log(text: str, embed=None):    _send_queue.put_nowait(("logs", text, embed))
 def send_trade(text: str, embed=None):  _send_queue.put_nowait(("trades", text, embed))
 def send_signal(text: str, embed=None): _send_queue.put_nowait(("signals", text, embed))
+
+
+async def send_signal_to_discord(sym: str, side: str, score: float, reasons: list[str], img_path: str | None = None):
+    text = f"{sym} {side} score={score:.1f} reasons={', '.join(reasons or [])}"
+    try:
+        if _ch_signals:
+            files = [discord.File(img_path)] if img_path and render_ready(img_path) else None
+            await _ch_signals.send(content=f"📡 {text}", files=files)
+        else:
+            print(f"[SIGNAL][DRY] {text}")
+    except Exception:
+        traceback.print_exc()
+
+
+async def publish_signal(sym: str, side: str, score: float, reasons: list[str], candle_open_ts: int, img_path: str | None = None):
+    allow_intent_only = getattr(SETTINGS, "ALLOW_INTENT_ONLY", False)
+    min_reason_cnt = getattr(SETTINGS, "MIN_REASON_COUNT", 1)
+    if not allow_intent_only and reasons == ["INTENT"]:
+        return
+    if reasons and len(reasons) < max(min_reason_cnt, 1):
+        return
+
+    emit = should_emit(
+        sym,
+        side,
+        score,
+        reasons,
+        candle_open_ts,
+        enter_th=getattr(SETTINGS, "ENTER_TH", 60),
+        cooldown_sec=getattr(SETTINGS, "COOLDOWN_SEC", 300),
+        score_bucket=getattr(SETTINGS, "SCORE_BUCKET", 5),
+        edge_trigger=getattr(SETTINGS, "EDGE_TRIGGER", True),
+    )
+    if not emit:
+        return
+
+    await send_signal_to_discord(sym, side, score, reasons, img_path if img_path and render_ready(img_path) else None)
 
 async def _sender_loop():
     global _ch_logs, _ch_trades, _ch_signals
@@ -182,9 +223,9 @@ async def update_analysis(
         return
 
 
-    ok, meta = should_render(_cfg, snapshot)
-    if not ok:
-        print(f"[CHART][SKIP] {symbol} {meta.get('reason','')}")
+    fp = getattr(snapshot, "fingerprint", None)
+    if not should_render(symbol, fp):
+        print(f"[CHART][SKIP] {symbol}")
     else:
         paths = render_analysis_charts(_cfg, snapshot, _cfg.CHART_DIR)
         if paths:
