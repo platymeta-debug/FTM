@@ -56,6 +56,13 @@ class Settings(BaseModel):
     ANALYZE_INTERVAL_S: int = int(os.getenv("ANALYZE_INTERVAL_S", "30"))
     ANALYSIS_TF: str = os.getenv("ANALYSIS_TF", "1m,5m,1h")
     MAX_DIVERGENCE_BPS: int = int(os.getenv("MAX_DIVERGENCE_BPS", "15"))
+    # [ANCHOR:M6_SETTINGS_CHART]
+    CHART_MODE: str = os.getenv("CHART_MODE", "overwrite")
+    CHART_DIR: str = os.getenv("CHART_DIR", "storage/charts")
+    CHART_KEEP_PER_SYMBOL: int = int(os.getenv("CHART_KEEP_PER_SYMBOL", "10"))
+    CHART_MIN_INTERVAL_S: int = int(os.getenv("CHART_MIN_INTERVAL_S", "60"))
+    CHART_MIN_SCORE_DELTA: float = float(os.getenv("CHART_MIN_SCORE_DELTA", "2.0"))
+    CHART_FORCE_N_CYCLES: int = int(os.getenv("CHART_FORCE_N_CYCLES", "10"))
     # 민감키는 import 시점 os.getenv 사용을 피한다
     BINANCE_API_KEY: str | None = None
     BINANCE_API_SECRET: str | None = None
