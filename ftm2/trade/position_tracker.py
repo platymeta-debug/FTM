@@ -45,6 +45,7 @@ class PositionTracker:
         self._disabled_edit = False
         self._last_upnl: Dict[str, float] = {}
 
+
     def key(self, symbol: str, side: str) -> str: return f"{symbol}:{side}"
 
     def set_snapshot(self, symbol: str, side: str, qty: float, entry: float,
@@ -128,6 +129,7 @@ class PositionTracker:
         denom = max(abs(ps.initial_margin), 1e-9) if ps else 1.0
         delta_bps = abs(cur - last) / denom * 1e4
         return delta_bps >= pnl_change_bps
+
 
     def disable_edits(self, b: bool): self._disabled_edit = b
     def edits_disabled(self) -> bool: return self._disabled_edit

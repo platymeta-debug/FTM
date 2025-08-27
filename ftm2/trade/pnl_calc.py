@@ -7,6 +7,7 @@ def upnl_usdm(entry: float, mark: float, qty: float, side: str, contract_size: f
     return ((mark - entry) if side=="LONG" else (entry - mark)) * qty * contract_size
 
 
+
 def initial_margin(entry: float, qty: float, lev: float) -> float:
     if entry <= 0 or qty == 0 or lev <= 0: return 0.0
     return abs(entry * qty) / lev

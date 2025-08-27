@@ -125,6 +125,7 @@ async def main():
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
+
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX
     ROUTER = OrderRouter(CFG, bx.filters)
@@ -141,6 +142,7 @@ async def main():
     # 동시에 WS 시작
     tasks = [
         asyncio.create_task(start_notifier(CFG)),
+
         asyncio.create_task(streams_market.market_stream(CFG.SYMBOLS, CFG.INTERVAL, on_market)),
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),

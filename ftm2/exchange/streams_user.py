@@ -47,6 +47,7 @@ async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
             await asyncio.sleep(1.0)
 
 async def on_user_event(evt, bx: BinanceClient, cfg):
+
     et = evt.get("e")
     if et == "ORDER_TRADE_UPDATE":
         x = evt.get("o", {})

@@ -11,6 +11,7 @@ _cfg = None
 _client: Optional[discord.Client] = None
 _ch_logs = _ch_trades = _ch_signals = None
 
+
 # 외부에서 주입할 훅(한국어 명령용)
 _hooks = {
     "force_flat": None,   # def func(symbol:str) -> str
@@ -28,6 +29,13 @@ def register_hooks(**kwargs):
 
 def register_tracker(tracker: PositionTracker):
     _hooks["tracker_ref"] = tracker
+
+def inject_tracker(tracker: PositionTracker):
+    global _tracker_ref
+    _tracker_ref = tracker
+
+def TRACKER_REF():
+    return _tracker_ref
 
 # 동기 호출 가능: 내부 큐에 적재
 def send_log(text: str):    _send_queue.put_nowait(("logs", text))
@@ -61,16 +69,20 @@ def _load_persist(tracker: PositionTracker):
     _persist_loaded = True
 
 
+
 async def ensure_trade_card(symbol: str, tracker: PositionTracker, cfg):
     global _ch_trades
     if not _ch_trades: return None
+
     _load_persist(tracker)
+
     if symbol in tracker.msg_ids:
         try:
             msg = await _ch_trades.fetch_message(tracker.msg_ids[symbol])
             return msg
         except:
             pass
+
     ps = tracker.get_symbol_view(symbol)
     tracker.recompute_totals()
     emb = build_trade_embed(cfg, symbol, ps, tracker.account)
@@ -88,6 +100,7 @@ async def edit_trade_card(symbol: str, tracker: PositionTracker, cfg, force: boo
         return
     if not force and not tracker.should_edit(symbol, cfg.PNL_CHANGE_BPS):
         return
+
 
     msg = await ensure_trade_card(symbol, tracker, cfg)
     if not msg: return
@@ -168,6 +181,7 @@ async def _handle_message(msg: discord.Message):
         text = f(sym) if f else f"{sym} 신호 훅 미연결"
         await msg.channel.send(f"📡 {text}")
     elif cmd == "포지션":
+
         tr = _hooks.get("tracker_ref")
         if not tr:
             await msg.channel.send("트래커가 아직 연결되지 않았습니다."); return
