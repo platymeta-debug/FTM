@@ -95,8 +95,9 @@ async def start_notifier(cfg):
     _cfg = cfg
     # 송신 루프는 항상 가동 (토큰 없어도 콘솔 출력)
     asyncio.create_task(_sender_loop())
-    if not cfg.DISCORD_TOKEN:
-        print("[DISCORD] 토큰 없음. 콘솔 로그만 출력합니다.")
+    token = (cfg.DISCORD_TOKEN or os.getenv("DISCORD_TOKEN") or "").strip()
+    if not token:
+        print("[DISCORD] 토큰 없음. 콘솔 로그만 출력합니다. (token.env 의 DISCORD_TOKEN 키를 확인하세요)")
         return
 
     intents = discord.Intents.default()
@@ -112,7 +113,8 @@ async def start_notifier(cfg):
         await _handle_message(message)
 
     try:
-        await _client.start(cfg.DISCORD_TOKEN)
+        print(f"[DISCORD] 토큰 감지: {token[:6]}… (길이={len(token)})")
+        await _client.start(token)
     except Exception:
         traceback.print_exc()
 
