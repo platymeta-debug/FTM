@@ -1,16 +1,30 @@
-from time import time
+# [ANCHOR:GUARDRAILS]
+from __future__ import annotations
+import time
 
+class GuardRails:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.cooldowns = {}           # symbol->ts
+        self.daily_loss = 0.0         # 누적 실현손익 추적은 별도에서 주입
+        self.kill_switch = cfg.KILL_SWITCH_ON
 
-class Guardrails:
-    """Basic placeholders for risk checks and cooldowns."""
+    def set_realized_pnl(self, pnl: float):
+        self.daily_loss = -min(0.0, pnl) * 1.0
 
-    def __init__(self, cooldown_s: int = 15):
-        self.cooldown_s = cooldown_s
-        self._last_ts = 0.0
+    def cooldown_ok(self, symbol: str) -> bool:
+        now = time.time()
+        ts = self.cooldowns.get(symbol, 0)
+        return (now - ts) >= self.cfg.COOLDOWN_S
 
-    def allow(self) -> bool:
-        now = time()
-        if now - self._last_ts >= self.cooldown_s:
-            self._last_ts = now
-            return True
-        return False
+    def arm_cooldown(self, symbol: str):
+        self.cooldowns[symbol] = time.time()
+
+    def daily_ok(self) -> bool:
+        if not self.cfg.KILL_SWITCH_ON: return True
+        return self.daily_loss < self.cfg.MAX_DAILY_LOSS_USDT
+
+    def slippage_ok(self, ref_price: float, exec_price: float) -> bool:
+        if ref_price<=0: return True
+        bps = abs(exec_price - ref_price)/ref_price*10000
+        return bps <= self.cfg.MAX_SLIPPAGE_BPS
