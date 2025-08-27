@@ -3,7 +3,7 @@ from __future__ import annotations
 import time, math
 from typing import Literal, Optional
 from ftm2.exchange.binance_client import BinanceClient
-from ftm2.notify.discord_bot import send_log, send_trade_update
+from ftm2.notify.discord_bot import send_log, send_trade
 from ftm2.trade.position_sizer import SizingDecision
 from ftm2.exchange.quantize import ExchangeFilters
 
@@ -37,7 +37,7 @@ class OrderRouter:
             params.update(price=q_price, timeInForce=self.cfg.TIME_IN_FORCE)
         try:
             od = self.bx.new_order(**params)
-            send_trade_update(f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {q_qty} / {dec.reason}")
+            send_trade(f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {q_qty} / {dec.reason}")
             return od
         except Exception as e:
             send_log(f"🚫 진입 주문 실패: {symbol} {e}")
@@ -58,7 +58,7 @@ class OrderRouter:
                 self.bx.new_order(symbol=symbol, side=reduce_side, type="TAKE_PROFIT",
                                   price=tp_price, stopPrice=tp_price, timeInForce=self.cfg.TIME_IN_FORCE,
                                   reduceOnly=True, workingType=self.cfg.WORKING_TYPE, newClientOrderId=_cid(symbol,"TP"))
-            send_trade_update(f"📎 브래킷 설정: SL≈{sl_price}, TP≈{tp_price} (reduceOnly)")
+            send_trade(f"📎 브래킷 설정: SL≈{sl_price}, TP≈{tp_price} (reduceOnly)")
         except Exception as e:
             send_log(f"⚠️ 브래킷 설정 실패: {e}")
 

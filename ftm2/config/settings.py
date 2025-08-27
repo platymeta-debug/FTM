@@ -93,13 +93,17 @@ class Settings(BaseModel):
     MTF_CONFLUENCE_BOOST: float = float(os.getenv("MTF_CONFLUENCE_BOOST", "1.08"))
     MTF_CONTRA_DAMP: float = float(os.getenv("MTF_CONTRA_DAMP", "0.88"))
 
-    DISCORD_TOKEN: str = os.getenv("DISCORD_TOKEN", "")
-    DISCORD_CHANNEL_SIGNALS: int = int(os.getenv("DISCORD_CHANNEL_SIGNALS", "0"))
-    DISCORD_CHANNEL_TRADES: int = int(os.getenv("DISCORD_CHANNEL_TRADES", "0"))
-    DISCORD_CHANNEL_LOGS: int = int(os.getenv("DISCORD_CHANNEL_LOGS", "0"))
-    DISCORD_UPDATE_INTERVAL_S: float = float(os.getenv("DISCORD_UPDATE_INTERVAL_S", "5"))
+
+    # --- Discord (KR only) ---
+    DISCORD_TOKEN: str | None = os.getenv("DISCORD_TOKEN")
+    DISCORD_GUILD_ID: int | None = int(os.getenv("DISCORD_GUILD_ID", "0")) or None
+    DISCORD_CHANNEL_SIGNALS: int | None = int(os.getenv("DISCORD_CHANNEL_SIGNALS", "0")) or None
+    DISCORD_CHANNEL_TRADES: int | None = int(os.getenv("DISCORD_CHANNEL_TRADES", "0")) or None
+    DISCORD_CHANNEL_LOGS: int | None = int(os.getenv("DISCORD_CHANNEL_LOGS", "0")) or None
     DISCORD_PREFIX: str = os.getenv("DISCORD_PREFIX", "!")
-    DISCORD_KR_ONLY: bool = True
+    DISCORD_TEST_ON_BOOT: bool = os.getenv("DISCORD_TEST_ON_BOOT","true").lower()=="true"
+    DISCORD_UPDATE_INTERVAL_S: int = int(os.getenv("DISCORD_UPDATE_INTERVAL_S","5"))
+
 
     # --- 진입/라우팅 ---
     ENTRY_ORDER: str = os.getenv("ENTRY_ORDER", "market")
