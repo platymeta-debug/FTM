@@ -3,6 +3,27 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv, dotenv_values
 
+
+PROTECT_KEYS = {"BINANCE_API_KEY", "BINANCE_API_SECRET", "DISCORD_TOKEN"}
+
+def _norm_key(k: str) -> str:
+    return k.lstrip("\ufeff").strip() if k else k
+
+def _apply_env_from(p: Path) -> bool:
+    if not p.exists():
+        return False
+    data = dotenv_values(p)
+    ok = False
+    for k, v in data.items():
+        nk = _norm_key(k)
+        if nk in PROTECT_KEYS and (v is None or v == ""):
+            continue
+        if v is not None:
+            os.environ[nk] = v
+            ok = True
+    return ok
+
+
 ENV_FILES_ORDER = [
     "token.env", ".env", ".env.strategy", ".env.risk", ".env.trade", ".env.notify"
 ]
@@ -11,21 +32,22 @@ def _load_env_series(root: Path, profile: str | None):
     loaded = []
     for f in ENV_FILES_ORDER:
         p = root / f
-        if p.exists():
-            load_dotenv(p, override=True)
+
+        if _apply_env_from(p):
             loaded.append(str(p))
         if profile and f.startswith(".env"):
             pp = root / f"{f}.{profile}"
-            if pp.exists():
-                load_dotenv(pp, override=True)
+            if _apply_env_from(pp):
+
                 loaded.append(str(pp))
     print(f"[ENV] loaded={len(loaded)} files={loaded}")
     return loaded
 
 class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # testnet | live
-    BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
-    BINANCE_API_SECRET: str = os.getenv("BINANCE_API_SECRET", "")
+    # 민감키는 import 시점 os.getenv 사용을 피한다
+    BINANCE_API_KEY: str | None = None
+    BINANCE_API_SECRET: str | None = None
     RECV_WINDOW_MS: int = int(os.getenv("RECV_WINDOW_MS", "5000"))
     HTTP_TIMEOUT_S: float = float(os.getenv("HTTP_TIMEOUT_S", "5"))
 
@@ -95,7 +117,7 @@ class Settings(BaseModel):
 
 
     # --- Discord (KR only) ---
-    DISCORD_TOKEN: str | None = os.getenv("DISCORD_TOKEN")
+    DISCORD_TOKEN: str | None = None
     DISCORD_GUILD_ID: int | None = int(os.getenv("DISCORD_GUILD_ID", "0")) or None
     DISCORD_CHANNEL_SIGNALS: int | None = int(os.getenv("DISCORD_CHANNEL_SIGNALS", "0")) or None
     DISCORD_CHANNEL_TRADES: int | None = int(os.getenv("DISCORD_CHANNEL_TRADES", "0")) or None
@@ -136,5 +158,13 @@ def load_env_chain() -> Settings:
     profile = os.getenv("ENV_PROFILE", None)
     _load_env_series(root, profile)
     _load_env_series(Path.cwd(), profile)
+    s = Settings()
+    for k in ("BINANCE_API_KEY","BINANCE_API_SECRET","DISCORD_TOKEN"):
+        v = os.getenv(k)
+        if v is not None and v != "":
+            setattr(s, k, v)
+    ak = s.BINANCE_API_KEY or ""
+    dt = s.DISCORD_TOKEN or ""
+    print(f"[ENV][CHK] BINANCE_API_KEY={(ak[:4]+'…') if ak else 'EMPTY'}  DISCORD_TOKEN={(dt[:6]+'…') if dt else 'EMPTY'}")
+    return s
 
-    return Settings()

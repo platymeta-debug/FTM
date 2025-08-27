@@ -83,6 +83,7 @@ async def _on_ready(client: discord.Client):
         send_log("FTM2 봇이 부팅되었습니다. (테스트 메시지)")
         send_log(f"환경: MODE={_cfg.MODE}, 심볼={_cfg.SYMBOLS}, 인터벌={_cfg.INTERVAL}, 프로파일={os.getenv('ENV_PROFILE','-')}")
 
+
 async def _handle_message(msg: discord.Message):
     if msg.author.bot: return
     if not msg.content.startswith(_cfg.DISCORD_PREFIX): return
@@ -132,9 +133,13 @@ async def start_notifier(cfg):
     _cfg = cfg
     # 송신 루프는 항상 가동 (토큰 없어도 콘솔 출력)
     asyncio.create_task(_sender_loop())
-    if not cfg.DISCORD_TOKEN:
+
+    token = (cfg.DISCORD_TOKEN or os.getenv("DISCORD_TOKEN") or "").strip()
+    if not token:
         print("[DISCORD] 토큰 없음. 콘솔 로그만 출력합니다.")
         return
+    print(f"[DISCORD] 토큰 감지: {token[:6]}… (길이={len(token)})")
+
 
     intents = discord.Intents.default()
     intents.message_content = True  # 포털에서 Message Content Intent 켜야 함
@@ -149,6 +154,7 @@ async def start_notifier(cfg):
         await _handle_message(message)
 
     try:
-        await _client.start(cfg.DISCORD_TOKEN)
+        await _client.start(token)
+
     except Exception:
         traceback.print_exc()
