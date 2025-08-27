@@ -6,6 +6,7 @@ from ftm2.indicators.core import add_indicators
 from ftm2.strategy.scorer import score_row
 from datetime import timezone
 
+
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
 from ftm2.exchange.streams_market import market_stream
