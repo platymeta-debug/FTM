@@ -9,12 +9,15 @@ from datetime import timezone
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
-from ftm2.exchange.streams_market import market_stream
+from ftm2.exchange import streams_market
 from ftm2.exchange.streams_user import user_stream
 from ftm2.trade.position_sizer import sizing_decision
 from ftm2.trade.order_router import OrderRouter
 from ftm2.risk.guardrails import GuardRails
-from ftm2.notify.discord_bot import start_notifier, register_hooks
+from ftm2.trade.position_tracker import PositionTracker
+from ftm2.reconcile.reconciler import resync_loop
+from ftm2.notify.discord_bot import start_notifier, register_hooks, register_tracker
+from ftm2.trade import order_router
 
 
 
@@ -108,11 +111,10 @@ async def on_market(msg):
                 if dec and dec.qty>0:
                     ROUTER.place_entry(sym, dec, mark_price=last['close'])
                     GUARD.arm_cooldown(sym)
-
-
-async def on_user(msg):
-    # TODO: 주문/체결/포지션 이벤트 라우팅 → position_tracker/discord
-    pass
+    elif st.endswith("@markPrice@1s"):
+        sym = data.get("s")
+        mark = float(data.get("p", 0) or 0)
+        await streams_market.on_mark_price(sym, mark, CFG)
 
 
 async def main():
@@ -123,20 +125,25 @@ async def main():
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
-    # --- Discord notifier 시작 (비동기) ---
-
-    asyncio.create_task(start_notifier(CFG))  # on_ready에서 부팅 메시지 보냄
-
-    # 라우터/가드 초기화
+    # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX
     ROUTER = OrderRouter(CFG, bx.filters)
     GUARD = GuardRails(CFG)
     BX = bx
+    tracker = PositionTracker()
+    register_tracker(tracker)
+    register_hooks(
+        close_all=lambda sym: order_router.close_position_all(sym),
+        get_status=lambda: f"심볼={CFG.SYMBOLS}, 모드={CFG.MODE}",
+    )
+    streams_market.TRACKER_REF = tracker
 
     # 동시에 WS 시작
     tasks = [
-        asyncio.create_task(market_stream(CFG.SYMBOLS, CFG.INTERVAL, on_market)),
-        asyncio.create_task(user_stream(on_user)),
+        asyncio.create_task(start_notifier(CFG)),
+        asyncio.create_task(streams_market.market_stream(CFG.SYMBOLS, CFG.INTERVAL, on_market)),
+        asyncio.create_task(user_stream(bx, tracker, CFG)),
+        asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
     smoke = int(os.getenv("SMOKE_SECONDS", "0"))
     if smoke > 0:

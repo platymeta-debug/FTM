@@ -1,8 +1,19 @@
 
 import asyncio, json, websockets
 from ftm2.config.settings import load_env_chain
+from ftm2.notify.discord_bot import edit_trade_card
+from ftm2.trade.position_tracker import PositionTracker
 CFG = load_env_chain()
 WS_BASE = "wss://fstream.binance.com" if CFG.MODE == "live" else "wss://fstream.binancefuture.com"
+
+TRACKER_REF: PositionTracker | None = None
+
+async def on_mark_price(symbol: str, mark: float, cfg):
+    global TRACKER_REF
+    if not TRACKER_REF: return
+    for side in ("LONG","SHORT"):
+        TRACKER_REF.update_mark(symbol, side, mark)
+    await edit_trade_card(symbol, TRACKER_REF, cfg, force=False)
 
 
 def kline_stream(symbol: str, interval: str) -> str:

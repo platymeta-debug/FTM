@@ -1,13 +1,15 @@
 # [ANCHOR:DISCORD_BOT]
-import asyncio, os, traceback
-from typing import Optional, Callable
+import asyncio, os, traceback, time
+from typing import Optional
 import discord
+from ftm2.notify.discord_views import build_trade_embed
+from ftm2.storage.persistence import load_trade_cards, save_trade_cards
+from ftm2.trade.position_tracker import PositionTracker
 
 _send_queue: "asyncio.Queue[tuple[str,str]]" = asyncio.Queue()
 _cfg = None
 _client: Optional[discord.Client] = None
 _ch_logs = _ch_trades = _ch_signals = None
-
 
 # 외부에서 주입할 훅(한국어 명령용)
 _hooks = {
@@ -15,10 +17,17 @@ _hooks = {
     "kill_switch": None,  # def func(on:bool) -> str
     "get_status": None,   # def func() -> str
     "get_signal": None,   # def func(symbol:str) -> str
+    "close_all": None,
+    "tracker_ref": None,
 }
 
+
 def register_hooks(**kwargs):
-    _hooks.update({k:v for k,v in kwargs.items() if k in _hooks})
+    _hooks.update({k: v for k, v in kwargs.items() if k in _hooks})
+
+
+def register_tracker(tracker: PositionTracker):
+    _hooks["tracker_ref"] = tracker
 
 # 동기 호출 가능: 내부 큐에 적재
 def send_log(text: str):    _send_queue.put_nowait(("logs", text))
@@ -37,6 +46,59 @@ async def _sender_loop():
                 print(f"[DISCORD][DRY] {chan}: {text}")  # 채널 미설정 시 콘솔로
         except Exception:
             traceback.print_exc()
+
+# [ANCHOR:M5_TRADE_CARD]
+_persist_loaded = False
+_last_edit_ts: dict[str, float] = {}
+
+
+def _load_persist(tracker: PositionTracker):
+    global _persist_loaded
+    if _persist_loaded: return
+    data = load_trade_cards()
+    if isinstance(data, dict):
+        tracker.msg_ids.update({k: int(v) for k, v in data.items() if str(v).isdigit()})
+    _persist_loaded = True
+
+
+async def ensure_trade_card(symbol: str, tracker: PositionTracker, cfg):
+    global _ch_trades
+    if not _ch_trades: return None
+    _load_persist(tracker)
+    if symbol in tracker.msg_ids:
+        try:
+            msg = await _ch_trades.fetch_message(tracker.msg_ids[symbol])
+            return msg
+        except:
+            pass
+    ps = tracker.get_symbol_view(symbol)
+    tracker.recompute_totals()
+    emb = build_trade_embed(cfg, symbol, ps, tracker.account)
+    msg = await _ch_trades.send(embed=emb)
+    tracker.msg_ids[symbol] = msg.id
+    save_trade_cards(tracker.msg_ids)
+    return msg
+
+
+async def edit_trade_card(symbol: str, tracker: PositionTracker, cfg, force: bool=False):
+    if tracker.edits_disabled(): return
+    now = time.time()
+    last = _last_edit_ts.get(symbol, 0)
+    if not force and (now - last) < cfg.DISCORD_UPDATE_INTERVAL_S:
+        return
+    if not force and not tracker.should_edit(symbol, cfg.PNL_CHANGE_BPS):
+        return
+
+    msg = await ensure_trade_card(symbol, tracker, cfg)
+    if not msg: return
+    ps = tracker.get_symbol_view(symbol)
+    tracker.recompute_totals()
+    emb = build_trade_embed(cfg, symbol, ps, tracker.account)
+    try:
+        await msg.edit(embed=emb)
+        _last_edit_ts[symbol] = now
+    except Exception as e:
+        print("[DISCORD][EDIT_ERR]", e)
 
 async def _resolve_guild_and_channels(client: discord.Client):
     global _ch_logs, _ch_trades, _ch_signals
@@ -95,11 +157,6 @@ async def _handle_message(msg: discord.Message):
         f = _hooks.get("get_status")
         text = f() if f else "상태 조회 훅이 아직 연결되지 않았습니다."
         await msg.channel.send(f"🧭 {text}")
-    elif cmd == "전량청산" and len(args)>=2:
-        sym = args[1].upper()
-        f = _hooks.get("force_flat")
-        text = f(sym) if f else f"{sym} 전량청산 훅 미연결"
-        await msg.channel.send(f"🔻 {text}")
     elif cmd == "킬스위치" and len(args)>=2:
         on = args[1] in ("켜","on","ON","true","TRUE")
         f = _hooks.get("kill_switch")
@@ -110,6 +167,27 @@ async def _handle_message(msg: discord.Message):
         f = _hooks.get("get_signal")
         text = f(sym) if f else f"{sym} 신호 훅 미연결"
         await msg.channel.send(f"📡 {text}")
+    elif cmd == "포지션":
+        tr = _hooks.get("tracker_ref")
+        if not tr:
+            await msg.channel.send("트래커가 아직 연결되지 않았습니다."); return
+        lines=[]
+        for k, ps in tr.pos.items():
+            if ps.qty==0: continue
+            lines.append(f"{ps.symbol} {ps.side} × {ps.qty:.6f} | 진입 {ps.entry_price:.2f} UPNL {ps.upnl:.2f} ROE {ps.roe:.2f}%")
+        await msg.channel.send("📊 현재 포지션\n" + ("\n".join(lines) if lines else "포지션 없음"))
+    elif cmd == "자본":
+        tr = _hooks.get("tracker_ref")
+        if not tr:
+            await msg.channel.send("트래커가 아직 연결되지 않았습니다."); return
+        tr.recompute_totals()
+        a = tr.account
+        await msg.channel.send(f"💼 총자본: {a.equity:.2f} USDT (지갑 {a.wallet_balance:.2f} / 가용 {a.available_balance:.2f} / UPNL {a.total_upnl:.2f})")
+    elif cmd == "청산" and len(args)>=2:
+        sym = args[1].upper()
+        f = _hooks.get("close_all")
+        text = f(sym) if f else "청산 라우터가 아직 연결되지 않았습니다."
+        await msg.channel.send(f"🔻 {text}")
     elif cmd == "로그테스트":
         send_log("이것은 로그 테스트입니다.")
         await msg.add_reaction("✅")
@@ -125,7 +203,7 @@ async def _handle_message(msg: discord.Message):
                                f"TRADES={_cfg.DISCORD_CHANNEL_TRADES}, "
                                f"SIGNALS={_cfg.DISCORD_CHANNEL_SIGNALS}")
     else:
-        await msg.channel.send("❓ 지원하지 않는 명령입니다. (상태, 전량청산 심볼, 킬스위치 켜|꺼, 신호 심볼, 로그테스트)")
+        await msg.channel.send("❓ 지원하지 않는 명령입니다. (상태, 포지션, 자본, 청산 심볼, 킬스위치 켜|꺼, 신호 심볼, 로그테스트)")
 
 async def start_notifier(cfg):
     """앱 루프 내에서 호출: 디스코드 클라이언트 + 송신 루프 실행"""
