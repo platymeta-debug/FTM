@@ -1,14 +1,14 @@
 {
   "BTCUSDT": {
-    "last_ts": 1756301357.4517777,
-    "last_fp": "debf3d1ac74bb79e3642887669050ef6ed5f0eaf",
-    "counter": 0,
-    "last_score": 22.328708243956985
+    "last_ts": 1756302649.1384885,
+    "last_fp": "d94bc727c9c3edeaea97cd25514064e5c04536ee",
+    "counter": 8,
+    "last_score": 44.06078454240996
   },
   "ETHUSDT": {
-    "last_ts": 1756295677.7713566,
-    "last_fp": "d6f1eeb1602a6dc502340b8ff3f593776e302533",
-    "counter": 6,
-    "last_score": 55.97470894635804
+    "last_ts": 1756302650.786682,
+    "last_fp": "cb16a2101f68ae778120e606624bf5ad855e0342",
+    "counter": 8,
+    "last_score": 72.92264182950399
   }
 }
