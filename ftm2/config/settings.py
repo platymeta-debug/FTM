@@ -2,47 +2,7 @@ from typing import Optional
 from pydantic import BaseModel
 import os
 from pathlib import Path
-from dotenv import load_dotenv, dotenv_values
-
-
-PROTECT_KEYS = {"BINANCE_API_KEY", "BINANCE_API_SECRET", "DISCORD_TOKEN"}
-
-def _norm_key(k: str) -> str:
-    return k.lstrip("\ufeff").strip() if k else k
-
-def _apply_env_from(p: Path) -> bool:
-    if not p.exists():
-        return False
-    data = dotenv_values(p)
-    ok = False
-    for k, v in data.items():
-        nk = _norm_key(k)
-        if nk in PROTECT_KEYS and (v is None or v == ""):
-            continue
-        if v is not None:
-            os.environ[nk] = v
-            ok = True
-    return ok
-
-
-ENV_FILES_ORDER = [
-    "token.env", ".env", ".env.strategy", ".env.risk", ".env.trade", ".env.notify"
-]
-
-def _load_env_series(root: Path, profile: str | None):
-    loaded = []
-    for f in ENV_FILES_ORDER:
-        p = root / f
-
-        if _apply_env_from(p):
-            loaded.append(str(p))
-        if profile and f.startswith(".env"):
-            pp = root / f"{f}.{profile}"
-            if _apply_env_from(pp):
-
-                loaded.append(str(pp))
-    print(f"[ENV] loaded={len(loaded)} files={loaded}")
-    return loaded
+from dotenv import load_dotenv
 
 class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # legacy field
@@ -55,6 +15,11 @@ class Settings(BaseModel):
     CONFIRM_TIMEOUT_S: int = int(os.getenv("CONFIRM_TIMEOUT_S", "15"))
     ANALYZE_INTERVAL_S: int = int(os.getenv("ANALYZE_INTERVAL_S", "30"))
     ANALYSIS_TF: str = os.getenv("ANALYSIS_TF", "1m,5m,1h")
+    TF_WEIGHTS: str = os.getenv("TF_WEIGHTS", "1m:0.7,5m:0.2,1h:0.1")
+    MTF_ALIGN_MIN: int = int(os.getenv("MTF_ALIGN_MIN", "2"))
+    ENTRY_TH: int = int(os.getenv("ENTRY_TH", "60"))
+    EXIT_TH: int = int(os.getenv("EXIT_TH", "40"))
+    COOLDOWN_S: int = int(os.getenv("COOLDOWN_S", "180"))
     MAX_DIVERGENCE_BPS: int = int(os.getenv("MAX_DIVERGENCE_BPS", "15"))
     # [ANCHOR:M6_SETTINGS_CHART]
     CHART_TFS: str = os.getenv("CHART_TFS", "15m,4h")
@@ -138,7 +103,6 @@ class Settings(BaseModel):
     ENTRY_SCORE: int = int(os.getenv("ENTRY_SCORE", "70"))
     EXIT_SCORE: int = int(os.getenv("EXIT_SCORE", "50"))
     OPPOSITE_MAX: int = int(os.getenv("OPPOSITE_MAX", "40"))
-    COOLDOWN_S: int = int(os.getenv("COOLDOWN_S", "15"))
 
     # --- MTF (multi-timeframe) ---
     MTF_USE: bool = os.getenv("MTF_USE", "true").lower() == "true"
@@ -205,36 +169,58 @@ class Settings(BaseModel):
     CSV_MARK_SNAPSHOT_SEC: int = int(os.getenv("CSV_MARK_SNAPSHOT_SEC", "0"))
     
 def load_env_chain() -> Settings:
-    root = Path(__file__).resolve().parents[2]
-    profile = os.getenv("ENV_PROFILE", None)
-    _load_env_series(root, profile)
-    _load_env_series(Path.cwd(), profile)
-    s = Settings()
-    for k in ("BINANCE_API_KEY","BINANCE_API_SECRET","DISCORD_TOKEN"):
-        v = os.getenv(k)
-        if v is not None and v != "":
-            setattr(s, k, v)
+    """
+    로드 순서 (나중에 로드한 값이 우선; override=True):
+    token.env → .env → .env.strategy → .env.risk → .env.trade → .env.notify → .env.local
+    """
+    ROOT = Path(__file__).resolve().parents[2]
 
-    for k in (
-        "DISCORD_GUILD_ID",
-        "DISCORD_CHANNEL_SIGNALS",
-        "DISCORD_CHANNEL_TRADES",
-        "DISCORD_CHANNEL_LOGS",
-        "DISCORD_CHANNEL_ANALYSIS_BTC",
-        "DISCORD_CHANNEL_ANALYSIS_ETH",
-    ):
+    candidates = [
+        ROOT / "token.env",
+        ROOT / ".env",
+        ROOT / ".env.strategy",
+        ROOT / ".env.risk",
+        ROOT / ".env.trade",
+        ROOT / ".env.notify",
+        ROOT / ".env.local",
+    ]
+
+    loaded, missing = [], []
+    for p in candidates:
+        if p.exists():
+            load_dotenv(dotenv_path=p, override=True)
+            loaded.append(str(p))
+        else:
+            missing.append(str(p))
+
+    print(f"[ENV] loaded={len(loaded)} files={loaded}")
+    if missing:
+        print(f"[ENV][MISS] {missing}")
+
+    field_values = {}
+    field_names = getattr(Settings, "model_fields", getattr(Settings, "__fields__", {}))
+    for k in field_names:
         v = os.getenv(k)
-        if v and v.strip().isdigit():
-            setattr(s, k, int(v.strip()))
-    s.DISCORD_PREFIX = os.getenv("DISCORD_PREFIX", s.DISCORD_PREFIX)
-    s.DISCORD_TEST_ON_BOOT = os.getenv("DISCORD_TEST_ON_BOOT", "true").lower() == "true"
-    try:
-        s.DISCORD_UPDATE_INTERVAL_S = int(os.getenv("DISCORD_UPDATE_INTERVAL_S", str(s.DISCORD_UPDATE_INTERVAL_S)))
-    except:
-        pass
-    ak = s.BINANCE_API_KEY or ""
-    dt = s.DISCORD_TOKEN or ""
-    print(f"[ENV][CHK] BINANCE_API_KEY={(ak[:4]+'…') if ak else 'EMPTY'}  DISCORD_TOKEN={(dt[:6]+'…') if dt else 'EMPTY'}")
-    print(f"[ENV][DISCORD] guild={s.DISCORD_GUILD_ID}  logs={s.DISCORD_CHANNEL_LOGS}  trades={s.DISCORD_CHANNEL_TRADES}  signals={s.DISCORD_CHANNEL_SIGNALS}")
+        if v is not None:
+            field_values[k] = v
+
+    s = Settings(**field_values)
+
+    print(
+        f"[ENV][DUMP] ANALYSIS_TF={s.ANALYSIS_TF}  TF_WEIGHTS={s.TF_WEIGHTS}  "
+        f"CHART_TFS={s.CHART_TFS}  CHART_MODE={s.CHART_MODE}"
+    )
+
+    for k in ["DISCORD_GUILD_ID", "DISCORD_CHANNEL_LOGS", "DISCORD_CHANNEL_TRADES",
+              "DISCORD_CHANNEL_SIGNALS", "DISCORD_CHANNEL_ANALYSIS_BTC", "DISCORD_CHANNEL_ANALYSIS_ETH",
+              "CHART_ATTACH_MAX", "CHART_KEEP_PER_SYMBOL", "CHART_MIN_INTERVAL_S",
+              "CHART_FORCE_N_CYCLES", "MTF_ALIGN_MIN", "ENTRY_TH", "EXIT_TH", "COOLDOWN_S"]:
+        v = os.getenv(k, None)
+        if v is not None:
+            try:
+                setattr(s, k, int(v))
+            except Exception:
+                pass
+
     return s
 

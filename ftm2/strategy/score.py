@@ -3,7 +3,8 @@ from __future__ import annotations
 """간단한 스냅샷 점수화 로직."""
 
 from dataclasses import dataclass
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
+
 
 import pandas as pd
 
@@ -28,11 +29,13 @@ class Snapshot:
     contribs: Dict[str, List[Contribution]]
     indicators: Dict[str, pd.DataFrame]
     rules: Dict[str, Any]
+    plan: Optional[Dict[str, Any]] = None
 
-    # ✅ 과거 코드 호환용 alias
+    # ✅ 과거 코드 호환 (app.py에서 snap.tfs를 쓰는 부분)
     @property
     def tfs(self):
         return self.tf_scores
+
 
 def _parse_tf_weights(s: str) -> Dict[str, float]:
     out: Dict[str, float] = {}
