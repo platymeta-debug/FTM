@@ -8,6 +8,8 @@ WS_BASE = "wss://fstream.binance.com" if CFG.MODE == "live" else "wss://fstream.
 
 
 TRACKER_REF: PositionTracker | None = None
+CSV = None
+LEDGER = None
 
 async def on_mark_price(symbol: str, mark: float, cfg):
     global TRACKER_REF

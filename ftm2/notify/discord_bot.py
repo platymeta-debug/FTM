@@ -22,6 +22,9 @@ _hooks = {
     "tracker_ref": None,
 }
 
+CSV = None
+LEDGER = None
+
 
 def register_hooks(**kwargs):
     _hooks.update({k: v for k, v in kwargs.items() if k in _hooks})
@@ -197,6 +200,28 @@ async def _handle_message(msg: discord.Message):
         tr.recompute_totals()
         a = tr.account
         await msg.channel.send(f"💼 총자본: {a.equity:.2f} USDT (지갑 {a.wallet_balance:.2f} / 가용 {a.available_balance:.2f} / UPNL {a.total_upnl:.2f})")
+    elif cmd == "일손익":
+        s = LEDGER.stats
+        await msg.channel.send(
+          f"📆 {s.day} 일손익 요약\n"
+          f"- 실현손익: {s.realized:.2f} USDT\n"
+          f"- 수수료: {s.fees:.2f} USDT\n"
+          f"- 펀딩: {s.funding:.2f} USDT\n"
+          f"- 순익: {s.net:.2f} USDT\n"
+          f"- 거래수/승률: {s.trades}/{(s.wins/max(1,s.trades))*100:.1f}%\n"
+          f"- 최대낙폭: {s.max_dd:.2f} USDT"
+        )
+    elif cmd == "손실컷해제":
+        LEDGER.cooldown_until = 0.0
+        await msg.channel.send("⏰ 손실컷 쿨다운을 해제했습니다.")
+    elif cmd == "csv스냅샷" and len(args)>=2:
+        opt = args[1].lower()
+        if opt == "on":
+            _cfg.CSV_MARK_SNAPSHOT_SEC = max(5, _cfg.CSV_MARK_SNAPSHOT_SEC or 0)
+            await msg.channel.send(f"📝 포지션 스냅샷 활성화({_cfg.CSV_MARK_SNAPSHOT_SEC}s)")
+        else:
+            _cfg.CSV_MARK_SNAPSHOT_SEC = 0
+            await msg.channel.send("📝 포지션 스냅샷 비활성화")
     elif cmd == "청산" and len(args)>=2:
         sym = args[1].upper()
         f = _hooks.get("close_all")
@@ -217,7 +242,7 @@ async def _handle_message(msg: discord.Message):
                                f"TRADES={_cfg.DISCORD_CHANNEL_TRADES}, "
                                f"SIGNALS={_cfg.DISCORD_CHANNEL_SIGNALS}")
     else:
-        await msg.channel.send("❓ 지원하지 않는 명령입니다. (상태, 포지션, 자본, 청산 심볼, 킬스위치 켜|꺼, 신호 심볼, 로그테스트)")
+        await msg.channel.send("❓ 지원하지 않는 명령입니다. (상태, 포지션, 자본, 일손익, 손실컷해제, csv스냅샷 on|off, 청산 심볼, 킬스위치 켜|꺼, 신호 심볼, 로그테스트)")
 
 async def start_notifier(cfg):
     """앱 루프 내에서 호출: 디스코드 클라이언트 + 송신 루프 실행"""

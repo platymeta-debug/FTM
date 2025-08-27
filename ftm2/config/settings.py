@@ -70,6 +70,11 @@ class Settings(BaseModel):
     MAX_POS_PER_SIDE: int = int(os.getenv("MAX_POS_PER_SIDE", "1"))
     MAX_DAILY_LOSS_USDT: float = float(os.getenv("MAX_DAILY_LOSS_USDT", "200"))
     MAX_OPEN_ORDERS: int = int(os.getenv("MAX_OPEN_ORDERS", "10"))
+    LOSS_CUT_DAILY_USDT: float = float(os.getenv("LOSS_CUT_DAILY_USDT", "0.0"))
+    LOSS_CUT_DAILY_PCT: float = float(os.getenv("LOSS_CUT_DAILY_PCT", "0.0"))
+    LOSS_CUT_ACTION: str = os.getenv("LOSS_CUT_ACTION", "close_all")
+    LOSS_CUT_COOLDOWN_MIN: int = int(os.getenv("LOSS_CUT_COOLDOWN_MIN", "60"))
+    REPORT_TZ: str = os.getenv("REPORT_TZ", "UTC")
 
     # --- Indicator lengths/params ---
     EMA_FAST: int = int(os.getenv("EMA_FAST", "20"))
@@ -137,6 +142,7 @@ class Settings(BaseModel):
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
     REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))
     WALLET_REFRESH_SEC: int = int(os.getenv("WALLET_REFRESH_SEC", "20"))
+    INCOME_POLL_SEC: int = int(os.getenv("INCOME_POLL_SEC", "90"))
 
 
     # --- 진입/라우팅 ---
@@ -164,6 +170,11 @@ class Settings(BaseModel):
     TRAIL_START_R: float = float(os.getenv("TRAIL_START_R", "1.5"))
     TRAIL_STEP_R: float = float(os.getenv("TRAIL_STEP_R", "0.5"))
     TRAIL_BACK_R: float = float(os.getenv("TRAIL_BACK_R", "0.8"))
+    CSV_ENABLE: bool = os.getenv("CSV_ENABLE", "true").lower() == "true"
+    CSV_DIR: str = os.getenv("CSV_DIR", "storage/csv")
+    CSV_FILE: str = os.getenv("CSV_FILE", "trades_all.csv")
+    CSV_FLUSH_SEC: int = int(os.getenv("CSV_FLUSH_SEC", "2"))
+    CSV_MARK_SNAPSHOT_SEC: int = int(os.getenv("CSV_MARK_SNAPSHOT_SEC", "0"))
     
 def load_env_chain() -> Settings:
     root = Path(__file__).resolve().parents[2]
