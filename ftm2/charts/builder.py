@@ -52,10 +52,12 @@ def render_analysis_charts(cfg, snapshot, out_dir: str) -> list[str]:
     p1 = os.path.join(base_dir, fn1)
     p2 = os.path.join(base_dir, fn2)
 
+
     indicators = getattr(snapshot, "indicators", {}) or {}
     df = indicators.get(tf)
     if df is None:
         df = indicators.get("main")
+
 
     if df is None or len(df) == 0:
         return []

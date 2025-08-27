@@ -28,6 +28,7 @@ def _save(reg: Dict[str, Any]):
 
 def compute_fingerprint(snapshot) -> str:
     """
+
     경량 메타(심볼/총점/방향/신뢰도 + 마지막 캔들 몇 값)로 지문 생성.
     DataFrame의 진릿값 평가(or/and) 절대 사용하지 않음.
     """
@@ -42,6 +43,7 @@ def compute_fingerprint(snapshot) -> str:
     df = indicators.get("1m")
     if df is None:
         df = indicators.get("main")
+
 
     if df is not None and len(df) > 0:
         last = df.iloc[-1]
@@ -78,6 +80,7 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
             _save(reg)
             return False, {"reason": "score-delta", "counter": ent["counter"]}
 
+
     # 지문 비교 (여기서도 DataFrame 진릿값을 절대 쓰지 않음)
     try:
         fp = compute_fingerprint(snapshot)
@@ -85,12 +88,14 @@ def should_render(cfg, snapshot) -> tuple[bool, Dict[str, Any]]:
         # 어떤 이유로든 fingerprint 실패하면 렌더 1회 허용해서 진행
         fp = f"{sym}:{time.time():.0f}"
 
+
     if fp == ent.get("last_fp", ""):
         ent["counter"] += 1
         if ent["counter"] < cfg.CHART_FORCE_N_CYCLES:
             reg[sym] = ent
             _save(reg)
             return False, {"reason": "fingerprint", "counter": ent["counter"]}
+
 
     # 통과 → 상태 갱신
     ent.update({
