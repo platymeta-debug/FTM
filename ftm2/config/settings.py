@@ -118,13 +118,13 @@ class Settings(BaseModel):
 
     # --- Discord (KR only) ---
     DISCORD_TOKEN: str | None = None
-    DISCORD_GUILD_ID: int | None = int(os.getenv("DISCORD_GUILD_ID", "0")) or None
-    DISCORD_CHANNEL_SIGNALS: int | None = int(os.getenv("DISCORD_CHANNEL_SIGNALS", "0")) or None
-    DISCORD_CHANNEL_TRADES: int | None = int(os.getenv("DISCORD_CHANNEL_TRADES", "0")) or None
-    DISCORD_CHANNEL_LOGS: int | None = int(os.getenv("DISCORD_CHANNEL_LOGS", "0")) or None
-    DISCORD_PREFIX: str = os.getenv("DISCORD_PREFIX", "!")
-    DISCORD_TEST_ON_BOOT: bool = os.getenv("DISCORD_TEST_ON_BOOT","true").lower()=="true"
-    DISCORD_UPDATE_INTERVAL_S: int = int(os.getenv("DISCORD_UPDATE_INTERVAL_S","5"))
+    DISCORD_GUILD_ID: int | None = None
+    DISCORD_CHANNEL_SIGNALS: int | None = None
+    DISCORD_CHANNEL_TRADES: int | None = None
+    DISCORD_CHANNEL_LOGS: int | None = None
+    DISCORD_PREFIX: str = "!"
+    DISCORD_TEST_ON_BOOT: bool = True
+    DISCORD_UPDATE_INTERVAL_S: int = 5
 
 
     # --- 진입/라우팅 ---
@@ -163,8 +163,20 @@ def load_env_chain() -> Settings:
         v = os.getenv(k)
         if v is not None and v != "":
             setattr(s, k, v)
+
+    for k in ("DISCORD_GUILD_ID","DISCORD_CHANNEL_SIGNALS","DISCORD_CHANNEL_TRADES","DISCORD_CHANNEL_LOGS"):
+        v = os.getenv(k)
+        if v and v.strip().isdigit():
+            setattr(s, k, int(v.strip()))
+    s.DISCORD_PREFIX = os.getenv("DISCORD_PREFIX", s.DISCORD_PREFIX)
+    s.DISCORD_TEST_ON_BOOT = os.getenv("DISCORD_TEST_ON_BOOT", "true").lower() == "true"
+    try:
+        s.DISCORD_UPDATE_INTERVAL_S = int(os.getenv("DISCORD_UPDATE_INTERVAL_S", str(s.DISCORD_UPDATE_INTERVAL_S)))
+    except:
+        pass
     ak = s.BINANCE_API_KEY or ""
     dt = s.DISCORD_TOKEN or ""
     print(f"[ENV][CHK] BINANCE_API_KEY={(ak[:4]+'…') if ak else 'EMPTY'}  DISCORD_TOKEN={(dt[:6]+'…') if dt else 'EMPTY'}")
+    print(f"[ENV][DISCORD] guild={s.DISCORD_GUILD_ID}  logs={s.DISCORD_CHANNEL_LOGS}  trades={s.DISCORD_CHANNEL_TRADES}  signals={s.DISCORD_CHANNEL_SIGNALS}")
     return s
 
