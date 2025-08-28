@@ -6,6 +6,7 @@ from ftm2.notify.discord_bot import edit_trade_card
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.analysis.divergence import DivergenceMonitor
 from ftm2.notify import dispatcher
+from ftm2.journal.events import JEvent
 
 CFG = load_env_chain()
 WS_LIVE = "wss://fstream.binance.com"
@@ -16,6 +17,7 @@ TRACKER_REF: PositionTracker | None = None
 CSV = None
 LEDGER = None
 DIVERGENCE: DivergenceMonitor | None = None
+RT = None
 
 async def on_mark_live(symbol: str, mark: float, cfg):
     global TRACKER_REF, DIVERGENCE
@@ -74,12 +76,18 @@ async def market_stream(symbols, interval, on_msg):
                 max_queue=128,
             ) as ws:
                 dispatcher.emit_once("ws_mkt_ok", "system", "📡 MKT_WS connected", 60000)
+                if RT and getattr(RT, "journal", None):
+                    RT.journal.write(JEvent.now("WS", symbol="", message="MKT_WS connected"))
+                if RT: RT.ws["mkt_ok"] = True
                 backoff = 1
                 async for raw in ws:
                     data = json.loads(raw)
                     await on_msg(data)
         except (websockets.exceptions.ConnectionClosedError, TimeoutError, OSError) as e:
             dispatcher.emit_once("ws_mkt_re", "error", f"⚠️ MKT_WS reconnecting: {e}", 60000)
+            if RT and getattr(RT, "journal", None):
+                RT.journal.write(JEvent.now("WS", symbol="", message=f"MKT_WS reconnect: {type(e).__name__}"))
+            if RT: RT.ws["mkt_ok"] = False
             await asyncio.sleep(min(60, backoff))
             backoff = min(60, backoff * 2)
             continue

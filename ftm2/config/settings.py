@@ -206,6 +206,15 @@ class Settings(BaseModel):
     EMBED_SHOW_LIQ: bool = os.getenv("EMBED_SHOW_LIQ", "true").lower() == "true"
     EMBED_SHOW_EQUITY: bool = os.getenv("EMBED_SHOW_EQUITY", "true").lower() == "true"
 
+    JOURNAL_DIR: str = os.getenv("JOURNAL_DIR", "./logs/journal")
+    JOURNAL_CSV_ENABLE: bool = os.getenv("JOURNAL_CSV_ENABLE", "true").lower() == "true"
+    JOURNAL_SQLITE_ENABLE: bool = os.getenv("JOURNAL_SQLITE_ENABLE", "false").lower() == "true"
+    JOURNAL_SQLITE_PATH: str = os.getenv("JOURNAL_SQLITE_PATH", "./logs/journal/trades.db")
+    DASH_ENABLE: bool = os.getenv("DASH_ENABLE", "true").lower() == "true"
+    DASH_INTERVAL_S: int = int(os.getenv("DASH_INTERVAL_S", "15"))
+    DASH_EDIT_MIN_MS: int = int(os.getenv("DASH_EDIT_MIN_MS", "10000"))
+    DASH_LIFETIME_MIN: int = int(os.getenv("DASH_LIFETIME_MIN", "55"))
+
     # --- User stream / REST sync ---
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
     REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))

@@ -1,5 +1,6 @@
 import time
 from ftm2.notify import dispatcher
+from ftm2.journal.events import JEvent
 
 
 def log_decision(*args, **kwargs):
@@ -46,6 +47,9 @@ class OrderRouter:
         resp = await self.client.new_order(symbol=sym, side=("BUY" if tk.side == "LONG" else "SELL"),
                                            type="MARKET", quantity=str(qty))
         self.notify.emit("order_submitted", f"📡 ✅ {sym} {tk.side} qty={qty} (ticket={tk.id})")
+        if self.rt and getattr(self.rt, "journal", None):
+            self.rt.journal.write(JEvent.now("ORDER_SUBMIT", symbol=sym, side=tk.side, qty=qty,
+                                            price=None, order_id=resp.get("orderId"), ticket_id=tk.id))
 
         ok = True
         if self.fills and hasattr(self.fills, "wait_fill"):
@@ -59,12 +63,22 @@ class OrderRouter:
         if not ok and (not pos or abs(getattr(pos, "qty", 0)) < 1e-12):
             self.notify.emit("order_failed", f"📡 ⏱️ {sym} 체결 확인 실패")
             return False
+        if pos and self.rt and getattr(self.rt, "journal", None):
+            self.rt.journal.write(JEvent.now("FILL", symbol=sym, side=tk.side,
+                                            qty=abs(pos.qty), price=pos.entry_price,
+                                            entry=pos.entry_price, mark=pos.mark_price,
+                                            lev=pos.leverage, mode=pos.margin_mode,
+                                            ticket_id=tk.id))
 
 
         tps = []
         sl = tk.stop_px
         if self.bracket:
             tps = await self.bracket.place_from_ticket(sym, tk, abs(getattr(pos, "qty", qty)))
+            if self.rt and getattr(self.rt, "journal", None):
+                self.rt.journal.write(JEvent.now("SL_SET", symbol=sym, sl=sl))
+                for px, q in tps:
+                    self.rt.journal.write(JEvent.now("TP_SET", symbol=sym, tp1=px, qty=q))
 
 
         if self.risk and pos:
