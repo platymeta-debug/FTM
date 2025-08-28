@@ -57,6 +57,14 @@ from ftm2 import strategy as ST
 
 CFG = load_env_chain()
 
+# 채널/어댑터 보증 (환경 변수 반영)
+NOTIFY.ensure_dc()
+NOTIFY.configure_channels(
+    signals=os.getenv("CHANNEL_SIGNALS"),
+    trades=os.getenv("CHANNEL_TRADES"),
+    logs=os.getenv("CHANNEL_LOGS"),
+)
+
 BUFFERS: dict[str, pd.DataFrame] = {}
 ROUTER: OrderRouter | None = None
 GUARD: GuardRails | None = None
