@@ -4,10 +4,13 @@ from ftm2.notify.discord_bot import edit_trade_card
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.exchange.binance_client import BinanceClient
 from ftm2.notify import dispatcher
+from ftm2.journal.events import JEvent
+from ftm2.dashboard.pnl_rollup import on_realized
 
 TRACKER: PositionTracker | None = None
 CSV = None
 LEDGER = None
+RT = None
 
 async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
     global TRACKER
@@ -36,11 +39,17 @@ async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
         try:
             async with websockets.connect(url, ping_interval=15, ping_timeout=10, close_timeout=5) as ws:
                 dispatcher.emit_once("ws_user_ok", "system", "👤 USER_WS connected", 60000)
+                if RT and getattr(RT, "journal", None):
+                    RT.journal.write(JEvent.now("WS", symbol="", message="USER_WS connected"))
+                if RT: RT.ws["user_ok"] = True
                 backoff = 1
                 async for raw in ws:
                     await on_message(raw)
         except Exception as e:
             dispatcher.emit_once("ws_user_re", "error", f"⚠️ USER_WS reconnecting: {e}", 60000)
+            if RT and getattr(RT, "journal", None):
+                RT.journal.write(JEvent.now("WS", symbol="", message=f"USER_WS reconnect: {type(e).__name__}"))
+            if RT: RT.ws["user_ok"] = False
             await asyncio.sleep(min(60, backoff))
             backoff = min(60, backoff * 2)
             try:
@@ -63,6 +72,7 @@ async def on_user_event(evt, bx: BinanceClient, cfg, listen_key: str):
         realized   = float(x.get("rp", 0) or 0)
         fee        = float(x.get("n", 0) or 0)
         if ex_type == "TRADE" and last_qty:
+            prev = TRACKER.pos.get(TRACKER.key(sym, side)) if hasattr(TRACKER, 'pos') else None
             TRACKER.apply_fill(sym, side, last_price, last_qty if side=="LONG" else -last_qty, realized, fee)
             await edit_trade_card(sym, TRACKER, cfg, force=True)
             # [ANCHOR:M5P_USERSTREAM_LOG]
@@ -78,6 +88,15 @@ async def on_user_event(evt, bx: BinanceClient, cfg, listen_key: str):
                         realized=realized, fee=fee, reason="fill", order_id=x.get("i"), client_id=x.get("c"),
                         entry=ps.entry_price if ps else "", mark=ps.mark_price if ps else "",
                         wallet=TRACKER.account.wallet_balance, equity=TRACKER.account.equity, avail=TRACKER.account.available_balance)
+            ps_after = TRACKER.pos.get(TRACKER.key(sym, side)) if hasattr(TRACKER, 'pos') else None
+            if ps_after and ps_after.qty == 0 and prev and abs(prev.qty) > 0:
+                realized_total = ps_after.realized_pnl
+                qty_closed = abs(prev.qty)
+                if RT and getattr(RT, "journal", None):
+                    RT.journal.write(JEvent.now("CLOSE", symbol=sym, side=side, qty=qty_closed, price=last_price, realized=realized_total))
+                    RT.journal.write(JEvent.now("PNL_REALIZED", symbol=sym, realized=realized_total))
+                if RT:
+                    on_realized(RT, realized_total)
     elif et == "ACCOUNT_UPDATE":
         a = evt.get("a", {})
         # 지갑/가용잔고

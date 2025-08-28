@@ -1,5 +1,6 @@
 from __future__ import annotations
 import time
+from ftm2.journal.events import JEvent
 
 
 class GuardRails:
@@ -25,3 +26,6 @@ class GuardRails:
         if hasattr(self.cfg, "AUTOTRADE_SWITCH"):
             self.cfg.AUTOTRADE_SWITCH.set(False)  # type: ignore[attr-defined]
         self.notify.emit("error", f"⛔ AutoTrade OFF: {reason}")
+        if getattr(self, "rt", None) and getattr(self.rt, "journal", None):
+            self.rt.journal.write(JEvent.now("GUARD_TRIP", symbol="", message=reason))
+            self.rt.guard_reason = reason
