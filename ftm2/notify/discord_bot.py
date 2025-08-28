@@ -222,7 +222,8 @@ async def update_analysis(
         return
 
 
-    ready, info = render_ready(snapshot, _cfg)
+
+    ready, info = should_render(_cfg, snapshot)
     if not ready:
         print(f"[CHART][SKIP] {symbol} cause={info.get('cause')}")
     else:

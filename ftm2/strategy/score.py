@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
+import math
 
 import pandas as pd
 import numpy as np
@@ -163,6 +164,8 @@ def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], 
         total_w += w
     if total_w > 0:
         total /= total_w
+
+    total = 100.0 * math.tanh(total / 100.0)
 
     direction = "NEUTRAL"
     if total > 0:

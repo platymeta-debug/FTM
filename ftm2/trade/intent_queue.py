@@ -1,69 +1,96 @@
 from __future__ import annotations
-import asyncio, time
-from ftm2.strategy.trace import DecisionTrace
-from ftm2.trade.order_router import log_decision
+
+import asyncio
+from dataclasses import dataclass
+from ftm2.trade.position_sizer import SizingDecision
+
+
+@dataclass
+class _Intent:
+    side: str
+    score: float
+    mark: float
+    sizing: SizingDecision
+    gates_ok: bool = True
+    autofire: bool = False
+
 
 class IntentQueue:
-    """Placeholder intent queue managing trade intents based on analysis snapshots."""
+    """Manage trade intents produced by analysis snapshots."""
+
     def __init__(self, cfg, divergence, router, csv, notify):
         self.cfg = cfg
         self.divergence = divergence
         self.router = router
         self.csv = csv
         self.notify = notify
-        self.intents: dict[str, dict] = {}
+        self.intents: dict[str, _Intent] = {}
+        self._runner_started = False
+
+    def _mark_from_snapshot(self, snap) -> float:
+        inds = getattr(snap, "indicators", {}) or {}
+        tf = snap.tfs[0] if getattr(snap, "tfs", None) else None
+        if tf and tf in inds and hasattr(inds[tf], "iloc") and len(inds[tf]) > 0:
+            try:
+                return float(inds[tf].iloc[-1].get("close", 0.0))
+            except Exception:
+                return 0.0
+        return 0.0
 
     def on_snapshot(self, snap):
-        sym = snap["symbol"] if isinstance(snap, dict) else snap.symbol
+        sym = getattr(snap, "symbol", "")
+        direction = getattr(snap, "direction", "NEUTRAL")
+        score = float(getattr(snap, "total_score", 0.0))
 
-        direction = snap["direction"] if isinstance(snap, dict) else snap.direction
-        score = snap["total_score"] if isinstance(snap, dict) else snap.total_score
-        trace = DecisionTrace(symbol=sym, decision_score=score, total_score=score, direction=direction)
-        trace.gates.update({
-            "ENTER_TH": self.cfg.ENTRY_TH,
-            "abs(score)": abs(score),
-        })
-        if self.divergence and self.divergence.too_wide(sym):
-            trace.reasons.append("divergence too wide")
-            log_decision(trace)
+        # notify intent
+        try:
+            self.notify(f"{sym} 의도만: {direction} / {score:+.1f}")
+        except Exception:
+            pass
+
+        mark = self._mark_from_snapshot(snap)
+        qty = 0.0 if mark <= 0 else 0.001
+        sl = mark * 0.99 if direction == "LONG" else mark * 1.01
+        tp = mark * 1.02 if direction == "LONG" else mark * 0.98
+        sizing = SizingDecision(
+            side=direction,
+            qty=qty,
+            entry_type=self.cfg.ENTRY_ORDER,
+            limit_offset_ticks=self.cfg.LIMIT_OFFSET_TICKS,
+            sl=sl,
+            tp=tp,
+            reason="auto",
+        )
+
+        it = _Intent(side=direction, score=score, mark=mark, sizing=sizing)
+        if self.cfg.LIVE_CONFIRM_MODE == "auto":
+            it.autofire = True
+        self.intents[sym] = it
+
+    async def run(self):
+        if self._runner_started:
             return
-        if abs(score) < self.cfg.ENTRY_TH:
-            trace.reasons.append("below enter threshold")
-            log_decision(trace)
-            return
-        direction = snap["direction"] if isinstance(snap, dict) else snap.direction
-        score = snap["total_score"] if isinstance(snap, dict) else snap.total_score
-        self.intents[sym] = {
-            "state": "pending",
-            "dir": direction,
-            "score": score,
-            "created": time.time(),
-            "expire": time.time() + self.cfg.CONFIRM_TIMEOUT_S,
-        }
-        if self.csv:
-            self.csv.log("TRADE_INTENT_NEW", symbol=sym, score=score)
-        trace.reasons.append("INTENT")
-        log_decision(trace)
-
-
-    async def tick(self):
+        self._runner_started = True
         while True:
-            now = time.time()
-            expired = [s for s, it in self.intents.items() if it["expire"] <= now]
-            for s in expired:
-                if self.csv:
-                    self.csv.log("TRADE_INTENT_CANCELLED", symbol=s)
-                self.intents.pop(s, None)
-            await asyncio.sleep(1)
+            try:
+                for sym, it in list(self.intents.items()):
+                    if not it.gates_ok:
+                        continue
+                    if it.autofire:
+                        ok = self.router.place_entry(sym, it.sizing, it.mark)
+                        if ok:
+                            try:
+                                self.notify(
+                                    f"{sym} 진입: {it.side} x{it.sizing.qty} @~{it.mark:.2f}"
+                                )
+                            except Exception:
+                                pass
+                            self.intents.pop(sym, None)
+                await asyncio.sleep(0.2)
+            except Exception as e:
+                try:
+                    self.notify(f"[INTENT][ERR] {e}")
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
 
-    async def confirm(self, symbol: str):
-        if symbol in self.intents:
-            if self.csv:
-                self.csv.log("TRADE_INTENT_CONFIRMED", symbol=symbol)
-            self.intents.pop(symbol, None)
-
-    async def cancel(self, symbol: str, reason: str = "manual"):
-        if symbol in self.intents:
-            if self.csv:
-                self.csv.log("TRADE_INTENT_CANCELLED", symbol=symbol, reason=reason)
-            self.intents.pop(symbol, None)

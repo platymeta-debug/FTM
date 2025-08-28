@@ -72,26 +72,34 @@ async def run_analysis_loop(cfg, symbols, market_cache, divergence, on_snapshot)
 
     # [ANCHOR:M6_ENGINE_LOOP] 분석 루프
     while True:
-        started = datetime.now(timezone.utc).timestamp()
-        for sym in symbols:
-            cache = market_cache.setdefault(sym, {})
-            for tf in tfs:
-                if _need_more(cache.get(tf), 100):
-                    boot = await bootstrap_candles(bx, sym, [tf])
-                    cache[tf] = boot[tf]
-            snap = score_snapshot(sym, cache, tfs, tf_weights)
-            bps = divergence.get_bps(sym)
-            snap.rules["divergence_bps"] = bps
+        try:
+            started = datetime.now(timezone.utc).timestamp()
+            for sym in symbols:
+                cache = market_cache.setdefault(sym, {})
+                for tf in tfs:
+                    if _need_more(cache.get(tf), 100):
+                        boot = await bootstrap_candles(bx, sym, [tf])
+                        cache[tf] = boot[tf]
+                snap = score_snapshot(sym, cache, tfs, tf_weights)
+                bps = divergence.get_bps(sym)
+                snap.rules["divergence_bps"] = bps
 
-            fp_key = f"fp:{sym}"
-            fp = getattr(snap, "fingerprint", None)
-            last_fp = STATE.get(fp_key)
-            if fp and last_fp == fp:
-                continue
-            STATE[fp_key] = fp
-            await on_snapshot(sym, snap)
+                fp_key = f"fp:{sym}"
+                fp = getattr(snap, "fingerprint", None)
+                last_fp = STATE.get(fp_key)
+                if fp and last_fp == fp:
+                    continue
+                STATE[fp_key] = fp
+                await on_snapshot(sym, snap)
 
-        elapsed = datetime.now(timezone.utc).timestamp() - started
-        wait = max(1, cfg.ANALYZE_INTERVAL_S - int(elapsed))
-        await asyncio.sleep(wait)
+            elapsed = datetime.now(timezone.utc).timestamp() - started
+            wait = max(1, cfg.ANALYZE_INTERVAL_S - int(elapsed))
+            await asyncio.sleep(wait)
+        except Exception as e:
+            try:
+                from ftm2.notify.discord_bot import send_log
+                send_log(f"[ANALYSIS][ERR] {e}")
+            except Exception:
+                print(f"[ANALYSIS][ERR] {e}")
+            await asyncio.sleep(1.0)
 
