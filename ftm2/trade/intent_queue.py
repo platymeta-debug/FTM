@@ -48,7 +48,7 @@ class IntentQueue:
 
         # notify intent
         try:
-            self.notify.emit("intent", f"📡 {sym} 의도만: {direction} / {score:+.1f}")
+            self.notify.emit("intent", f"📡 {sym} {direction} / {score:+.1f}")
 
         except Exception:
             pass

@@ -8,6 +8,8 @@ class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # legacy field
     TRADE_MODE: str = os.getenv("TRADE_MODE", MODE)  # testnet | live
     DATA_FEED: str = os.getenv("DATA_FEED", "live")  # live | testnet
+    # [PIPELINE_MODE]
+    PIPELINE_MODE: str = os.getenv("PIPELINE_MODE", "tickets")  # "tickets" | "legacy"
     WORKING_PRICE: str = os.getenv("WORKING_PRICE", "MARK_PRICE")
     LIVE_GUARD_ENABLE: bool = os.getenv("LIVE_GUARD_ENABLE", "true").lower() == "true"
     LIVE_MIN_NOTIONAL_USDT: float = float(os.getenv("LIVE_MIN_NOTIONAL_USDT", "10"))
@@ -26,9 +28,34 @@ class Settings(BaseModel):
     NOTIFY_STRICT: bool = os.getenv("NOTIFY_STRICT", "true").lower() == "true"
     NOTIFY_THROTTLE_MS: int = int(os.getenv("NOTIFY_THROTTLE_MS", "60000"))
     ENTRY_TF: str = os.getenv("ENTRY_TF", "1m")
-    ENTRY_COOLDOWN_SEC: int = int(os.getenv("ENTRY_COOLDOWN_SEC", "30"))
+    # [ANALYSIS/TICKET PARAMS]
+    SCORING_TFS: list[str] = os.getenv("SCORING_TFS", "1m,15m,1h,4h").split(",")
+    LONG_MIN_SCORE: int = int(os.getenv("LONG_MIN_SCORE", "60"))
+    SHORT_MIN_SCORE: int = int(os.getenv("SHORT_MIN_SCORE", "60"))
+    STOP_ATR: float = float(os.getenv("STOP_ATR", "1.5"))
+    TP1_ATR: float = float(os.getenv("TP1_ATR", "1.5"))
+    TP2_ATR: float = float(os.getenv("TP2_ATR", "3.0"))
+    MIN_RR: float = float(os.getenv("MIN_RR", "1.2"))
+    SETUP_TICKET_TTL_SEC: int = int(os.getenv("SETUP_TICKET_TTL_SEC", "300"))
     SETUP_INVALIDATION_BUFFER_PCT: float = float(os.getenv("SETUP_INVALIDATION_BUFFER_PCT", "0.05"))
+    ANALYSIS_SCORE_DELTA_MIN: int = int(os.getenv("ANALYSIS_SCORE_DELTA_MIN", "8"))
+    ANALYSIS_EDIT_MIN_MS: int = int(os.getenv("ANALYSIS_EDIT_MIN_MS", "15000"))
+    ANALYSIS_LIFETIME_MIN: int = int(os.getenv("ANALYSIS_LIFETIME_MIN", "55"))
+    REGM_ATR_LOOKBACK: int = int(os.getenv("REGM_ATR_LOOKBACK", "500"))
+    DIV_FILTER: bool = os.getenv("DIV_FILTER", "true").lower() == "true"
+    SHOW_CONFIDENCE: bool = os.getenv("SHOW_CONFIDENCE", "true").lower() == "true"
+    TRADE_CARD_EDIT_MIN_MS: int = int(os.getenv("TRADE_CARD_EDIT_MIN_MS", "10000"))
+    TRADE_CARD_LIFETIME_MIN: int = int(os.getenv("TRADE_CARD_LIFETIME_MIN", "55"))
+    ENTRY_COOLDOWN_SEC: int = int(os.getenv("ENTRY_COOLDOWN_SEC", "30"))
     FILL_TIMEOUT_SEC: int = int(os.getenv("FILL_TIMEOUT_SEC", "2"))
+    RISK_PCT_DEFAULT: float = float(os.getenv("RISK_PCT_DEFAULT", "0.50"))
+    RISK_PCT_OVERRIDE: dict = {k.removeprefix("RISK_PCT_OVERRIDE_"): float(v) for k, v in os.environ.items() if k.startswith("RISK_PCT_OVERRIDE_")}
+    MAX_QTY_DEFAULT: float = float(os.getenv("MAX_QTY_DEFAULT", "1.0"))
+    MAX_QTY_OVERRIDE: dict = {k.removeprefix("MAX_QTY_OVERRIDE_"): float(v) for k, v in os.environ.items() if k.startswith("MAX_QTY_OVERRIDE_")}
+    LEVERAGE_DEFAULT: int = int(os.getenv("LEVERAGE_DEFAULT", "5"))
+    LEVERAGE_OVERRIDE: dict = {k.removeprefix("LEVERAGE_OVERRIDE_"): int(v) for k, v in os.environ.items() if k.startswith("LEVERAGE_OVERRIDE_")}
+    MARGIN_MODE_DEFAULT: str = os.getenv("MARGIN_MODE_DEFAULT", "ISOLATED")
+    MARGIN_MODE_OVERRIDE: dict = {k.removeprefix("MARGIN_MODE_OVERRIDE_"): v for k, v in os.environ.items() if k.startswith("MARGIN_MODE_OVERRIDE_")}
     RENDER_CHARTS: bool = os.getenv("RENDER_CHARTS", "false").lower() == "true"
     RENDER_ON_NEW_BAR: bool = os.getenv("RENDER_ON_NEW_BAR", "true").lower() == "true"
     RENDER_INTERVAL_SEC: int = int(os.getenv("RENDER_INTERVAL_SEC", "180"))
@@ -162,7 +189,7 @@ class Settings(BaseModel):
     DISCORD_TEST_ON_BOOT: bool = True
     DISCORD_UPDATE_INTERVAL_S: int = 5
     TRADE_HEARTBEAT_S: int = int(os.getenv("TRADE_HEARTBEAT_S", "30"))
-    PNL_CHANGE_BPS: int = int(os.getenv("PNL_CHANGE_BPS", "5"))
+    PNL_CHANGE_BPS: int = int(os.getenv("PNL_CHANGE_BPS", "50"))
     EMBED_DECIMALS_PRICE: int = int(os.getenv("EMBED_DECIMALS_PRICE", "2"))
     EMBED_DECIMALS_QTY: int = int(os.getenv("EMBED_DECIMALS_QTY", "6"))
     EMBED_DECIMALS_USDT: int = int(os.getenv("EMBED_DECIMALS_USDT", "2"))
@@ -174,6 +201,13 @@ class Settings(BaseModel):
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
     REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))
     WALLET_REFRESH_SEC: int = int(os.getenv("WALLET_REFRESH_SEC", "20"))
+    BT_SYMBOLS: list[str] = os.getenv("BT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+    BT_TF: str = os.getenv("BT_TF", "1m")
+    BT_START: str = os.getenv("BT_START", "2025-05-01")
+    BT_END: str = os.getenv("BT_END", "2025-08-01")
+    BT_FEES_BPS: int = int(os.getenv("BT_FEES_BPS", "2"))
+    BT_SLIPPAGE_BPS: int = int(os.getenv("BT_SLIPPAGE_BPS", "1"))
+    BT_EXPORT: str = os.getenv("BT_EXPORT", "./reports/ftm2_bt.csv")
     INCOME_POLL_SEC: int = int(os.getenv("INCOME_POLL_SEC", "90"))
 
 
