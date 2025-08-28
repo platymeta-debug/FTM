@@ -188,6 +188,7 @@ class Settings(BaseModel):
     DISCORD_PREFIX: str = "!"
     DISCORD_TEST_ON_BOOT: bool = True
     DISCORD_UPDATE_INTERVAL_S: int = 5
+    DISCORD_ALLOWED_ROLES: str = os.getenv("DISCORD_ALLOWED_ROLES", "")
     TRADE_HEARTBEAT_S: int = int(os.getenv("TRADE_HEARTBEAT_S", "30"))
     PNL_CHANGE_BPS: int = int(os.getenv("PNL_CHANGE_BPS", "50"))
     BE_ENABLED: bool = os.getenv("BE_ENABLED", "true").lower() == "true"
@@ -205,6 +206,18 @@ class Settings(BaseModel):
     EMBED_SHOW_FUNDING: bool = os.getenv("EMBED_SHOW_FUNDING", "false").lower() == "true"
     EMBED_SHOW_LIQ: bool = os.getenv("EMBED_SHOW_LIQ", "true").lower() == "true"
     EMBED_SHOW_EQUITY: bool = os.getenv("EMBED_SHOW_EQUITY", "true").lower() == "true"
+
+    JOURNAL_DIR: str = os.getenv("JOURNAL_DIR", "./logs/journal")
+    JOURNAL_CSV_ENABLE: bool = os.getenv("JOURNAL_CSV_ENABLE", "true").lower() == "true"
+    JOURNAL_SQLITE_ENABLE: bool = os.getenv("JOURNAL_SQLITE_ENABLE", "false").lower() == "true"
+    JOURNAL_SQLITE_PATH: str = os.getenv("JOURNAL_SQLITE_PATH", "./logs/journal/trades.db")
+    DASH_ENABLE: bool = os.getenv("DASH_ENABLE", "true").lower() == "true"
+    DASH_INTERVAL_S: int = int(os.getenv("DASH_INTERVAL_S", "15"))
+    DASH_EDIT_MIN_MS: int = int(os.getenv("DASH_EDIT_MIN_MS", "10000"))
+    DASH_LIFETIME_MIN: int = int(os.getenv("DASH_LIFETIME_MIN", "55"))
+    SYNC_PERIODIC_SEC: int = int(os.getenv("SYNC_PERIODIC_SEC", "60"))
+    SNAPSHOT_INTERVAL_SEC: int = int(os.getenv("SNAPSHOT_INTERVAL_SEC", "300"))
+    RECOVER_LAST_SNAPSHOT: bool = os.getenv("RECOVER_LAST_SNAPSHOT", "true").lower() == "true"
 
     # --- User stream / REST sync ---
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
