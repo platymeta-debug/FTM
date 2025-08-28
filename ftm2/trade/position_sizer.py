@@ -172,3 +172,4 @@ class PositionSizer:
             return self.filters.q_qty(sym, max(qmin, qty))
         except Exception:
             return getattr(self, "q_qty", lambda s, q: q)(sym, qty)
+
