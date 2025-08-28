@@ -48,5 +48,8 @@ class Scoring:
         cons = 1.0 if (htf_ok_up or htf_ok_down) else 0.5
         reg = {"LOW": 1.0, "NORMAL": 0.9, "HIGH": 0.8, "EXTREME": 0.7}[regime]
         confidence = max(0.0, min(1.0, 0.4 * (adx_avg / 40.0) + 0.4 * cons + 0.2 * reg))
+        # [ANCHOR:SCORE_STATE_CACHE]
+        self.last_conf = confidence
+        self.last_regime = regime
         return score, confidence, regime
 

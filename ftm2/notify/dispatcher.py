@@ -106,3 +106,19 @@ push_trade = notifier.push_trade
 push_log = notifier.push_log
 send_once = notifier.send_once
 
+# [ANCHOR:DISPATCHER_DC_ADAPTER]
+async def _send(channel_key: str, text: str):
+    notifier._send(channel_key, text)
+
+async def _edit(message_id, text: str):
+    return None
+
+class _DCAdapter:
+    async def send(self, channel_key: str, text: str):
+        return await _send(channel_key, text)
+
+    async def edit(self, message_id, text: str):
+        return await _edit(message_id, text)
+
+dc = _DCAdapter()
+

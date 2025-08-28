@@ -1,6 +1,11 @@
 import itertools, json, random, os, time
 from dataclasses import dataclass
 
+try:
+    from dotenv import dotenv_values
+except Exception:
+    dotenv_values = None
+
 
 @dataclass
 class TuneResult:
@@ -25,9 +30,13 @@ def _parse_range(spec: str):
 
 
 def _space_from_env(cfg):
-    sp = {}
+    sp={}
+    # 1) .env.tune가 있으면 우선 사용
+    tune_map = {}
+    if dotenv_values and os.path.exists('.env.tune'):
+        tune_map = dotenv_values('.env.tune')
     for k in cfg.TUNE_PARAMS:
-        spec = os.getenv(k)
+        spec = (tune_map.get(k) if tune_map else None) or os.getenv(k)
         if not spec:
             continue
         sp[k] = _parse_range(spec)
