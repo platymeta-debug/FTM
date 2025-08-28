@@ -25,8 +25,13 @@ class AnalysisEngine:
             return self.market.mark(sym)
         return 0.0
 
+    def series(self, sym: str, tf: str, key: str):
+        """Placeholder for price/indicator series lookup."""
+        return []
+
     # [BUILD_TICKET]
-    def build_ticket(self, sym: str, score: int):
+    def build_ticket(self, sym: str, score: int, confidence: float | None = None, regime: str | None = None):
+
         side = None
         reasons = []
         if (
@@ -45,6 +50,17 @@ class AnalysisEngine:
             reasons.append("score<=-SHORT_MIN & HTF=DOWN")
         else:
             return None
+
+        from ftm2.analysis.divergence import rsi_bear_div, rsi_bull_div  # [ANCHOR:DIVERGENCE_FILTER]
+        hi = self.series(sym, self.cfg.ENTRY_TF, "high")
+        lo = self.series(sym, self.cfg.ENTRY_TF, "low")
+        rsi = self.series(sym, self.cfg.ENTRY_TF, "rsi")
+        if self.cfg.DIV_FILTER:
+            if side == "LONG" and rsi_bear_div(hi, rsi):
+                return None
+            if side == "SHORT" and rsi_bull_div(lo, rsi):
+                return None
+
 
         atr = self.atr(sym, self.cfg.ENTRY_TF)
         px = float(self.mark(sym))
@@ -68,6 +84,8 @@ class AnalysisEngine:
             created_ts=time(),
             expire_ts=time() + self.cfg.SETUP_TICKET_TTL_SEC,
             reasons=reasons,
+            confidence=confidence if confidence is not None else 0.8,
+            regime=regime,
         )
 
 BOOT_LIMIT = 500  # 초기 캔들 개수 (필요시 .env로 빼도 됨)

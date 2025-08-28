@@ -132,8 +132,9 @@ class PositionSizer:
         dist = abs(px - sl)
 
         risk_pct = Decimal(str(self.cfg.RISK_PCT_OVERRIDE.get(sym, self.cfg.RISK_PCT_DEFAULT)))
-        boost = Decimal("1.0") + Decimal(str(max(0, abs(getattr(ticket, 'score', 0)) - 60))) / Decimal("200")
-        risk_pct = (risk_pct * min(boost, Decimal("1.5"))).quantize(Decimal("0.0001"))
+        conf = Decimal(str(getattr(ticket, "confidence", getattr(ticket, "conf", 0.8))))
+        boost = Decimal("0.8") + conf * Decimal("0.9")  # [ANCHOR:CONFIDENCE_BOOST]
+        risk_pct = (risk_pct * min(boost, Decimal("1.7"))).quantize(Decimal("0.0001"))
 
         eq = Decimal(str(getattr(account, 'equity_usdt', 0)))
         risk_usdt = (eq * risk_pct / Decimal("100")).quantize(Decimal("0.01"))

@@ -19,7 +19,8 @@ class AnalysisNotify:
         else:
             self.notify.emit("system", text)
 
-    def upsert_analysis(self, sym: str, score: int, trend: str, ticket):
+    def upsert_analysis(self, sym: str, score: int, trend: str, ticket, confidence: float | None = None, regime: str | None = None):
+
         changed = (
             abs(score - self.prev.get(sym, {}).get("score", 0)) >= self.cfg.ANALYSIS_SCORE_DELTA_MIN
             or bool(ticket) != self.prev.get(sym, {}).get("has_ticket", False)
@@ -27,7 +28,7 @@ class AnalysisNotify:
         )
         if (not changed) or (not self._edit_ok(f"analysis_{sym}", self.cfg.ANALYSIS_EDIT_MIN_MS)):
             return
-        text = self.views.render(sym, score=score, trend=trend, ticket=ticket)
+        text = self.views.render(sym, score=score, trend=trend, ticket=ticket, confidence=confidence, regime=regime)
         self._upsert_sticky(self.cfg.CHANNEL_SIGNALS, f"analysis_{sym}", text,
                              lifetime_min=self.cfg.ANALYSIS_LIFETIME_MIN)
         self.prev[sym] = {"score": score, "trend": trend, "has_ticket": bool(ticket)}

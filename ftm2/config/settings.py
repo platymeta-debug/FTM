@@ -41,6 +41,9 @@ class Settings(BaseModel):
     ANALYSIS_SCORE_DELTA_MIN: int = int(os.getenv("ANALYSIS_SCORE_DELTA_MIN", "8"))
     ANALYSIS_EDIT_MIN_MS: int = int(os.getenv("ANALYSIS_EDIT_MIN_MS", "15000"))
     ANALYSIS_LIFETIME_MIN: int = int(os.getenv("ANALYSIS_LIFETIME_MIN", "55"))
+    REGM_ATR_LOOKBACK: int = int(os.getenv("REGM_ATR_LOOKBACK", "500"))
+    DIV_FILTER: bool = os.getenv("DIV_FILTER", "true").lower() == "true"
+    SHOW_CONFIDENCE: bool = os.getenv("SHOW_CONFIDENCE", "true").lower() == "true"
     TRADE_CARD_EDIT_MIN_MS: int = int(os.getenv("TRADE_CARD_EDIT_MIN_MS", "10000"))
     TRADE_CARD_LIFETIME_MIN: int = int(os.getenv("TRADE_CARD_LIFETIME_MIN", "55"))
     ENTRY_COOLDOWN_SEC: int = int(os.getenv("ENTRY_COOLDOWN_SEC", "30"))
@@ -198,6 +201,13 @@ class Settings(BaseModel):
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
     REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))
     WALLET_REFRESH_SEC: int = int(os.getenv("WALLET_REFRESH_SEC", "20"))
+    BT_SYMBOLS: list[str] = os.getenv("BT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+    BT_TF: str = os.getenv("BT_TF", "1m")
+    BT_START: str = os.getenv("BT_START", "2025-05-01")
+    BT_END: str = os.getenv("BT_END", "2025-08-01")
+    BT_FEES_BPS: int = int(os.getenv("BT_FEES_BPS", "2"))
+    BT_SLIPPAGE_BPS: int = int(os.getenv("BT_SLIPPAGE_BPS", "1"))
+    BT_EXPORT: str = os.getenv("BT_EXPORT", "./reports/ftm2_bt.csv")
     INCOME_POLL_SEC: int = int(os.getenv("INCOME_POLL_SEC", "90"))
 
 

@@ -17,4 +17,7 @@ class SetupTicket:
     created_ts: float
     expire_ts: float
     reasons: List[str]
+    confidence: float = 0.8
+    regime: str | None = None
+
 
