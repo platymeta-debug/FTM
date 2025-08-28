@@ -218,6 +218,13 @@ class Settings(BaseModel):
     SYNC_PERIODIC_SEC: int = int(os.getenv("SYNC_PERIODIC_SEC", "60"))
     SNAPSHOT_INTERVAL_SEC: int = int(os.getenv("SNAPSHOT_INTERVAL_SEC", "300"))
     RECOVER_LAST_SNAPSHOT: bool = os.getenv("RECOVER_LAST_SNAPSHOT", "true").lower() == "true"
+    WEB_ENABLE: bool = os.getenv("WEB_ENABLE", "true").lower() == "true"
+    WEB_HOST: str = os.getenv("WEB_HOST", "0.0.0.0")
+    WEB_PORT: int = int(os.getenv("WEB_PORT", "8088"))
+    WEB_TOKEN: str = os.getenv("WEB_TOKEN", "devtoken")
+    WEB_STATIC_DIR: str = os.getenv("WEB_STATIC_DIR", "./ftm2/web/static")
+    WEB_PUSH_INTERVAL_S: int = int(os.getenv("WEB_PUSH_INTERVAL_S", "3"))
+    WEB_CORS: str = os.getenv("WEB_CORS", "*")
 
 
     # --- User stream / REST sync ---

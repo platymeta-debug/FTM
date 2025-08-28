@@ -266,6 +266,14 @@ async def main():
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
+    if CFG.WEB_ENABLE:
+        from ftm2.web.app import app as web_app, init as web_init
+        import uvicorn
+        broadcaster = web_init(web_app, CFG, RT, None, RT.bracket, NOTIFY)
+        config = uvicorn.Config(web_app, host=CFG.WEB_HOST, port=CFG.WEB_PORT, log_level="info")
+        server = uvicorn.Server(config)
+        tasks.append(asyncio.create_task(server.serve()))
+        tasks.append(asyncio.create_task(broadcaster()))
     tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
     async def dashboard_task():
         while True:
