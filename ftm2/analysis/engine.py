@@ -5,6 +5,70 @@ import asyncio
 STATE: dict[str, str] = {}
 
 from ftm2.strategy.score import score_snapshot, _parse_tf_weights
+from time import time
+from ftm2.analysis.types import SetupTicket
+
+
+class AnalysisEngine:
+    def __init__(self, cfg, market=None):
+        self.cfg = cfg
+        self.market = market
+
+    def trend(self, sym: str, tf: str) -> str:
+        return "FLAT"
+
+    def atr(self, sym: str, tf: str) -> float:
+        return 0.0
+
+    def mark(self, sym: str) -> float:
+        if self.market and hasattr(self.market, "mark"):
+            return self.market.mark(sym)
+        return 0.0
+
+    # [BUILD_TICKET]
+    def build_ticket(self, sym: str, score: int):
+        side = None
+        reasons = []
+        if (
+            score >= self.cfg.LONG_MIN_SCORE
+            and self.trend(sym, "1h") == "UP"
+            and self.trend(sym, "4h") == "UP"
+        ):
+            side = "LONG"
+            reasons.append("score>=LONG_MIN & HTF=UP")
+        elif (
+            score <= -self.cfg.SHORT_MIN_SCORE
+            and self.trend(sym, "1h") == "DOWN"
+            and self.trend(sym, "4h") == "DOWN"
+        ):
+            side = "SHORT"
+            reasons.append("score<=-SHORT_MIN & HTF=DOWN")
+        else:
+            return None
+
+        atr = self.atr(sym, self.cfg.ENTRY_TF)
+        px = float(self.mark(sym))
+        stop = px - self.cfg.STOP_ATR * atr if side == "LONG" else px + self.cfg.STOP_ATR * atr
+        tp1 = px + self.cfg.TP1_ATR * atr if side == "LONG" else px - self.cfg.TP1_ATR * atr
+        tp2 = px + self.cfg.TP2_ATR * atr if side == "LONG" else px - self.cfg.TP2_ATR * atr
+        rr = abs((tp1 - px) / (px - stop)) if px != stop else 0.0
+        if rr < self.cfg.MIN_RR:
+            return None
+
+        return SetupTicket(
+            id=f"{sym}_{int(time()*1000)}",
+            symbol=sym,
+            side=side,
+            tf=self.cfg.ENTRY_TF,
+            score=score,
+            entry_px=px,
+            stop_px=stop,
+            tps=[tp1, tp2],
+            rr=rr,
+            created_ts=time(),
+            expire_ts=time() + self.cfg.SETUP_TICKET_TTL_SEC,
+            reasons=reasons,
+        )
 
 BOOT_LIMIT = 500  # 초기 캔들 개수 (필요시 .env로 빼도 됨)
 

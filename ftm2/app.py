@@ -7,6 +7,7 @@ from ftm2.strategy.scorer import score_row
 from datetime import timezone
 import asyncio
 import pandas as pd
+import logging
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -33,11 +34,14 @@ from ftm2.trade.intent_queue import IntentQueue
 from ftm2.analysis.adapter import to_analysis_snapshot
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 from ftm2.strategy.trace import DecisionTrace
+from ftm2.account.leverage_sync import enforce_leverage_and_margin
 
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
 from ftm2.exchange import streams_user as US
 from ftm2.exchange import streams_market as MS
+
+log = logging.getLogger(__name__)
 from ftm2 import strategy as ST
 
 
@@ -156,8 +160,11 @@ async def on_market(msg):
                     mtf_bias=(1 if (mtf_ctx and True) else 0),
                 )
                 if dec and dec.qty > 0:
-                    ROUTER.place_entry(sym, dec, mark_price=last['close'], trace=trace)
-                    GUARD.arm_cooldown(sym)
+                    if CFG.PIPELINE_MODE == "legacy":
+                        log.warning("[PIPELINE] legacy mode is deprecated; enable tickets flow instead.")
+                    else:
+                        # 티켓 기반만 허용: 분석 엔진이 on_snapshot()으로 티켓을 발급/소비하게 둔다.
+                        pass
                 else:
                     trace.reasons.append("no sizing")
                     log_decision(trace)
@@ -214,6 +221,8 @@ async def main():
 
     div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
     MS.DIVERGENCE = div
+
+    await enforce_leverage_and_margin(bx, CFG, CFG.SYMBOLS)
 
     def _notify(text):
         try:

@@ -113,3 +113,46 @@ def sizing_decision(
         reason=f"{'추가진입' if is_add else '초기진입'}: weight={raw_weight:.2f}, atr={atr:.4f}",
         is_add=is_add
     )
+
+# [ANCHOR:SIZE_ENTRY_TICKET_AWARE]
+from decimal import Decimal
+
+class PositionSizer:
+    def __init__(self, cfg, filters):
+        self.cfg = cfg
+        self.filters = filters
+
+    def size_entry(self, sym: str, ticket, account):
+        """
+        ticket: SetupTicket (entry_px, stop_px, side, score)
+        account: 계정 정보 (availableBalance 등)
+        """
+        px = Decimal(str(ticket.entry_px))
+        sl = Decimal(str(ticket.stop_px))
+        dist = abs(px - sl)
+
+        risk_pct = Decimal(str(self.cfg.RISK_PCT_OVERRIDE.get(sym, self.cfg.RISK_PCT_DEFAULT)))
+        boost = Decimal("1.0") + Decimal(str(max(0, abs(getattr(ticket, 'score', 0)) - 60))) / Decimal("200")
+        risk_pct = (risk_pct * min(boost, Decimal("1.5"))).quantize(Decimal("0.0001"))
+
+        eq = Decimal(str(getattr(account, 'equity_usdt', 0)))
+        risk_usdt = (eq * risk_pct / Decimal("100")).quantize(Decimal("0.01"))
+
+        if dist <= 0 or risk_usdt <= 0:
+            return 0.0
+
+        lev = Decimal(str(self.cfg.LEVERAGE_OVERRIDE.get(sym, self.cfg.LEVERAGE_DEFAULT)))
+        qty = (risk_usdt / dist).quantize(Decimal("0.0000001"))
+        qty = min(qty, Decimal(str(self.cfg.MAX_QTY_OVERRIDE.get(sym, self.cfg.MAX_QTY_DEFAULT))))
+        qty = max(qty, Decimal("0"))
+
+        q = self.filters.q_qty(sym, float(qty))
+        min_ok = self.filters.min_ok(float(px), q)
+        if not min_ok:
+            q_min = self.filters.min_qty_for(float(px), symbol=sym)
+            if self.cfg.ORDER_SCALE_TO_MIN:
+                q = float(q_min)
+            else:
+                return 0.0
+
+        return float(q)
