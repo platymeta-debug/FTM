@@ -1,4 +1,4 @@
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
 class SymbolFilter:
@@ -84,6 +84,28 @@ class ExchangeFilters:
         else:
             raise TypeError("min_ok('SYM', price, qty) 또는 min_ok(price, qty, symbol='SYM') 형태로 호출하세요.")
         return self.map[symbol].min_ok(self._coerce_decimal(price), self._coerce_decimal(qty))
+
+
+    def min_qty_for_notional(self, symbol: str, price, min_notional_override: float | None = None) -> Decimal:
+        f = self.map[symbol]
+        px = price if isinstance(price, Decimal) else Decimal(str(price))
+        mn = Decimal(str(min_notional_override)) if min_notional_override is not None else f.min_notional
+        raw = (mn / px)
+        q = f.q_qty(raw)
+        if not f.min_ok(px, q):
+            q = q + f.step
+        return f.q_qty(q)
+
+    def clamp_to_min_notional(self, symbol: str, price, qty, min_notional_override: float | None = None) -> Decimal | None:
+        f = self.map[symbol]
+        px = price if isinstance(price, Decimal) else Decimal(str(price))
+        qy = qty if isinstance(qty, Decimal) else Decimal(str(qty))
+        qy = f.q_qty(qy)
+        if f.min_ok(px, qy):
+            return qy
+        need = self.min_qty_for_notional(symbol, px, min_notional_override)
+        return need if f.min_ok(px, need) else None
+
 
     def tick_size(self, symbol: str) -> Decimal:
         return self.map[symbol].tick
