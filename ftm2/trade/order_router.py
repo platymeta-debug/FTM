@@ -7,7 +7,9 @@ def log_decision(*args, **kwargs):
 
 # [ANCHOR:ROUTER_TICKET_FLOW]
 class OrderRouter:
-    def __init__(self, cfg, client, sizer, market, fills, account, rt, bracket, notify=dispatcher, cards=None, analysis_views=None):
+    def __init__(self, cfg, client, sizer=None, market=None, fills=None, account=None, rt=None,
+                 bracket=None, risk=None, notify=dispatcher, cards=None, analysis_views=None):
+
         self.cfg = cfg
         self.client = client
         self.sizer = sizer
@@ -16,6 +18,7 @@ class OrderRouter:
         self.account = account
         self.rt = rt
         self.bracket = bracket
+        self.risk = risk
         self.notify = notify
         self.cards = cards
         self.analysis_views = analysis_views
@@ -62,6 +65,11 @@ class OrderRouter:
         sl = tk.stop_px
         if self.bracket:
             tps = await self.bracket.place_from_ticket(sym, tk, abs(getattr(pos, "qty", qty)))
+
+
+        if self.risk and pos:
+            self.risk.on_open(sym, getattr(pos, "entry_price", tk.entry_px))
+
 
         self.rt.idem_hit[(sym, tk.side)] = bar_ts
         self.rt.cooldown_until[sym] = time.time() + self.cfg.ENTRY_COOLDOWN_SEC

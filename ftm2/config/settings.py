@@ -190,6 +190,15 @@ class Settings(BaseModel):
     DISCORD_UPDATE_INTERVAL_S: int = 5
     TRADE_HEARTBEAT_S: int = int(os.getenv("TRADE_HEARTBEAT_S", "30"))
     PNL_CHANGE_BPS: int = int(os.getenv("PNL_CHANGE_BPS", "50"))
+    BE_ENABLED: bool = os.getenv("BE_ENABLED", "true").lower() == "true"
+    BE_ARM_R_MULT: float = float(os.getenv("BE_ARM_R_MULT", "1.0"))
+    BE_FEE_BUFFER_PCT: float = float(os.getenv("BE_FEE_BUFFER_PCT", "0.03"))
+    TRAILING_ENABLED: bool = os.getenv("TRAILING_ENABLED", "true").lower() == "true"
+    TRAILING_ATR: float = float(os.getenv("TRAILING_ATR", "1.0"))
+    TIMEOUT_ENABLED: bool = os.getenv("TIMEOUT_ENABLED", "true").lower() == "true"
+    TIMEOUT_SEC: int = int(os.getenv("TIMEOUT_SEC", "5400"))
+    DAILY_LOSS_CAP_USDT: float = float(os.getenv("DAILY_LOSS_CAP_USDT", "50"))
+    MAX_LOSS_STREAK: int = int(os.getenv("MAX_LOSS_STREAK", "3"))
     EMBED_DECIMALS_PRICE: int = int(os.getenv("EMBED_DECIMALS_PRICE", "2"))
     EMBED_DECIMALS_QTY: int = int(os.getenv("EMBED_DECIMALS_QTY", "6"))
     EMBED_DECIMALS_USDT: int = int(os.getenv("EMBED_DECIMALS_USDT", "2"))
@@ -205,9 +214,22 @@ class Settings(BaseModel):
     BT_TF: str = os.getenv("BT_TF", "1m")
     BT_START: str = os.getenv("BT_START", "2025-05-01")
     BT_END: str = os.getenv("BT_END", "2025-08-01")
+    BT_START_IDX: int = int(os.getenv("BT_START_IDX", "0"))
+    BT_END_IDX: int = int(os.getenv("BT_END_IDX", "0"))
     BT_FEES_BPS: int = int(os.getenv("BT_FEES_BPS", "2"))
     BT_SLIPPAGE_BPS: int = int(os.getenv("BT_SLIPPAGE_BPS", "1"))
     BT_EXPORT: str = os.getenv("BT_EXPORT", "./reports/ftm2_bt.csv")
+    TUNE_PARAMS: list[str] = [s.strip() for s in os.getenv("TUNE_PARAMS", "").split(",") if s.strip()]
+    TUNE_LIMIT: int = int(os.getenv("TUNE_LIMIT", "120"))
+    TUNE_SEED: int = int(os.getenv("TUNE_SEED", "42"))
+    TUNE_OBJECTIVE: str = os.getenv("TUNE_OBJECTIVE", "expectancy")
+    TUNE_PF_MIN: float = float(os.getenv("TUNE_PF_MIN", "1.30"))
+    TUNE_SHARPE_MIN: float = float(os.getenv("TUNE_SHARPE_MIN", "0.80"))
+    TUNE_WINRATE_MIN: float = float(os.getenv("TUNE_WINRATE_MIN", "0.35"))
+    TUNE_WINRATE_MAX: float = float(os.getenv("TUNE_WINRATE_MAX", "0.70"))
+    TUNE_TRADES_MIN: int = int(os.getenv("TUNE_TRADES_MIN", "80"))
+    TUNE_EXPORT_CSV: str = os.getenv("TUNE_EXPORT_CSV", "./reports/tune_results.csv")
+    TUNE_EXPORT_BEST: str = os.getenv("TUNE_EXPORT_BEST", "./reports/tune_best.json")
     INCOME_POLL_SEC: int = int(os.getenv("INCOME_POLL_SEC", "90"))
 
 
