@@ -1,0 +1,49 @@
+<!-- [ANCHOR:WEB_UI_INDEX] -->
+<!doctype html><html><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>FTM2 Ops Board</title>
+<style>body{font-family:system-ui,Segoe UI,Roboto,Apple Color Emoji;max-width:1100px;margin:24px auto;padding:0 12px}
+.card{border:1px solid #eee;border-radius:14px;padding:14px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,.04)}
+.badge{padding:2px 8px;border-radius:999px;background:#eee;margin-left:6px}
+.table{width:100%;border-collapse:collapse} .table th,.table td{padding:6px 8px;border-bottom:1px solid #f0f0f0;text-align:left}
+.ok{color:#2e7d32} .warn{color:#d32f2f}
+</style></head><body>
+<h2>FTM2 — Realtime Ops</h2>
+<div class="card" id="meta"></div>
+<div class="card"><table class="table" id="pos"><thead>
+<tr><th>Symbol</th><th>Mode/Lev</th><th>Side×Qty</th><th>Entry/Mark</th><th>UPNL/ROE</th><th>SL/TPs</th><th>Ticket</th></tr>
+</thead><tbody></tbody></table></div>
+<script>
+const token = new URLSearchParams(location.search).get("token") || "devtoken";
+const ws = new WebSocket(`${location.protocol==='https:'?'wss':'ws'}://${location.host}/ws?token=${token}`);
+const meta = document.getElementById('meta');
+const tbody = document.querySelector('#pos tbody');
+ws.onmessage = (ev)=>{
+  const msg = JSON.parse(ev.data); if(msg.type!=='ops') return;
+  const d = msg.data;
+  meta.innerHTML = `
+    <div>AutoTrade <span class="badge">${d.autotrade?'ON':'OFF'}</span> | Pipeline <span class="badge">${d.pipeline}</span></div>
+    <div>WS mkt <span class="${d.ws_mkt_ok?'ok':'warn'}">${d.ws_mkt_ok?'OK':'ERR'}</span> / user <span class="${d.ws_user_ok?'ok':'warn'}">${d.ws_user_ok?'OK':'ERR'}</span>
+      | Realized(Today) ${d.daily_realized?.toFixed(2)} USDT | LossStreak ${d.loss_streak}</div>
+    ${d.guard?`<div class="warn">Guard: ${d.guard}</div>`:''}
+  `;
+  tbody.innerHTML = '';
+  (d.symbols||[]).forEach(row=>{
+    const [sym, pos, tk] = row;
+    const sl = pos.sl?pos.sl.toFixed(2):'-';
+    const tps = (pos.tps||[]).map(([px,q])=>`${px.toFixed(2)}×${q.toFixed(6)}`).join(' / ') || '-';
+    const tkx = tk?`${tk.side} s=${tk.score} RR≈${(tk.rr||0).toFixed(2)} ttl=${tk.ttl}s`:'-';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><b>${sym}</b></td>
+      <td>${pos.mode}×${pos.lev}</td>
+      <td>${pos.side} × ${pos.qty.toFixed(6)}</td>
+      <td>${pos.entry?.toFixed(2)} / ${pos.mark?.toFixed(2)}</td>
+      <td>${pos.upnl?.toFixed(2)} / ${(pos.roe*100).toFixed(2)}%</td>
+      <td>${sl} / ${tps}</td>
+      <td>${tkx}</td>`;
+    tbody.appendChild(tr);
+  });
+};
+ws.onclose=()=>{ meta.innerHTML='<div class="warn">WS closed</div>'; };
+</script></body></html>

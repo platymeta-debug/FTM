@@ -1,5 +1,6 @@
 from __future__ import annotations
 import time
+from ftm2.journal.events import JEvent
 
 
 class RiskManager:
@@ -33,6 +34,8 @@ class RiskManager:
             be_px = entry_px * (1 + (self.cfg.BE_FEE_BUFFER_PCT / 100.0) * (1 if pos.qty > 0 else -1))
             await self._modify_stop_market(sym, be_px)
             self.notify.emit_once(f"be_{sym}", "fill", f"💹 {sym} BE 이동: {be_px:.2f}", 60000)
+            if getattr(self, "rt", None) and getattr(self.rt, "journal", None):
+                self.rt.journal.write(JEvent.now("RISK", symbol=sym, message=f"BE→{be_px:.2f}"))
 
     async def maybe_trail(self, sym, pos):
         if not self.cfg.TRAILING_ENABLED:
@@ -49,6 +52,8 @@ class RiskManager:
             new_sl = anchor + self.cfg.TRAILING_ATR * atr
             st["trail_anchor"] = anchor
         await self._modify_stop_market(sym, new_sl)
+        if getattr(self, "rt", None) and getattr(self.rt, "journal", None):
+            self.rt.journal.write(JEvent.now("RISK", symbol=sym, message=f"TRAIL→{new_sl:.2f}"))
 
     async def maybe_timeout_close(self, sym, pos):
         if not self.cfg.TIMEOUT_ENABLED:
@@ -64,6 +69,8 @@ class RiskManager:
             if self.guard:
                 self.guard.on_trade_close(pos.upnl)
             self.notify.emit("close", f"💹 {sym} 타임아웃 청산")
+            if getattr(self, "rt", None) and getattr(self.rt, "journal", None):
+                self.rt.journal.write(JEvent.now("RISK", symbol=sym, message="TIMEOUT_CLOSE"))
 
     async def _modify_stop_market(self, sym, new_px):
         od = await self.client.get_open_orders(symbol=sym)

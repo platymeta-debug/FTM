@@ -15,3 +15,10 @@ class RuntimeState:
         self.last_position_update: float = 0.0
         # [RUNTIME_TICKETS]
         self.active_ticket = {}     # {symbol: SetupTicket}
+        # [ANCHOR:RUNTIME_WS]
+        self.ws: dict[str, bool] = {}
+        self.open_orders: dict[str, int] = {}
+        self.daily_realized: float = 0.0
+        self.loss_streak: int = 0
+        self.guard_reason: str | None = None
+        self.journal = None
