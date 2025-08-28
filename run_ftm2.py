@@ -10,4 +10,3 @@ if __name__ == "__main__":
         sys.path.insert(0, str(ROOT))
     # 패키지 모듈을 __main__으로 실행 (python -m ftm2.app 과 동일)
     runpy.run_module("ftm2.app", run_name="__main__")
-
