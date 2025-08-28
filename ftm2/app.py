@@ -14,6 +14,7 @@ from ftm2.exchange import streams_market
 from ftm2.exchange.streams_user import user_stream
 from ftm2.trade.position_sizer import sizing_decision
 from ftm2.trade.order_router import OrderRouter, log_decision
+from ftm2.trade.bracket import Bracket
 from ftm2.risk.guardrails import GuardRails
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.reconcile.reconciler import resync_loop
@@ -190,7 +191,8 @@ async def main():
 
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ
-    ROUTER = OrderRouter(CFG, bx.filters)
+    brkt = Bracket(CFG, bx, bx.filters)
+    ROUTER = OrderRouter(CFG, bx.filters, bracket=brkt)
     GUARD = GuardRails(CFG)
     BX = bx
     tracker = PositionTracker()

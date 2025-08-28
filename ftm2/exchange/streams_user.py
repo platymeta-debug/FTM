@@ -1,48 +1,54 @@
 # [ANCHOR:M5_USER_STREAM]
-import asyncio, json, time
+import asyncio, json, time, websockets
 from ftm2.notify.discord_bot import edit_trade_card
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.exchange.binance_client import BinanceClient
+from ftm2.notify import dispatcher
 
 TRACKER: PositionTracker | None = None
 CSV = None
 LEDGER = None
 
-async def keepalive_loop(bx: BinanceClient, listen_key: str, interval_sec: int):
-    while True:
-        await asyncio.sleep(interval_sec)
-        try:
-            r = bx.keepalive_listen_key(listen_key)
-            if r and r.status_code == 200:
-                print("[USER_WS] keepalive OK")
-            else:
-                print("[USER_WS] keepalive ERR → recreate")
-                break
-        except Exception as e:
-            print("[USER_WS] keepalive exception", e); break
-
 async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
     global TRACKER
     TRACKER = tracker
+    listen_key = bx.create_listen_key()
+
+    async def on_message(raw: str):
+        msg = json.loads(raw)
+        if 'e' in msg:
+            await on_user_event(msg, bx, cfg, listen_key)
+
+    async def keepalive():
+        while True:
+            try:
+                bx.keepalive_listen_key(listen_key)
+                dispatcher.emit_once("lk_ok", "system", "🔑 listenKey keepalive", 3600000)
+            except Exception as e:
+                dispatcher.emit("error", f"🔑 keepalive err: {e}")
+            await asyncio.sleep(30*60)
+
+    asyncio.create_task(keepalive())
+
+    backoff = 1
+    url = f"{bx.WS_USER_BASE}/{listen_key}"
     while True:
-        lk = ""
-        keep = None
         try:
-            lk = bx.create_listen_key()
-            print(f"[USER_WS] listenKey={lk[:8]}… created")
-            keep = asyncio.create_task(keepalive_loop(bx, lk, cfg.LISTENKEY_KEEPALIVE_SEC))
-            async with bx.ws_connect_user(f"/{lk}") as ws:
-                print("[USER_WS] connected")
+            async with websockets.connect(url, ping_interval=15, ping_timeout=10, close_timeout=5) as ws:
+                dispatcher.emit_once("ws_user_ok", "system", "👤 USER_WS connected", 60000)
+                backoff = 1
                 async for raw in ws:
-                    msg = json.loads(raw)
-                    if 'e' in msg:
-                        await on_user_event(msg, bx, cfg, lk)
+                    await on_message(raw)
         except Exception as e:
-            print("[USER_WS] stream error → reconnect", e)
-        finally:
-            if keep and not keep.done():
-                keep.cancel()
-            await asyncio.sleep(1.0)
+            dispatcher.emit_once("ws_user_re", "error", f"⚠️ USER_WS reconnecting: {e}", 60000)
+            await asyncio.sleep(min(60, backoff))
+            backoff = min(60, backoff * 2)
+            try:
+                listen_key = bx.create_listen_key()
+            except Exception:
+                pass
+            url = f"{bx.WS_USER_BASE}/{listen_key}"
+            continue
 
 async def on_user_event(evt, bx: BinanceClient, cfg, listen_key: str):
 

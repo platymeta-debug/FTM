@@ -1,12 +1,13 @@
 # [ANCHOR:ORDER_ROUTER]
 from __future__ import annotations
-import time, math
+import time, math, asyncio
 from typing import Literal, Optional
 from ftm2.exchange.binance_client import BinanceClient
 from ftm2.notify import dispatcher
 from ftm2.trade.position_sizer import SizingDecision
 from ftm2.exchange.quantize import ExchangeFilters
 from ftm2.strategy.trace import DecisionTrace
+from ftm2.trade.bracket import Bracket
 
 CSV = None
 
@@ -35,7 +36,7 @@ def quantize(filters: ExchangeFilters, price: float, qty: float):
     return filters.q_price(price), filters.q_qty(qty)
 
 class OrderRouter:
-    def __init__(self, cfg, filters: ExchangeFilters, rt=None, market=None, notify=dispatcher):
+    def __init__(self, cfg, filters: ExchangeFilters, rt=None, market=None, notify=dispatcher, bracket: Bracket | None = None):
         self.cfg = cfg
         self.filters = filters
         self.bx = BinanceClient()
@@ -43,6 +44,7 @@ class OrderRouter:
         self.rt = rt
         self.market = market
         self.notify = notify
+        self.bracket = bracket
 
     def allow_live(self):
         self.live_allowed = True
@@ -155,6 +157,8 @@ class OrderRouter:
                         sl=dec.sl, tp=dec.tp, leverage=self.cfg.LEVERAGE, margin=self.cfg.MARGIN_TYPE,
                         reason=dec.reason,
                         route={"slippage":0, "post_only":self.cfg.POST_ONLY, "reduce_only":False, "type":params.get("type")})
+            if self.bracket:
+                asyncio.create_task(self._place_bracket_async(symbol, dec.side, float(q_price), float(q_qty)))
             return od
         except Exception as e:
             print(f"[ORDER][ERR] {e}")
@@ -163,6 +167,17 @@ class OrderRouter:
                 trace.reasons.append("order failed")
                 log_decision(trace)
             return None
+
+    async def _place_bracket_async(self, sym: str, side: str, entry_px: float, qty: float):
+        try:
+            if not self.bracket:
+                return
+            plan = await self.bracket.place(sym, side, entry_px, qty)
+            sl = float(plan.sl_px) if plan.sl_px else 0.0
+            tps = ", ".join(f"{float(px):.2f}x{float(q):.6f}" for px, q in plan.tps)
+            self.notify.emit("fill", f"💹 {sym} 브래킷 배치: SL {sl:.2f} / TP {tps}")
+        except Exception as e:
+            self.notify.emit("error", f"⚠️ 브래킷 배치 실패: {e}")
 
     def place_brackets(self, symbol: str, side: str, qty: float, entry_price: float, sl: float, tp: float):
         self.filters.use(symbol)

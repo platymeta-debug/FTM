@@ -122,7 +122,6 @@ class IntentQueue:
                                 try:
                                     self.notify.emit(
                                         "gate_skip", f"📡 {sym} 의도 취소: 재시도 초과"
-
                                     )
                                 except Exception:
                                     pass

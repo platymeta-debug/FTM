@@ -179,7 +179,11 @@ class Settings(BaseModel):
     # --- 진입/라우팅 ---
     ENTRY_ORDER: str = os.getenv("ENTRY_ORDER", "market")
     LIMIT_OFFSET_TICKS: int = int(os.getenv("LIMIT_OFFSET_TICKS", "2"))
-    BRACKET_MODE: str = os.getenv("BRACKET_MODE", "reduce")
+    BRACKET_MODE: str = os.getenv("BRACKET_MODE", "percent")
+    SL_PCT: float = float(os.getenv("SL_PCT", "0.010"))
+    TP1_PCT: float = float(os.getenv("TP1_PCT", "0.010"))
+    TP2_PCT: float = float(os.getenv("TP2_PCT", "0.020"))
+    TP_SPLIT: float = float(os.getenv("TP_SPLIT", "0.50"))
     TP_ORDER: str = os.getenv("TP_ORDER", "limit")
     SL_ORDER: str = os.getenv("SL_ORDER", "market")
     WORKING_TYPE: str = os.getenv("WORKING_TYPE", "MARK_PRICE")
@@ -190,6 +194,7 @@ class Settings(BaseModel):
     BACKOFF_429_MS: int = int(os.getenv("BACKOFF_429_MS", "800"))
     BACKOFF_NET_MS: int = int(os.getenv("BACKOFF_NET_MS", "500"))
     KILL_SWITCH_ON: bool = os.getenv("KILL_SWITCH_ON", "true").lower() == "true"
+    CARD_MAX_EDIT_MIN: int = int(os.getenv("CARD_MAX_EDIT_MIN", "50"))
 
     # --- 점수 기반 "비율적" 포지션/추가진입 ---
     TIER_BINS: list[str] = os.getenv("TIER_BINS", "60,70,80,90").split(",")
