@@ -27,6 +27,7 @@ class Settings(BaseModel):
     NOTIFY_THROTTLE_MS: int = int(os.getenv("NOTIFY_THROTTLE_MS", "60000"))
     ENTRY_TF: str = os.getenv("ENTRY_TF", "1m")
     ENTRY_COOLDOWN_SEC: int = int(os.getenv("ENTRY_COOLDOWN_SEC", "30"))
+    SETUP_INVALIDATION_BUFFER_PCT: float = float(os.getenv("SETUP_INVALIDATION_BUFFER_PCT", "0.05"))
     FILL_TIMEOUT_SEC: int = int(os.getenv("FILL_TIMEOUT_SEC", "2"))
     RENDER_CHARTS: bool = os.getenv("RENDER_CHARTS", "false").lower() == "true"
     RENDER_ON_NEW_BAR: bool = os.getenv("RENDER_ON_NEW_BAR", "true").lower() == "true"

@@ -5,6 +5,27 @@ from typing import List, Tuple
 def pre_trade_gates(rt, cfg, market, sym: str, dec, reasons: List[Tuple[str, str]] | None = None):
     """Check startup and autotrade gates."""
     reasons = reasons or []
+    # [ANCHOR:GATE_REQUIRE_TICKET]
+    ticket = getattr(rt, "active_ticket", {}).get(sym) if hasattr(rt, "active_ticket") else None
+    if not ticket:
+        reasons.append(("gate", "no_setup_ticket"))
+        return False, reasons
+    now = time.time()
+    if now > ticket.expire_ts:
+        reasons.append(("gate", "ticket_expired"))
+        if hasattr(rt, "active_ticket"):
+            rt.active_ticket.pop(sym, None)
+        return False, reasons
+    if market and hasattr(market, "mark"):
+        mpx = market.mark(sym)
+        buf = cfg.SETUP_INVALIDATION_BUFFER_PCT / 100.0 if hasattr(cfg, "SETUP_INVALIDATION_BUFFER_PCT") else 0.0
+        if (ticket.side == "LONG" and mpx <= ticket.stop_px * (1 + buf)) or \
+           (ticket.side == "SHORT" and mpx >= ticket.stop_px * (1 - buf)):
+            reasons.append(("gate", "ticket_invalidated"))
+            if hasattr(rt, "active_ticket"):
+                rt.active_ticket.pop(sym, None)
+            return False, reasons
+
     # 동일 바/방향 중복 진입 금지
     if hasattr(rt, "idem_hit") and hasattr(market, "bar_open_ts"):
         key = (sym, dec.side)

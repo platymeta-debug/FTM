@@ -37,6 +37,19 @@ class Notifier:
         }[which]
         self.dc.send(ch, text)
 
+    def push_signal(self, text: str):
+        """Directly send to signal channel."""
+        self._send("signals", text)
+
+    def push_trade(self, text: str):
+        """Directly send to trade channel."""
+        self._send("trades", text)
+
+    def push_log(self, text: str):
+        """Directly send to log channel."""
+        self._send("logs", text)
+
+
     def emit(self, event: str, text: str):
         which = self.route.get(event, "logs")
         if self.cfg.NOTIFY_STRICT:
@@ -55,15 +68,19 @@ class Notifier:
         self._throttle[key] = now
         self.emit(event, text)
 
-    # 과거 함수명 예방용(임시)
-    def send_trade(self, *_args, **_kwargs):
-        raise RuntimeError("Deprecated. Use emit('fill'|'close'|'pnl', text).")
 
-    def send_signal(self, *_args, **_kwargs):
-        raise RuntimeError("Deprecated. Use emit('intent'|'order_submitted'|'order_failed'|'gate_skip', text).")
+    def send_once(self, key: str, text: str, to: str = "logs"):
+        now = time.time() * 1000
+        if now - self._throttle.get(key, 0) < self.cfg.NOTIFY_THROTTLE_MS:
+            return
+        self._throttle[key] = now
+        if to == "signals":
+            self.push_signal(text)
+        elif to == "trades":
+            self.push_trade(text)
+        else:
+            self.push_log(text)
 
-    def send_log(self, *_args, **_kwargs):
-        raise RuntimeError("Deprecated. Use emit('system'|'error'|'chart', text).")
 
 
 class _DiscordAdapter:
@@ -84,3 +101,8 @@ notifier = Notifier(_cfg, _DiscordAdapter(_cfg))
 
 emit = notifier.emit
 emit_once = notifier.emit_once
+push_signal = notifier.push_signal
+push_trade = notifier.push_trade
+push_log = notifier.push_log
+send_once = notifier.send_once
+
