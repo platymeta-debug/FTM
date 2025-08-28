@@ -159,6 +159,9 @@ class OrderRouter:
                         route={"slippage":0, "post_only":self.cfg.POST_ONLY, "reduce_only":False, "type":params.get("type")})
             if self.bracket:
                 asyncio.create_task(self._place_bracket_async(symbol, dec.side, float(q_price), float(q_qty)))
+            # [CONSUME_TICKET]
+            if self.rt:
+                self.rt.active_ticket.pop(symbol, None)
             return od
         except Exception as e:
             print(f"[ORDER][ERR] {e}")

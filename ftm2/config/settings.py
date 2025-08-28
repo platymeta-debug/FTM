@@ -8,6 +8,8 @@ class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # legacy field
     TRADE_MODE: str = os.getenv("TRADE_MODE", MODE)  # testnet | live
     DATA_FEED: str = os.getenv("DATA_FEED", "live")  # live | testnet
+    # [PIPELINE_MODE]
+    PIPELINE_MODE: str = os.getenv("PIPELINE_MODE", "tickets")  # "tickets" | "legacy"
     WORKING_PRICE: str = os.getenv("WORKING_PRICE", "MARK_PRICE")
     LIVE_GUARD_ENABLE: bool = os.getenv("LIVE_GUARD_ENABLE", "true").lower() == "true"
     LIVE_MIN_NOTIONAL_USDT: float = float(os.getenv("LIVE_MIN_NOTIONAL_USDT", "10"))
@@ -26,8 +28,20 @@ class Settings(BaseModel):
     NOTIFY_STRICT: bool = os.getenv("NOTIFY_STRICT", "true").lower() == "true"
     NOTIFY_THROTTLE_MS: int = int(os.getenv("NOTIFY_THROTTLE_MS", "60000"))
     ENTRY_TF: str = os.getenv("ENTRY_TF", "1m")
-    ENTRY_COOLDOWN_SEC: int = int(os.getenv("ENTRY_COOLDOWN_SEC", "30"))
+    # [ANALYSIS/TICKET PARAMS]
+    SCORING_TFS: list[str] = os.getenv("SCORING_TFS", "1m,15m,1h,4h").split(",")
+    LONG_MIN_SCORE: int = int(os.getenv("LONG_MIN_SCORE", "60"))
+    SHORT_MIN_SCORE: int = int(os.getenv("SHORT_MIN_SCORE", "60"))
+    STOP_ATR: float = float(os.getenv("STOP_ATR", "1.5"))
+    TP1_ATR: float = float(os.getenv("TP1_ATR", "1.5"))
+    TP2_ATR: float = float(os.getenv("TP2_ATR", "3.0"))
+    MIN_RR: float = float(os.getenv("MIN_RR", "1.2"))
+    SETUP_TICKET_TTL_SEC: int = int(os.getenv("SETUP_TICKET_TTL_SEC", "300"))
     SETUP_INVALIDATION_BUFFER_PCT: float = float(os.getenv("SETUP_INVALIDATION_BUFFER_PCT", "0.05"))
+    ANALYSIS_SCORE_DELTA_MIN: int = int(os.getenv("ANALYSIS_SCORE_DELTA_MIN", "8"))
+    ANALYSIS_EDIT_MIN_MS: int = int(os.getenv("ANALYSIS_EDIT_MIN_MS", "15000"))
+    ANALYSIS_LIFETIME_MIN: int = int(os.getenv("ANALYSIS_LIFETIME_MIN", "55"))
+    ENTRY_COOLDOWN_SEC: int = int(os.getenv("ENTRY_COOLDOWN_SEC", "30"))
     FILL_TIMEOUT_SEC: int = int(os.getenv("FILL_TIMEOUT_SEC", "2"))
     RENDER_CHARTS: bool = os.getenv("RENDER_CHARTS", "false").lower() == "true"
     RENDER_ON_NEW_BAR: bool = os.getenv("RENDER_ON_NEW_BAR", "true").lower() == "true"
