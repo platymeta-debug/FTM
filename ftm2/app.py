@@ -44,6 +44,7 @@ from ftm2.ops.sync_guard import SyncGuard
 from ftm2.recover.snapshot import load_state, dump_state
 from ftm2.notify import dispatcher as NOTIFY
 
+
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
 from ftm2.exchange import streams_user as US
@@ -283,6 +284,7 @@ async def main():
             await asyncio.sleep(CFG.DASH_INTERVAL_S)
     tasks.append(asyncio.create_task(dashboard_task()))
 
+
     async def sync_watchdog():
         while True:
             try:
@@ -295,6 +297,7 @@ async def main():
             await asyncio.sleep(CFG.SYNC_PERIODIC_SEC)
 
     tasks.append(asyncio.create_task(sync_watchdog()))
+
 
     market_cache = {}
 

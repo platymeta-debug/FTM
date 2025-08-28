@@ -8,8 +8,10 @@ from ftm2.web.auth import verify
 from ftm2.web.ws import WSHub
 from ftm2.web.ipguard import require_ip_allow
 
+
 app = FastAPI(title="FTM2 Web", version="1.0")
 hub = WSHub()
+
 
 # [ANCHOR:WEB_READONLY_FLAG]
 READONLY = os.getenv("WEB_READONLY","true").lower() in ("1","true","yes")
@@ -21,11 +23,13 @@ async def readonly_guard(request, call_next):
         return JSONResponse({"error":"readonly mode"}, status_code=403)
     return await call_next(request)
 
+
 def init(app, cfg, rt, market, bracket, notify):
     origins = [o.strip() for o in os.getenv("WEB_CORS", "*").split(",")]
     app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True,
                        allow_methods=["*"], allow_headers=["*"])
     app.mount("/ui", StaticFiles(directory=os.getenv("WEB_STATIC_DIR","./ftm2/web/static"), html=True), name="ui")
+
 
     # [ANCHOR:WEB_SAFE_ROUTES]
     DISABLE_AB = os.getenv("DISABLE_AB_API","true").lower() in ("1","true","yes")
@@ -38,12 +42,14 @@ def init(app, cfg, rt, market, bracket, notify):
         from ftm2.web.ab import router as ab_router
         app.include_router(ab_router)
 
+
     @app.get("/api/health")
     async def health():
         return {"ok": True}
 
     @app.get("/api/state")
     async def state(_: None = Depends(verify), __: None = Depends(require_ip_allow)):
+
         ops = dash_collect(rt, cfg, market, bracket, None)
         return ops.__dict__
 
@@ -53,6 +59,7 @@ def init(app, cfg, rt, market, bracket, notify):
 
     @app.get("/api/tickets")
     async def tickets(_: None = Depends(verify), __: None = Depends(require_ip_allow)):
+
         return {k: vars(v) for k,v in rt.active_ticket.items()}
 
     @app.websocket("/ws")

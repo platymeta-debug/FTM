@@ -39,6 +39,7 @@ def summary(_: None = Depends(verify)):
 def sql(q: str, _: None = Depends(verify)):
     if os.getenv("DISABLE_SQL_API","true").lower() in ("1","true","yes"):
         return {"error":"sql api disabled"}
+
     if not os.getenv("JOURNAL_SQLITE_ENABLE","false").lower() in ("1","true","yes"):
         return {"error":"sqlite disabled"}
     db = os.getenv("JOURNAL_SQLITE_PATH","./logs/journal/trades.db")

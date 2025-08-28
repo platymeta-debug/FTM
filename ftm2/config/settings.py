@@ -226,6 +226,7 @@ class Settings(BaseModel):
     WEB_PUSH_INTERVAL_S: int = int(os.getenv("WEB_PUSH_INTERVAL_S", "3"))
     WEB_CORS: str = os.getenv("WEB_CORS", "*")
 
+
     # --- User stream / REST sync ---
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
     REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))
