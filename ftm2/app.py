@@ -34,6 +34,7 @@ from ftm2.trade.intent_queue import IntentQueue
 from ftm2.analysis.adapter import to_analysis_snapshot
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 from ftm2.strategy.trace import DecisionTrace
+from ftm2.account.leverage_sync import enforce_leverage_and_margin
 
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
@@ -220,6 +221,8 @@ async def main():
 
     div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
     MS.DIVERGENCE = div
+
+    await enforce_leverage_and_margin(bx, CFG, CFG.SYMBOLS)
 
     def _notify(text):
         try:

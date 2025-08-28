@@ -88,3 +88,37 @@ class Bracket:
                 tps.append((float(o.get("stopPrice", 0)), qty))
         tps.sort(key=lambda x: x[0], reverse=True)
         return sl, tps
+
+    # [ANCHOR:BRACKET_FROM_TICKET]
+    async def place_from_ticket(self, symbol: str, ticket, qty: float):
+        opp = "SELL" if ticket.side == "LONG" else "BUY"
+        await self.client.new_order(
+            symbol=symbol,
+            side=opp,
+            type="STOP_MARKET",
+            stopPrice=str(ticket.stop_px),
+            closePosition=True,
+            reduceOnly=True,
+            workingType="MARK_PRICE",
+            timeInForce="GTC",
+        )
+        split = float(self.cfg.TP_SPLIT)
+        tp_qty1 = self.filters.q_qty(symbol, qty * split)
+        tp_qty2 = self.filters.q_qty(symbol, qty - tp_qty1)
+        tps = [(ticket.tps[0], tp_qty1)]
+        if len(ticket.tps) > 1 and tp_qty2 > 0:
+            tps.append((ticket.tps[1], tp_qty2))
+        for tp_px, q in tps:
+            if q <= 0:
+                continue
+            await self.client.new_order(
+                symbol=symbol,
+                side=opp,
+                type="TAKE_PROFIT_MARKET",
+                stopPrice=str(tp_px),
+                quantity=str(q),
+                reduceOnly=True,
+                workingType="MARK_PRICE",
+                timeInForce="GTC",
+            )
+        return tps
