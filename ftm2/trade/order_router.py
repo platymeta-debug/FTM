@@ -8,8 +8,22 @@ def log_decision(*args, **kwargs):
 
 # [ANCHOR:ROUTER_TICKET_FLOW]
 class OrderRouter:
-    def __init__(self, cfg, client, sizer=None, market=None, fills=None, account=None, rt=None,
-                 bracket=None, risk=None, notify=dispatcher, cards=None, analysis_views=None):
+    def __init__(
+        self,
+        cfg,
+        client,
+        sizer=None,
+        market=None,
+        fills=None,
+        account=None,
+        rt=None,
+        bracket=None,
+        risk=None,
+        notify=dispatcher,
+        cards=None,
+        analysis_views=None,
+        sync_guard=None,
+    ):
 
         self.cfg = cfg
         self.client = client
@@ -23,6 +37,7 @@ class OrderRouter:
         self.notify = notify
         self.cards = cards
         self.analysis_views = analysis_views
+        self.sync_guard = sync_guard
 
     async def place_entry(self, sym: str):
         tk = self.rt.active_ticket.get(sym)
@@ -80,6 +95,29 @@ class OrderRouter:
                 for px, q in tps:
                     self.rt.journal.write(JEvent.now("TP_SET", symbol=sym, tp1=px, qty=q))
 
+        if self.sync_guard:
+            ok = await self.sync_guard.verify_after_fill(
+                sym, self.rt, self.bracket, self.analysis_views
+            )
+            if not ok and self.cards and pos:
+                await self.cards.upsert_trade_card(sym, pos, sl, tps, force=True)
+                if self.analysis_views and hasattr(self.analysis_views, "render_active"):
+                    entry_px = getattr(
+                        self.rt.positions.get(sym, pos), "entry_price", tk.entry_px
+                    )
+                    text = self.analysis_views.render_active(
+                        sym,
+                        side=tk.side,
+                        entry=entry_px,
+                        stop=sl,
+                        tps=[px for px, _ in tps],
+                    )
+                    self.notify._upsert_sticky(
+                        self.cfg.CHANNEL_SIGNALS,
+                        f"analysis_{sym}",
+                        text,
+                        lifetime_min=self.cfg.ANALYSIS_LIFETIME_MIN,
+                    )
 
         if self.risk and pos:
             self.risk.on_open(sym, getattr(pos, "entry_price", tk.entry_px))

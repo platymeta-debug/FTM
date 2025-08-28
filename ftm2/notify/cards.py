@@ -16,7 +16,14 @@ class TradeCards:
         self.prev_qty: dict[str, float] = {}
         self.prev_upnl: dict[str, float] = {}
 
-    def render_pos_card(self, sym: str, snap: PosSnap, sl: float | None, tps: list[tuple[float, float]], prev_qty: float | None):
+    def render_pos_card(
+        self,
+        sym: str,
+        snap: PosSnap,
+        sl: float | None,
+        tps: list[tuple[float, float]],
+        prev_qty: float | None,
+    ):
         side = "LONG" if snap.qty > 0 else "SHORT" if snap.qty < 0 else "FLAT"
         qty = abs(snap.qty)
         delta = qty - (prev_qty or 0.0)
@@ -33,19 +40,55 @@ class TradeCards:
             lines.append(f"Δ수량 {delta:+.6f}")
         return "\n".join(lines)
 
-    async def upsert_trade_card(self, sym: str, snap: PosSnap, sl: float | None, tps: list[tuple[float, float]]):
+    async def upsert_trade_card(
+        self,
+        sym: str,
+        snap: PosSnap,
+        sl: float | None,
+        tps: list[tuple[float, float]],
+        force: bool = False,
+    ):
         now = time.time()
         card = self.cards.get(sym)
         txt = self.render_pos_card(sym, snap, sl, tps, self.prev_qty.get(sym))
-        if card and (now - card.last_edit_at) < (self.cfg.TRADE_CARD_EDIT_MIN_MS / 1000):
+        if card and not force and (now - card.last_edit_at) < (
+            self.cfg.TRADE_CARD_EDIT_MIN_MS / 1000
+        ):
             return
-        if card and (now - card.created_at) > (self.cfg.TRADE_CARD_LIFETIME_MIN * 60):
+        if card and (now - card.created_at) > (
+            self.cfg.TRADE_CARD_LIFETIME_MIN * 60
+        ):
             card = None
+        components = [
+            [
+                {"type": 2, "label": "BE", "style": 2, "custom_id": f"btn_be_{sym}"},
+                {
+                    "type": 2,
+                    "label": "Close 50%",
+                    "style": 4,
+                    "custom_id": f"btn_half_{sym}",
+                },
+                {
+                    "type": 2,
+                    "label": "Flatten",
+                    "style": 4,
+                    "custom_id": f"btn_flat_{sym}",
+                },
+                {
+                    "type": 2,
+                    "label": "Cancel TP1",
+                    "style": 2,
+                    "custom_id": f"btn_ctp1_{sym}",
+                },
+            ]
+        ]
         if card:
-            await self.dc.edit(card.message_id, txt)
+            await self.dc.edit(card.message_id, txt, components=components)
             card.last_edit_at = now
         else:
-            mid = await self.dc.send(self.cfg.CHANNEL_TRADES, txt)
+            mid = await self.dc.send(
+                self.cfg.CHANNEL_TRADES, txt, components=components
+            )
             card = CardRef(message_id=mid, created_at=now, last_edit_at=now)
             self.cards[sym] = card
         self.prev_qty[sym] = abs(snap.qty)
