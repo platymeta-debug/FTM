@@ -36,18 +36,15 @@ async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
                 async for raw in ws:
                     msg = json.loads(raw)
                     if 'e' in msg:
-                        await on_user_event(msg, bx, cfg)
+                        await on_user_event(msg, bx, cfg, lk)
         except Exception as e:
             print("[USER_WS] stream error → reconnect", e)
         finally:
-            try:
-                if lk: bx.delete_listen_key(lk); print("[USER_WS] listenKey deleted")
-            except: pass
             if keep and not keep.done():
                 keep.cancel()
             await asyncio.sleep(1.0)
 
-async def on_user_event(evt, bx: BinanceClient, cfg):
+async def on_user_event(evt, bx: BinanceClient, cfg, listen_key: str):
 
     et = evt.get("e")
     if et == "ORDER_TRADE_UPDATE":
@@ -96,3 +93,10 @@ async def on_user_event(evt, bx: BinanceClient, cfg):
         if CSV:
             CSV.log("SNAPSHOT", symbol=sym if 'sym' in locals() else "", reason="account_update",
                     wallet=TRACKER.account.wallet_balance, equity=TRACKER.account.equity, avail=TRACKER.account.available_balance)
+    elif et == "listenKeyExpired":
+        try:
+            bx.delete_listen_key(listen_key)
+            print("[USER_WS] listenKey deleted")
+        except Exception as e:
+            print("[USER_WS] listenKey delete failed", e)
+        raise RuntimeError("listenKeyExpired")
