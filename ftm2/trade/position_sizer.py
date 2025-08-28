@@ -87,6 +87,25 @@ def sizing_decision(
     entry_type = cfg.ENTRY_ORDER
     limit_offset_ticks = cfg.LIMIT_OFFSET_TICKS
 
+    # 6) 최소 명목가 충족(있으면 보정, 아니면 미진입)
+    try:
+        from ftm2.exchange.quantize import ExchangeFilters
+        if isinstance(filters, ExchangeFilters):
+            filters.use(symbol)
+            if not filters.min_ok(price, target_qty):
+                if cfg.ORDER_SCALE_TO_MIN:
+                    q_min = filters.min_qty_for(price, symbol=symbol)
+                    if q_min and q_min > 0:
+                        target_qty = float(filters.q_qty(symbol, q_min))
+                    else:
+                        return None
+                else:
+                    return None
+            if target_qty <= 0:
+                return None
+    except Exception:
+        pass
+
     # 6) 필터 정량화 (호출은 router에서 수행)
     return SizingDecision(
         side=side, qty=target_qty, entry_type=entry_type,
