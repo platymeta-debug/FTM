@@ -1,9 +1,11 @@
 
 import asyncio, json, websockets
+from asyncio import TimeoutError
 from ftm2.config.settings import load_env_chain
 from ftm2.notify.discord_bot import edit_trade_card
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.analysis.divergence import DivergenceMonitor
+from ftm2.notify import dispatcher
 
 CFG = load_env_chain()
 WS_LIVE = "wss://fstream.binance.com"
@@ -59,20 +61,30 @@ async def market_stream(symbols, interval, on_msg):
     url = f"{base}/stream?streams={'/'.join(names)}"
     print(f"[MKT_WS] connecting → {url}")
     test_task = None
-    if CFG.DATA_FEED == "live" and DIVERGENCE:
-        test_task = asyncio.create_task(_test_mark_loop(symbols))
-    async with websockets.connect(url, ping_interval=150) as ws:
-        print("[MKT_WS] connected")
-        first = True
+    backoff = 1
+    while True:
         try:
-            async for raw in ws:
-                data = json.loads(raw)
-                if first:
-                    stream = data.get("stream")
-                    print(f"[MKT_WS] first msg on {stream}")
-                    first = False
-                await on_msg(data)
+            if CFG.DATA_FEED == "live" and DIVERGENCE and (test_task is None or test_task.done()):
+                test_task = asyncio.create_task(_test_mark_loop(symbols))
+            async with websockets.connect(
+                url,
+                ping_interval=15,
+                ping_timeout=10,
+                close_timeout=5,
+                max_queue=128,
+            ) as ws:
+                dispatcher.emit_once("ws_mkt_ok", "system", "📡 MKT_WS connected", 60000)
+                backoff = 1
+                async for raw in ws:
+                    data = json.loads(raw)
+                    await on_msg(data)
+        except (websockets.exceptions.ConnectionClosedError, TimeoutError, OSError) as e:
+            dispatcher.emit_once("ws_mkt_re", "error", f"⚠️ MKT_WS reconnecting: {e}", 60000)
+            await asyncio.sleep(min(60, backoff))
+            backoff = min(60, backoff * 2)
+            continue
         finally:
             if test_task:
                 test_task.cancel()
+                test_task = None
 

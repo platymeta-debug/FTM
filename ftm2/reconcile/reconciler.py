@@ -1,6 +1,6 @@
 # [ANCHOR:M5_RECONCILER]
 import asyncio
-from ftm2.notify.discord_bot import send_log
+from ftm2.notify import dispatcher
 
 async def resync_loop(bx, tracker, cfg, symbols):
     while True:
@@ -26,5 +26,5 @@ async def resync_loop(bx, tracker, cfg, symbols):
                     tracker.set_liq(sym, side, liq)
             tracker.recompute_totals()
         except Exception as e:
-            send_log(f"⚠️ 재동기화 실패: {e}")
+            dispatcher.emit("error", f"⚠️ 재동기화 실패: {e}")
         await asyncio.sleep(cfg.REST_RESYNC_SEC)
