@@ -106,24 +106,33 @@ class BinanceClient:
                 r.raise_for_status()
                 return r.json()
             except httpx.HTTPStatusError as e:
-                body = e.response.text
+                body = r.text
                 code = None
                 msg = body
                 try:
-                    j = e.response.json()
+                    j = r.json()
                     code = j.get("code")
                     msg = j.get("msg", body)
+                    body = f"code={code} msg={msg}"
                 except Exception:
                     pass
                 symbol = kwargs.get("symbol")
-                send_trade(f"❌ 진입 주문 실패: {symbol} status={e.response.status_code} code={code} msg={msg}")
-                if code in FATAL_USER_ERRORS or e.response.status_code == 400:
-                    raise
-                if e.response.status_code in RETRYABLE_STATUS and attempt < CFG.RETRY_MAX:
-                    backoff_ms = CFG.BACKOFF_429_MS if e.response.status_code in (418, 429) else CFG.BACKOFF_NET_MS
+                send_trade(
+                    f"❌ 진입 주문 실패: {symbol} status={r.status_code} code={code} msg={msg}"
+                )
+                if code in FATAL_USER_ERRORS or r.status_code == 400:
+                    raise RuntimeError(
+                        f"HTTP {r.status_code} {e.request.url} body={body}"
+                    ) from e
+                if r.status_code in RETRYABLE_STATUS and attempt < CFG.RETRY_MAX:
+                    backoff_ms = (
+                        CFG.BACKOFF_429_MS if r.status_code in (418, 429) else CFG.BACKOFF_NET_MS
+                    )
                     time.sleep(backoff_ms / 1000)
                     continue
-                raise
+                raise RuntimeError(
+                    f"HTTP {r.status_code} {e.request.url} body={body}"
+                ) from e
 
     # [ANCHOR:M5_BINANCE_REST]
     def get_account_v2(self):

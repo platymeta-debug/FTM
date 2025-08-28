@@ -11,6 +11,19 @@ class Settings(BaseModel):
     WORKING_PRICE: str = os.getenv("WORKING_PRICE", "MARK_PRICE")
     LIVE_GUARD_ENABLE: bool = os.getenv("LIVE_GUARD_ENABLE", "true").lower() == "true"
     LIVE_MIN_NOTIONAL_USDT: float = float(os.getenv("LIVE_MIN_NOTIONAL_USDT", "10"))
+    ORDER_SCALE_TO_MIN: bool = os.getenv("ORDER_SCALE_TO_MIN", "true").lower() == "true"
+    INTENT_AUTOFIRE_SCALE_TO_MIN: bool = os.getenv("INTENT_AUTOFIRE_SCALE_TO_MIN", "true").lower() == "true"
+    INTENT_BACKOFF_MS: int = int(os.getenv("INTENT_BACKOFF_MS", "1500"))
+    INTENT_MAX_RETRY: int = int(os.getenv("INTENT_MAX_RETRY", "5"))
+    AUTOTRADE_DEFAULT: bool = os.getenv("AUTOTRADE_DEFAULT", "false").lower() == "true"
+    STARTUP_HOLD_SEC: int = int(os.getenv("STARTUP_HOLD_SEC", "20"))
+    STARTUP_REQUIRE_ANALYSIS: bool = os.getenv("STARTUP_REQUIRE_ANALYSIS", "true").lower() == "true"
+    STARTUP_REQUIRE_NEW_BAR: bool = os.getenv("STARTUP_REQUIRE_NEW_BAR", "true").lower() == "true"
+    SEND_SKIP_TO_TRADES: bool = os.getenv("SEND_SKIP_TO_TRADES", "false").lower() == "true"
+    NOTIFY_THROTTLE_MS: int = int(os.getenv("NOTIFY_THROTTLE_MS", "60000"))
+    RENDER_CHARTS: bool = os.getenv("RENDER_CHARTS", "false").lower() == "true"
+    RENDER_ON_NEW_BAR: bool = os.getenv("RENDER_ON_NEW_BAR", "true").lower() == "true"
+    RENDER_INTERVAL_SEC: int = int(os.getenv("RENDER_INTERVAL_SEC", "180"))
     LIVE_CONFIRM_MODE: str = os.getenv("LIVE_CONFIRM_MODE", "auto")
     CONFIRM_TIMEOUT_S: int = int(os.getenv("CONFIRM_TIMEOUT_S", "15"))
     ANALYZE_INTERVAL_S: int = int(os.getenv("ANALYZE_INTERVAL_S", "30"))

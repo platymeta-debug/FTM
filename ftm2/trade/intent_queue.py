@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from ftm2.trade.position_sizer import SizingDecision
+from ftm2.notify import dispatcher
 
 
 @dataclass
@@ -13,12 +15,14 @@ class _Intent:
     sizing: SizingDecision
     gates_ok: bool = True
     autofire: bool = False
+    attempts: int = 0
+    next_try_ts: float = 0.0
 
 
 class IntentQueue:
     """Manage trade intents produced by analysis snapshots."""
 
-    def __init__(self, cfg, divergence, router, csv, notify):
+    def __init__(self, cfg, divergence, router, csv, notify=dispatcher):
         self.cfg = cfg
         self.divergence = divergence
         self.router = router
@@ -44,7 +48,7 @@ class IntentQueue:
 
         # notify intent
         try:
-            self.notify(f"{sym} 의도만: {direction} / {score:+.1f}")
+            self.notify.send_log(f"{sym} 의도만: {direction} / {score:+.1f}")
         except Exception:
             pass
 
@@ -76,25 +80,59 @@ class IntentQueue:
                 for sym, it in list(self.intents.items()):
                     filters = self.router.filters
                     filters.use(sym)
-                    for need in ("q_price", "q_qty", "min_ok"):
+                    for need in ("q_price", "q_qty", "min_ok", "min_qty_for"):
                         if not hasattr(filters, need):
                             raise RuntimeError(f"ExchangeFilters has no {need}")
                     if not it.gates_ok:
                         continue
+                    # 백오프
+                    now = time.time()
+                    if it.next_try_ts and now < it.next_try_ts:
+                        continue
+
+                    # 사전 필터 검증
+                    q = it.sizing.qty
+                    px = it.mark
+                    if not filters.min_ok(px, q):
+                        if self.cfg.ORDER_SCALE_TO_MIN and self.cfg.INTENT_AUTOFIRE_SCALE_TO_MIN:
+                            q_min = filters.min_qty_for(px, symbol=sym)
+                            it.sizing.qty = float(q_min)
+                        else:
+                            self.intents.pop(sym, None)
+                            try:
+                                self.notify.send_once(
+                                    f"intent_skip_{sym}",
+                                    f"{sym} 의도 취소: 최소 명목 미달",
+                                    "logs",
+                                    self.cfg.NOTIFY_THROTTLE_MS,
+                                )
+                            except Exception:
+                                pass
+                            continue
+
                     if it.autofire:
                         ok = self.router.place_entry(sym, it.sizing, it.mark)
                         if ok:
                             try:
-                                self.notify(
+                                self.notify.send_trade(
                                     f"{sym} 진입: {it.side} x{it.sizing.qty} @~{it.mark:.2f}"
                                 )
                             except Exception:
                                 pass
                             self.intents.pop(sym, None)
+                        else:
+                            it.attempts += 1
+                            it.next_try_ts = time.time() + (self.cfg.INTENT_BACKOFF_MS / 1000.0)
+                            if it.attempts >= self.cfg.INTENT_MAX_RETRY:
+                                self.intents.pop(sym, None)
+                                try:
+                                    self.notify.send_log(f"{sym} 의도 취소: 재시도 초과")
+                                except Exception:
+                                    pass
                 await asyncio.sleep(0.2)
             except Exception as e:
                 try:
-                    self.notify(f"[INTENT][ERR] {e}")
+                    self.notify.send_log(f"[INTENT][ERR] {e}")
                 except Exception:
                     pass
                 await asyncio.sleep(1.0)

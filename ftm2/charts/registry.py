@@ -48,6 +48,9 @@ def should_render(cfg, snapshot):
     sym = getattr(snapshot, "symbol", "UNKNOWN")
     now = time.time()
 
+    if not getattr(cfg, "RENDER_CHARTS", True):
+        return False, {"reason": "disabled"}
+
     min_interval = _cfg_int(cfg, "CHART_MIN_INTERVAL_S", 10)
     last = _LAST_FP.get(sym)
     if last and (now - last[1]) < min_interval:

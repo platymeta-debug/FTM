@@ -189,7 +189,7 @@ async def update_analysis(
     view:     dict 가공본 (텍스트 임베드용)
     """
 
-    from ftm2.charts.registry import render_ready
+    from ftm2.charts.registry import render_ready, should_render
     from ftm2.charts.builder import render_analysis_charts
 
 
