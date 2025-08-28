@@ -14,6 +14,7 @@ from ftm2.exchange import streams_market
 from ftm2.exchange.streams_user import user_stream
 from ftm2.trade.position_sizer import sizing_decision
 from ftm2.trade.order_router import OrderRouter, log_decision
+from ftm2.trade.bracket import Bracket
 from ftm2.risk.guardrails import GuardRails
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.reconcile.reconciler import resync_loop
@@ -190,7 +191,8 @@ async def main():
 
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ
-    ROUTER = OrderRouter(CFG, bx.filters)
+    brkt = Bracket(CFG, bx, bx.filters)
+    ROUTER = OrderRouter(CFG, bx.filters, bracket=brkt)
     GUARD = GuardRails(CFG)
     BX = bx
     tracker = PositionTracker()
@@ -225,6 +227,9 @@ async def main():
 
     from ftm2.notify import dispatcher as NOTIFY
     INTQ = IntentQueue(CFG, div, ROUTER, CSV, NOTIFY)
+    NOTIFY.emit("system", f"[NOTIFY_MAP] {NOTIFY.notifier.route}")
+    NOTIFY.emit("intent", "📡 [테스트] 신호 채널 확인")
+    NOTIFY.emit("fill", "💹 [테스트] 트레이드 채널 확인")
 
     LC = LossCutController(CFG, LEDGER, tracker, router=type("R",(),{"close_all":_close_all}), notify=_notify, csv_logger=CSV)
 
