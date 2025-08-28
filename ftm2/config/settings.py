@@ -21,6 +21,9 @@ class Settings(BaseModel):
     STARTUP_REQUIRE_NEW_BAR: bool = os.getenv("STARTUP_REQUIRE_NEW_BAR", "true").lower() == "true"
     SEND_SKIP_TO_TRADES: bool = os.getenv("SEND_SKIP_TO_TRADES", "false").lower() == "true"
     NOTIFY_THROTTLE_MS: int = int(os.getenv("NOTIFY_THROTTLE_MS", "60000"))
+    ENTRY_TF: str = os.getenv("ENTRY_TF", "1m")
+    ENTRY_COOLDOWN_SEC: int = int(os.getenv("ENTRY_COOLDOWN_SEC", "30"))
+    FILL_TIMEOUT_SEC: int = int(os.getenv("FILL_TIMEOUT_SEC", "2"))
     RENDER_CHARTS: bool = os.getenv("RENDER_CHARTS", "false").lower() == "true"
     RENDER_ON_NEW_BAR: bool = os.getenv("RENDER_ON_NEW_BAR", "true").lower() == "true"
     RENDER_INTERVAL_SEC: int = int(os.getenv("RENDER_INTERVAL_SEC", "180"))
