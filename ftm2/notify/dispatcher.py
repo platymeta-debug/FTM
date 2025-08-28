@@ -113,6 +113,7 @@ async def send(channel_key_or_name: str, text: str):
 async def edit(message_id, text: str):
     return None
 
+
 # ================== DISPATCHER DC ADAPTER (HARDENED) ==================
 import os, asyncio
 
@@ -137,10 +138,12 @@ def configure_channels(**kw):
 def _resolve_channel(key_or_name: str):
     """
     'signals'(별칭) / '#포지션신호'(이름) / '123456789...' (ID) 모두 허용.
+
     매칭 실패 시 'signals'로 폴백.
     """
     if not key_or_name:
         return CHANNELS.get("signals", "signals")
+
     k = str(key_or_name).strip()
     if k in CHANNELS:                # 별칭
         return CHANNELS[k]
@@ -167,6 +170,7 @@ async def _send_impl(channel_key_or_name: str, text: str):
 
 async def _edit_impl(message_id, text: str):
     if 'edit' in globals():
+
         return await edit(message_id, text)  # 실제 수정 함수명으로 연결
     if 'emit' in globals():
         try:
@@ -190,6 +194,7 @@ class _DCAdapter:
         return await _send_impl(channel_key_or_name, text)
     async def edit(self, message_id, text: str):
         return await _edit_impl(message_id, text)
+
 
 class _NoopDC:
     """최후방 안전망: dc가 None이어도 .use/.send/.edit가 존재하도록 보장"""
@@ -216,4 +221,5 @@ def ensure_dc():
         dc = _DCAdapter()
     return dc
 # =====================================================================
+
 
