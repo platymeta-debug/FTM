@@ -1,3 +1,4 @@
+import os
 import time
 from ftm2.config.settings import load_env_chain
 from ftm2.notify import discord_bot
@@ -48,6 +49,7 @@ class Notifier:
         """Directly send to log channel."""
         self._send("logs", text)
 
+
     def emit(self, event: str, text: str):
         which = self.route.get(event, "logs")
         if self.cfg.NOTIFY_STRICT:
@@ -66,6 +68,7 @@ class Notifier:
         self._throttle[key] = now
         self.emit(event, text)
 
+
     def send_once(self, key: str, text: str, to: str = "logs"):
         now = time.time() * 1000
         if now - self._throttle.get(key, 0) < self.cfg.NOTIFY_THROTTLE_MS:
@@ -77,6 +80,7 @@ class Notifier:
             self.push_trade(text)
         else:
             self.push_log(text)
+
 
 
 class _DiscordAdapter:
@@ -101,3 +105,4 @@ push_signal = notifier.push_signal
 push_trade = notifier.push_trade
 push_log = notifier.push_log
 send_once = notifier.send_once
+
