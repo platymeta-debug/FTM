@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """간단한 스냅샷 점수화 로직."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 
 import pandas as pd
@@ -26,6 +26,8 @@ try:  # pragma: no cover
 except Exception:  # pragma: no cover
     from . import reasons
 
+from ftm2.charts.registry import compute_fingerprint
+
 
 @dataclass
 class Contribution:
@@ -46,6 +48,8 @@ class Snapshot:
     rules: Dict[str, Any]
     plan: Optional[Dict[str, Any]] = None
     trend_state: str = "UNKNOWN"
+    reasons: List[str] = field(default_factory=list)
+    fingerprint: str = ""
 
     # ✅ 과거 코드 호환 (app.py에서 snap.tfs를 쓰는 부분)
     @property
@@ -186,4 +190,5 @@ def score_snapshot(symbol: str, cache: Dict[str, pd.DataFrame], tfs: List[str], 
         plan=None,
         trend_state=trend_state,
     )
+    snap.fingerprint = compute_fingerprint(snap)
     return snap
