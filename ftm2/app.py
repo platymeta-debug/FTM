@@ -223,7 +223,8 @@ async def main():
         from ftm2.trade import order_router as OR
         return await OR.close_position_all(sym)
 
-    INTQ = IntentQueue(CFG, div, ROUTER, CSV, _notify)
+    from ftm2.notify import dispatcher as NOTIFY
+    INTQ = IntentQueue(CFG, div, ROUTER, CSV, NOTIFY)
 
     LC = LossCutController(CFG, LEDGER, tracker, router=type("R",(),{"close_all":_close_all}), notify=_notify, csv_logger=CSV)
 

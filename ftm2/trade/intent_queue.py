@@ -4,6 +4,7 @@ import asyncio
 import time
 from dataclasses import dataclass
 from ftm2.trade.position_sizer import SizingDecision
+from ftm2.notify import dispatcher
 
 
 @dataclass
@@ -21,7 +22,7 @@ class _Intent:
 class IntentQueue:
     """Manage trade intents produced by analysis snapshots."""
 
-    def __init__(self, cfg, divergence, router, csv, notify):
+    def __init__(self, cfg, divergence, router, csv, notify=dispatcher):
         self.cfg = cfg
         self.divergence = divergence
         self.router = router
@@ -47,7 +48,7 @@ class IntentQueue:
 
         # notify intent
         try:
-            self.notify(f"{sym} 의도만: {direction} / {score:+.1f}")
+            self.notify.send_log(f"{sym} 의도만: {direction} / {score:+.1f}")
         except Exception:
             pass
 
@@ -99,7 +100,13 @@ class IntentQueue:
                         else:
                             self.intents.pop(sym, None)
                             try:
-                                self.notify(f"{sym} 의도 취소: 최소 명목가 미만 (qty={q}, px≈{px:.4f})")
+                                self.notify.send_once(
+                                    f"intent_skip_{sym}",
+                                    f"{sym} 의도 취소: 최소 명목 미달",
+                                    "logs",
+                                    self.cfg.NOTIFY_THROTTLE_MS,
+                                )
+
                             except Exception:
                                 pass
                             continue
@@ -108,7 +115,7 @@ class IntentQueue:
                         ok = self.router.place_entry(sym, it.sizing, it.mark)
                         if ok:
                             try:
-                                self.notify(
+                                self.notify.send_trade(
                                     f"{sym} 진입: {it.side} x{it.sizing.qty} @~{it.mark:.2f}"
                                 )
                             except Exception:
@@ -120,13 +127,14 @@ class IntentQueue:
                             if it.attempts >= self.cfg.INTENT_MAX_RETRY:
                                 self.intents.pop(sym, None)
                                 try:
-                                    self.notify(f"{sym} 의도 취소: 재시도 초과")
+                                    self.notify.send_log(f"{sym} 의도 취소: 재시도 초과")
+
                                 except Exception:
                                     pass
                 await asyncio.sleep(0.2)
             except Exception as e:
                 try:
-                    self.notify(f"[INTENT][ERR] {e}")
+                    self.notify.send_log(f"[INTENT][ERR] {e}")
                 except Exception:
                     pass
                 await asyncio.sleep(1.0)
