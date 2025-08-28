@@ -20,6 +20,7 @@ class AnalysisNotify:
             self.notify.emit("system", text)
 
     def upsert_analysis(self, sym: str, score: int, trend: str, ticket, confidence: float | None = None, regime: str | None = None):
+
         changed = (
             abs(score - self.prev.get(sym, {}).get("score", 0)) >= self.cfg.ANALYSIS_SCORE_DELTA_MIN
             or bool(ticket) != self.prev.get(sym, {}).get("has_ticket", False)

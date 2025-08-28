@@ -39,6 +39,7 @@ class OrderRouter:
             self.notify.emit("gate_skip", f"📡 {sym} 쿨다운 중 → 스킵")
             return False
 
+
         resp = await self.client.new_order(symbol=sym, side=("BUY" if tk.side == "LONG" else "SELL"),
                                            type="MARKET", quantity=str(qty))
         self.notify.emit("order_submitted", f"📡 ✅ {sym} {tk.side} qty={qty} (ticket={tk.id})")
@@ -55,6 +56,7 @@ class OrderRouter:
         if not ok and (not pos or abs(getattr(pos, "qty", 0)) < 1e-12):
             self.notify.emit("order_failed", f"📡 ⏱️ {sym} 체결 확인 실패")
             return False
+
 
         tps = []
         sl = tk.stop_px
