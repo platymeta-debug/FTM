@@ -16,6 +16,7 @@ def reset_cache() -> None:
 if getattr(SETTINGS, "CHART_FINGERPRINT_RESET", False):
     reset_cache()
 
+
 _LAST_FP: dict[str, Optional[str]] = {}
 _LAST_TS: dict[str, float] = {}
 
@@ -36,6 +37,7 @@ def should_render(symbol: str, fingerprint: Optional[str]) -> bool:
     _LAST_TS[symbol] = now
     _LAST_FP[symbol] = fingerprint
     return True
+
 
 
 def render_ready(path: str) -> bool:

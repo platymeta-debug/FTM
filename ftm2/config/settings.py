@@ -40,6 +40,7 @@ class Settings(BaseModel):
     CHART_FORCE_FIRST_RENDER: bool = os.getenv("CHART_FORCE_FIRST_RENDER", "false").lower() == "true"
     CHART_FINGERPRINT_RESET: bool = os.getenv("CHART_FINGERPRINT_RESET", "false").lower() == "true"
 
+
     # SIGNALS
     ENTER_TH: int = int(os.getenv("ENTER_TH", "60"))
     COOLDOWN_SEC: int = int(os.getenv("COOLDOWN_SEC", "300"))
