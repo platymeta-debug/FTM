@@ -85,6 +85,7 @@ class ExchangeFilters:
             raise TypeError("min_ok('SYM', price, qty) 또는 min_ok(price, qty, symbol='SYM') 형태로 호출하세요.")
         return self.map[symbol].min_ok(self._coerce_decimal(price), self._coerce_decimal(qty))
 
+
     def min_qty_for_notional(self, symbol: str, price, min_notional_override: float | None = None) -> Decimal:
         f = self.map[symbol]
         px = price if isinstance(price, Decimal) else Decimal(str(price))
@@ -104,6 +105,7 @@ class ExchangeFilters:
             return qy
         need = self.min_qty_for_notional(symbol, px, min_notional_override)
         return need if f.min_ok(px, need) else None
+
 
     def tick_size(self, symbol: str) -> Decimal:
         return self.map[symbol].tick

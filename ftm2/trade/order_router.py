@@ -79,7 +79,9 @@ class OrderRouter:
         return True
 
     def place_entry(self, symbol: str, dec: SizingDecision, mark_price: float, trace: DecisionTrace | None = None):
+
         q = dec.qty
+
         entry_price = mark_price
         # limit 오더면 틱 오프셋 반영
         if dec.entry_type == "limit":
