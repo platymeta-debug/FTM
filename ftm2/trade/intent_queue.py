@@ -48,7 +48,8 @@ class IntentQueue:
 
         # notify intent
         try:
-            self.notify.push_signal(f"{sym} 의도만: {direction} / {score:+.1f}")
+            self.notify.emit("intent", f"📡 {sym} 의도만: {direction} / {score:+.1f}")
+
         except Exception:
             pass
 
@@ -100,12 +101,11 @@ class IntentQueue:
                         else:
                             self.intents.pop(sym, None)
                             try:
-                                self.notify.send_once(
+                                self.notify.emit_once(
                                     f"intent_skip_{sym}",
-                                    f"{sym} 의도 취소: 최소 명목 미달",
-                                    to="signals",
+                                    "gate_skip",
+                                    f"📡 ❌ {sym} 의도 취소: 최소 명목 미달",
                                 )
-
                             except Exception:
                                 pass
                             continue
@@ -113,12 +113,6 @@ class IntentQueue:
                     if it.autofire:
                         ok = self.router.place_entry(sym, it.sizing, it.mark)
                         if ok:
-                            try:
-                                self.notify.push_trade(
-                                    f"{sym} 진입: {it.side} x{it.sizing.qty} @~{it.mark:.2f}"
-                                )
-                            except Exception:
-                                pass
                             self.intents.pop(sym, None)
                         else:
                             it.attempts += 1
@@ -126,15 +120,16 @@ class IntentQueue:
                             if it.attempts >= self.cfg.INTENT_MAX_RETRY:
                                 self.intents.pop(sym, None)
                                 try:
-                                    self.notify.push_signal(
-                                        f"{sym} 의도 취소: 재시도 초과"
+                                    self.notify.emit(
+                                        "gate_skip", f"📡 {sym} 의도 취소: 재시도 초과"
+
                                     )
                                 except Exception:
                                     pass
                 await asyncio.sleep(0.2)
             except Exception as e:
                 try:
-                    self.notify.push_log(f"[INTENT][ERR] {e}")
+                    self.notify.emit("error", f"[INTENT][ERR] {e}")
                 except Exception:
                     pass
                 await asyncio.sleep(1.0)

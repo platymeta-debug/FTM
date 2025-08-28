@@ -18,13 +18,13 @@ def log_decision(trace: DecisionTrace):
     )
 
     if "ENTER" in trace.reasons:
-        dispatcher.push_signal(
-            f"{trace.symbol} 진입 신호 → {trace.direction} / {trace.decision_score:+.1f}"
+        dispatcher.emit(
+            "intent", f"📡 {trace.symbol} 진입 신호 → {trace.direction} / {trace.decision_score:+.1f}"
         )
     else:
-        dispatcher.push_signal(
-            f"{trace.symbol} 의도만: {trace.direction} / {trace.decision_score:+.1f} "
-            f"/ 사유: {', '.join(trace.reasons)}"
+        dispatcher.emit(
+            "intent",
+            f"📡 {trace.symbol} 의도만: {trace.direction} / {trace.decision_score:+.1f} / 사유: {', '.join(trace.reasons)}",
         )
 
 
@@ -108,11 +108,10 @@ class OrderRouter:
                 if trace:
                     trace.reasons.append("below min notional")
                     log_decision(trace)
-                to = "trades" if self.cfg.SEND_SKIP_TO_TRADES else "logs"
-                self.notify.send_once(
+                self.notify.emit_once(
                     key=f"skip_min_{symbol}",
-                    text=f"❌ 최소 명목 미달로 스킵: {symbol} px~{entry_price:.2f} qty_req≥{self.filters.min_qty_for(entry_price, symbol)}",
-                    to=to,
+                    event="gate_skip",
+                    text=f"📡 ❌ 최소 명목 미달로 스킵: {symbol} px~{entry_price:.2f} qty_req≥{self.filters.min_qty_for(entry_price, symbol)}",
                 )
                 return None
 
@@ -121,11 +120,10 @@ class OrderRouter:
             if trace:
                 trace.reasons.append("qty quantized zero")
                 log_decision(trace)
-            to = "trades" if self.cfg.SEND_SKIP_TO_TRADES else "logs"
-            self.notify.send_once(
+            self.notify.emit_once(
                 key=f"skip_qty0_{symbol}",
-                text=f"❌ 진입 스킵: {symbol} {dec.side} — 수량이 0",
-                to=to,
+                event="gate_skip",
+                text=f"📡 ❌ 진입 스킵: {symbol} {dec.side} — 수량이 0",
             )
 
             return None
@@ -144,8 +142,9 @@ class OrderRouter:
             print(f"[ORDER][TRY] {symbol} {dec.side} qty={float(q_qty)}")
             od = self.bx.new_order(**params)
             print(f"[ORDER][RESP] {od}")
-            self.notify.push_signal(
-                f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {float(q_qty)} / {dec.reason}"
+            self.notify.emit(
+                "order_submitted",
+                f"📡 ✅ 진입 주문 전송: {symbol} {dec.side} 수량 {float(q_qty)} / {dec.reason}",
             )
 
             if trace:
@@ -159,7 +158,7 @@ class OrderRouter:
             return od
         except Exception as e:
             print(f"[ORDER][ERR] {e}")
-            self.notify.push_signal(f"❌ 진입 주문 실패: {symbol} {e}")
+            self.notify.emit("order_failed", f"📡 ❌ 진입 주문 실패: {symbol} {e}")
             if trace:
                 trace.reasons.append("order failed")
                 log_decision(trace)
@@ -184,9 +183,11 @@ class OrderRouter:
                 self.bx.new_order(symbol=symbol, side=reduce_side, type="TAKE_PROFIT",
                                     price=tp_price, stopPrice=tp_price, timeInForce=self.cfg.TIME_IN_FORCE,
                                     reduceOnly=True, workingType=self.cfg.WORKING_PRICE, newClientOrderId=_cid(symbol,"TP"))
-            self.notify.push_trade(f"📎 브래킷 설정: SL≈{sl_price}, TP≈{tp_price} (reduceOnly)")
+            self.notify.emit(
+                "pnl", f"📎 브래킷 설정: SL≈{sl_price}, TP≈{tp_price} (reduceOnly)"
+            )
         except Exception as e:
-            self.notify.push_trade(f"⚠️ 브래킷 설정 실패: {e}")
+            self.notify.emit("error", f"⚠️ 브래킷 설정 실패: {e}")
 
     # 추적손절(트레일) 계산 헬퍼 — R 단위
     def trail_price(self, entry: float, atr: float, side: str, r_unreal: float, cfg):
@@ -208,10 +209,10 @@ def close_position_all(symbol: str) -> str:
         # 양방향 모두 reduceOnly 시장가 시도
         bx.new_order(symbol=symbol, side="BUY", type="MARKET", reduceOnly=True)
         bx.new_order(symbol=symbol, side="SELL", type="MARKET", reduceOnly=True)
-        dispatcher.push_trade(f"🔻 {symbol} 전량 청산 주문 전송")
+        dispatcher.emit("close", f"💹 {symbol} 전량 청산 주문 전송")
         if CSV:
             CSV.log("POSITION_CLOSE", symbol=symbol, side="", exit="", realized="", fee="", roe="", elapsed_sec="", reason="close_all")
         return f"{symbol} 청산 주문 전송"
     except Exception as e:
-        dispatcher.push_trade(f"⚠️ {symbol} 청산 실패: {e}")
+        dispatcher.emit("error", f"⚠️ {symbol} 청산 실패: {e}")
         return f"{symbol} 청산 실패: {e}"
