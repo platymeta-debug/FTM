@@ -1,3 +1,4 @@
+
 """Chart rendering gate utilities."""
 
 from __future__ import annotations
@@ -5,6 +6,7 @@ from __future__ import annotations
 import hashlib
 import time
 from typing import Any, Dict, Tuple
+
 
 _LAST_FP: Dict[str, Tuple[str | None, float]] = {}
 _FORCE_LEFT: Dict[str, int] = {}
@@ -16,11 +18,13 @@ def reset_cache() -> None:
 
 
 def compute_fingerprint(snapshot) -> str:
+
     """Compute a simple fingerprint for a snapshot."""
     direction = getattr(snapshot, "direction", "").upper()
     total = float(getattr(snapshot, "total_score", 0.0))
     tf_scores = getattr(snapshot, "scores", {}) or getattr(snapshot, "tf_scores", {}) or {}
     mtf_hash = hashlib.md5(str(sorted(tf_scores.items())).encode("utf-8")).hexdigest()[:4]
+
     last_ts = 0
     indicators = getattr(snapshot, "indicators", {}) or {}
     try:
@@ -33,6 +37,7 @@ def compute_fingerprint(snapshot) -> str:
         pass
     payload = f"{direction}|{total:.1f}|{mtf_hash}|{int(last_ts)}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
+
 
 
 def should_render(cfg, snapshot) -> Tuple[bool, Dict[str, Any]]:
@@ -58,4 +63,5 @@ def should_render(cfg, snapshot) -> Tuple[bool, Dict[str, Any]]:
 
     _LAST_FP[sym] = (fp, now)
     return True, {"reason": "changed"}
+
 
