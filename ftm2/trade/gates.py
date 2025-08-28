@@ -5,25 +5,25 @@ from typing import List, Tuple
 def pre_trade_gates(rt, cfg, market, sym: str, dec, reasons: List[Tuple[str, str]] | None = None):
     """Check startup and autotrade gates."""
     reasons = reasons or []
-    # [ANCHOR:GATE_REQUIRE_TICKET]
-    ticket = getattr(rt, "active_ticket", {}).get(sym) if hasattr(rt, "active_ticket") else None
-    if not ticket:
+    # [GATE_REQUIRE_TICKET]
+    tk = rt.active_ticket.get(sym)
+    if not tk:
         reasons.append(("gate", "no_setup_ticket"))
         return False, reasons
+    # [TICKET_VALIDITY]
     now = time.time()
-    if now > ticket.expire_ts:
+    if now > tk.expire_ts:
         reasons.append(("gate", "ticket_expired"))
-        if hasattr(rt, "active_ticket"):
-            rt.active_ticket.pop(sym, None)
+        rt.active_ticket.pop(sym, None)
         return False, reasons
-    if market and hasattr(market, "mark"):
+    if market:
         mpx = market.mark(sym)
-        buf = cfg.SETUP_INVALIDATION_BUFFER_PCT / 100.0 if hasattr(cfg, "SETUP_INVALIDATION_BUFFER_PCT") else 0.0
-        if (ticket.side == "LONG" and mpx <= ticket.stop_px * (1 + buf)) or \
-           (ticket.side == "SHORT" and mpx >= ticket.stop_px * (1 - buf)):
+        buf = 1.0 + (cfg.SETUP_INVALIDATION_BUFFER_PCT / 100.0)
+        if (tk.side == "LONG" and mpx <= tk.stop_px * buf) or (
+            tk.side == "SHORT" and mpx >= tk.stop_px * (2 - buf)
+        ):
             reasons.append(("gate", "ticket_invalidated"))
-            if hasattr(rt, "active_ticket"):
-                rt.active_ticket.pop(sym, None)
+            rt.active_ticket.pop(sym, None)
             return False, reasons
 
     # 동일 바/방향 중복 진입 금지

@@ -27,3 +27,14 @@ class DivergenceMonitor:
 
     def too_wide(self, sym: str) -> bool:
         return self.get_bps(sym) >= self.max_bps
+
+
+# [ANCHOR:DIVERGENCE_DETECT]
+def rsi_bear_div(highs, rsi):
+    # 가격 고점 상승, RSI 고점 하락
+    return len(highs) >= 2 and len(rsi) >= 2 and highs[-2] < highs[-1] and rsi[-2] > rsi[-1]
+
+
+def rsi_bull_div(lows, rsi):
+    # 가격 저점 하락, RSI 저점 상승
+    return len(lows) >= 2 and len(rsi) >= 2 and lows[-2] > lows[-1] and rsi[-2] < rsi[-1]
