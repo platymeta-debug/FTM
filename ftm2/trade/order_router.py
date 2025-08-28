@@ -9,6 +9,7 @@ def log_decision(*args, **kwargs):
 class OrderRouter:
     def __init__(self, cfg, client, sizer=None, market=None, fills=None, account=None, rt=None,
                  bracket=None, risk=None, notify=dispatcher, cards=None, analysis_views=None):
+
         self.cfg = cfg
         self.client = client
         self.sizer = sizer
@@ -41,6 +42,7 @@ class OrderRouter:
             self.notify.emit("gate_skip", f"📡 {sym} 쿨다운 중 → 스킵")
             return False
 
+
         resp = await self.client.new_order(symbol=sym, side=("BUY" if tk.side == "LONG" else "SELL"),
                                            type="MARKET", quantity=str(qty))
         self.notify.emit("order_submitted", f"📡 ✅ {sym} {tk.side} qty={qty} (ticket={tk.id})")
@@ -58,13 +60,16 @@ class OrderRouter:
             self.notify.emit("order_failed", f"📡 ⏱️ {sym} 체결 확인 실패")
             return False
 
+
         tps = []
         sl = tk.stop_px
         if self.bracket:
             tps = await self.bracket.place_from_ticket(sym, tk, abs(getattr(pos, "qty", qty)))
 
+
         if self.risk and pos:
             self.risk.on_open(sym, getattr(pos, "entry_price", tk.entry_px))
+
 
         self.rt.idem_hit[(sym, tk.side)] = bar_ts
         self.rt.cooldown_until[sym] = time.time() + self.cfg.ENTRY_COOLDOWN_SEC

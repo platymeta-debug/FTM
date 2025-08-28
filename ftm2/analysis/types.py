@@ -20,3 +20,4 @@ class SetupTicket:
     confidence: float = 0.8
     regime: str | None = None
 
+

@@ -1,5 +1,6 @@
 from ftm2.analysis.notify import AnalysisNotify
 
+
 class AnalysisRunner:
     def __init__(self, cfg, scoring, engine, notify, views, rt, symbols):
         self.cfg = cfg
@@ -25,7 +26,9 @@ class AnalysisRunner:
                 self.notify.emit(
                     "intent",
                     f"📡 SETUP: {sym} {ticket.side} score={ticket.score} conf={conf:.2f} reg={regime} RR≈{ticket.rr:.2f} SL={ticket.stop_px:.2f} TP1={ticket.tps[0]:.2f}",
+
                 )
                 self.rt.active_ticket[sym] = ticket
         if not self.rt.analysis_ready and self._all_tf_ready():
             self.rt.analysis_ready = True
+

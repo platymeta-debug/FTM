@@ -31,6 +31,7 @@ class AnalysisEngine:
 
     # [BUILD_TICKET]
     def build_ticket(self, sym: str, score: int, confidence: float | None = None, regime: str | None = None):
+
         side = None
         reasons = []
         if (
@@ -59,6 +60,7 @@ class AnalysisEngine:
                 return None
             if side == "SHORT" and rsi_bull_div(lo, rsi):
                 return None
+
 
         atr = self.atr(sym, self.cfg.ENTRY_TF)
         px = float(self.mark(sym))

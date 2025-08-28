@@ -19,6 +19,7 @@ class PositionSync:
             sym = r["symbol"]
             mpx = float(marks.get(sym) or r.get("markPrice") or r.get("entryPrice"))
             prev = self.rt.positions.get(sym)
+
             snap = from_positionRisk(r, mpx)
             self.rt.positions[sym] = snap
             self.rt.last_position_update = time.time()
@@ -31,3 +32,4 @@ class PositionSync:
                 await self.risk.maybe_move_to_breakeven(sym, snap, snap.entry_price, sl or snap.entry_price)
                 await self.risk.maybe_trail(sym, snap)
                 await self.risk.maybe_timeout_close(sym, snap)
+
