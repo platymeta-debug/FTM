@@ -43,6 +43,11 @@ class OrderRouter:
         self.analysis_views = analysis_views
         self.sync_guard = sync_guard
 
+        # [ANCHOR:ROUTER_INJECT_FILTERS]
+        self.filters = getattr(self.client, "filters", None)
+        if hasattr(self, "sizer") and self.sizer is not None:
+            setattr(self.sizer, "filters", self.filters)
+
     async def place_entry(self, sym: str):
         # 0) 티켓 게이트
         tk = self.rt.active_ticket.get(sym)

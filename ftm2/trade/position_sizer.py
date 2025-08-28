@@ -118,7 +118,7 @@ def sizing_decision(
 from decimal import Decimal
 
 class PositionSizer:
-    def __init__(self, cfg, filters):
+    def __init__(self, cfg, filters=None):
         self.cfg = cfg
         self.filters = filters
 
@@ -160,7 +160,16 @@ class PositionSizer:
 
     # [ANCHOR:MIN_NOTIONAL_AUTOSCALE]
     def autoscale_min(self, sym: str, px: float, qty: float):
-        if self.filters.min_ok(px, qty):
-            return self.filters.q_qty(sym, qty)
-        qmin = self.filters.min_qty_for(px, symbol=sym)
-        return self.filters.q_qty(sym, max(qmin, qty))
+        """
+        거래소 필터(minNotional/stepSize 등)를 이용해 최소 명목/스텝을 만족하도록 수량을 자동 보정.
+        """
+        if not hasattr(self, "filters") or self.filters is None:
+            return getattr(self, "q_qty", lambda s, q: q)(sym, qty)
+        try:
+            if self.filters.min_ok(px, qty, symbol=sym):
+                return self.filters.q_qty(sym, qty)
+            qmin = self.filters.min_qty_for(px, symbol=sym)
+            return self.filters.q_qty(sym, max(qmin, qty))
+        except Exception:
+            return getattr(self, "q_qty", lambda s, q: q)(sym, qty)
+
