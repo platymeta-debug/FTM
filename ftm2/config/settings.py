@@ -1,5 +1,5 @@
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import os
 from pathlib import Path
 from dotenv import load_dotenv
@@ -29,7 +29,7 @@ class Settings(BaseModel):
     NOTIFY_THROTTLE_MS: int = int(os.getenv("NOTIFY_THROTTLE_MS", "60000"))
     ENTRY_TF: str = os.getenv("ENTRY_TF", "1m")
     # [ANALYSIS/TICKET PARAMS]
-    SCORING_TFS: list[str] = os.getenv("SCORING_TFS", "1m,15m,1h,4h").split(",")
+    SCORING_TFS: list[str] = ["1m","15m","1h","4h"]
     LONG_MIN_SCORE: int = int(os.getenv("LONG_MIN_SCORE", "60"))
     SHORT_MIN_SCORE: int = int(os.getenv("SHORT_MIN_SCORE", "60"))
     STOP_ATR: float = float(os.getenv("STOP_ATR", "1.5"))
@@ -231,7 +231,7 @@ class Settings(BaseModel):
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
     REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))
     WALLET_REFRESH_SEC: int = int(os.getenv("WALLET_REFRESH_SEC", "20"))
-    BT_SYMBOLS: list[str] = os.getenv("BT_SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+    BT_SYMBOLS: list[str] = ["BTCUSDT","ETHUSDT"]
     BT_TF: str = os.getenv("BT_TF", "1m")
     BT_START: str = os.getenv("BT_START", "2025-05-01")
     BT_END: str = os.getenv("BT_END", "2025-08-01")
@@ -240,7 +240,21 @@ class Settings(BaseModel):
     BT_FEES_BPS: int = int(os.getenv("BT_FEES_BPS", "2"))
     BT_SLIPPAGE_BPS: int = int(os.getenv("BT_SLIPPAGE_BPS", "1"))
     BT_EXPORT: str = os.getenv("BT_EXPORT", "./reports/ftm2_bt.csv")
-    TUNE_PARAMS: list[str] = [s.strip() for s in os.getenv("TUNE_PARAMS", "").split(",") if s.strip()]
+    TUNE_PARAMS: list[str] = []
+
+    @field_validator("SCORING_TFS","BT_SYMBOLS","TUNE_PARAMS", mode="before")
+    @classmethod
+    def _csv_or_json(cls, v):
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                import json
+                return json.loads(s)
+            return [x.strip() for x in s.split(",") if x.strip()]
+        return v
+
     TUNE_LIMIT: int = int(os.getenv("TUNE_LIMIT", "120"))
     TUNE_SEED: int = int(os.getenv("TUNE_SEED", "42"))
     TUNE_OBJECTIVE: str = os.getenv("TUNE_OBJECTIVE", "expectancy")

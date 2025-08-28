@@ -9,9 +9,11 @@ class CardRef:
     last_edit_at: float
 
 class TradeCards:
-    def __init__(self, cfg, dc):
+    def __init__(self, cfg, dc, rt=None, analysis_views=None):
         self.cfg = cfg
         self.dc = dc
+        self.rt = rt
+        self.analysis_views = analysis_views
         self.cards: dict[str, CardRef] = {}
         self.prev_qty: dict[str, float] = {}
         self.prev_upnl: dict[str, float] = {}
@@ -38,6 +40,12 @@ class TradeCards:
         ]
         if abs(delta) > 1e-12:
             lines.append(f"Δ수량 {delta:+.6f}")
+        # [ANCHOR:CARD_WHY_ONELINE]
+        why = getattr(self.rt, "last_reasons", {}).get(sym) if self.rt else None
+        if (not why) and self.analysis_views and hasattr(self.analysis_views, "last_ticket") and self.analysis_views.last_ticket.get(sym):
+            why = (self.analysis_views.last_ticket[sym].reasons or [])[:1]
+        if why:
+            lines.append("Why: " + " · ".join(why if isinstance(why, list) else [why]))
         return "\n".join(lines)
 
     async def upsert_trade_card(

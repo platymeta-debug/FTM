@@ -157,3 +157,10 @@ class PositionSizer:
                 return 0.0
 
         return float(q)
+
+    # [ANCHOR:MIN_NOTIONAL_AUTOSCALE]
+    def autoscale_min(self, sym: str, px: float, qty: float):
+        if self.filters.min_ok(px, qty):
+            return self.filters.q_qty(sym, qty)
+        qmin = self.filters.min_qty_for(px, symbol=sym)
+        return self.filters.q_qty(sym, max(qmin, qty))
