@@ -13,3 +13,4 @@ class RuntimeState:
         self.cooldown_until: dict[str, float] = {}
         self.positions: dict[str, object] = {}
         self.last_position_update: float = 0.0
+

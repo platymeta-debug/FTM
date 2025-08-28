@@ -1,3 +1,4 @@
+import os
 import time
 from ftm2.config.settings import load_env_chain
 from ftm2.notify import discord_bot
