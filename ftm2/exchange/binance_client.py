@@ -7,7 +7,7 @@ import httpx, websockets
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.quantize import ExchangeFilters
-from ftm2.notify.discord_bot import send_trade
+from ftm2.notify import dispatcher
 
 CFG = load_env_chain()
 
@@ -117,8 +117,9 @@ class BinanceClient:
                 except Exception:
                     pass
                 symbol = kwargs.get("symbol")
-                send_trade(
-                    f"❌ 진입 주문 실패: {symbol} status={r.status_code} code={code} msg={msg}"
+                dispatcher.emit(
+                    "order_failed",
+                    f"📡 ❌ 진입 주문 실패: {symbol} status={r.status_code} code={code} msg={msg}",
                 )
                 if code in FATAL_USER_ERRORS or r.status_code == 400:
                     raise RuntimeError(

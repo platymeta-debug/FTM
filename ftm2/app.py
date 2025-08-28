@@ -225,6 +225,9 @@ async def main():
 
     from ftm2.notify import dispatcher as NOTIFY
     INTQ = IntentQueue(CFG, div, ROUTER, CSV, NOTIFY)
+    NOTIFY.emit("system", f"[NOTIFY_MAP] {NOTIFY.notifier.route}")
+    NOTIFY.emit("intent", "📡 [테스트] 신호 채널 확인")
+    NOTIFY.emit("fill", "💹 [테스트] 트레이드 채널 확인")
 
     LC = LossCutController(CFG, LEDGER, tracker, router=type("R",(),{"close_all":_close_all}), notify=_notify, csv_logger=CSV)
 

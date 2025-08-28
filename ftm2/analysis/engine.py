@@ -101,8 +101,8 @@ async def run_analysis_loop(cfg, symbols, market_cache, divergence, on_snapshot)
             await asyncio.sleep(wait)
         except Exception as e:
             try:
-                from ftm2.notify.discord_bot import send_log
-                send_log(f"[ANALYSIS][ERR] {e}")
+                from ftm2.notify import dispatcher
+                dispatcher.emit("error", f"[ANALYSIS][ERR] {e}")
             except Exception:
                 print(f"[ANALYSIS][ERR] {e}")
             await asyncio.sleep(1.0)
