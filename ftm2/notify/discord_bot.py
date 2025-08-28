@@ -2,7 +2,6 @@
 import asyncio, os, traceback, time
 from typing import Optional
 import discord
-from ftm2.charts.registry import render_ready
 from ftm2.signals.dedupe import should_emit
 from ftm2.config.settings import load_env_chain
 from ftm2.notify.discord_views import build_trade_embed
@@ -58,7 +57,7 @@ async def send_signal_to_discord(sym: str, side: str, score: float, reasons: lis
     text = f"{sym} {side} score={score:.1f} reasons={', '.join(reasons or [])}"
     try:
         if _ch_signals:
-            files = [discord.File(img_path)] if img_path and render_ready(img_path) else None
+            files = [discord.File(img_path)] if img_path and os.path.exists(img_path) else None
             await _ch_signals.send(content=f"📡 {text}", files=files)
         else:
             print(f"[SIGNAL][DRY] {text}")
@@ -88,7 +87,7 @@ async def publish_signal(sym: str, side: str, score: float, reasons: list[str], 
     if not emit:
         return
 
-    await send_signal_to_discord(sym, side, score, reasons, img_path if img_path and render_ready(img_path) else None)
+    await send_signal_to_discord(sym, side, score, reasons, img_path if img_path and os.path.exists(img_path) else None)
 
 async def _sender_loop():
     global _ch_logs, _ch_trades, _ch_signals
@@ -223,11 +222,11 @@ async def update_analysis(
         return
 
 
-    fp = getattr(snapshot, "fingerprint", None)
-    if not should_render(symbol, fp):
-        print(f"[CHART][SKIP] {symbol}")
+    ready, info = should_render(_cfg, snapshot)
+    if not ready:
+        print(f"[CHART][SKIP] {symbol} cause={info.get('cause')}")
     else:
-        paths = render_analysis_charts(_cfg, snapshot, _cfg.CHART_DIR)
+        paths = render_analysis_charts(snapshot, _cfg.CHART_DIR)
         if paths:
             print(f"[CHART][RENDER] {symbol} saved={paths}")
 

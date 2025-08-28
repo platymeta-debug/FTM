@@ -29,8 +29,8 @@ from ftm2.analysis.engine import run_analysis_loop
 from ftm2.notify.analysis_views import build_analysis_embed  # 내부에서 사용
 from ftm2.charts.janitor import run_chart_janitor
 from ftm2.trade.intent_queue import IntentQueue
+from ftm2.analysis.adapter import to_analysis_snapshot
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
-from ftm2.strategy.compat import to_viewdict
 from ftm2.strategy.trace import DecisionTrace
 
 # 전역 주입 포인트(간단)
@@ -213,7 +213,7 @@ async def main():
     div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
     MS.DIVERGENCE = div
 
-    async def _notify(text):
+    def _notify(text):
         try:
             DB.send_log(text)
         except Exception:
@@ -238,35 +238,50 @@ async def main():
 
     market_cache = {}
 
-    async def on_snapshot(sym, snap):
-        # [ANCHOR:M6_APP_ON_SNAPSHOT_PATCH]
-        snap_v = to_viewdict(snap)
+    async def on_snapshot(sym, snap_raw):
+        snap = to_analysis_snapshot(sym, snap_raw)
+        view = {
+            "symbol": snap.symbol,
+            "decision_score": snap.total_score,
+            "total_score": snap.total_score,
+            "direction": snap.direction,
+            "confidence": snap.confidence,
+            "tf_scores": snap.scores,
+            "contribs": {},
+        }
+        contribs_map = getattr(snap_raw, "contribs", {}) or {}
+        for tf, cons in contribs_map.items():
+            view["contribs"][tf] = [
+                {"name": getattr(c, "name", ""), "score": getattr(c, "score", 0.0), "text": getattr(c, "text", "")}
+                for c in cons
+            ]
+
         await DB.update_analysis(
             sym,
             snap,
             div.get_bps(sym),
             CFG.ANALYZE_INTERVAL_S,
-            view=snap_v,
+            view=view,
         )
 
-        INTQ.on_snapshot(snap_v)
+        INTQ.on_snapshot(snap)
         CSV.log(
             "ANALYSIS_SNAPSHOT",
             symbol=sym,
             data_feed=CFG.DATA_FEED,
             trade_mode=CFG.TRADE_MODE,
             divergence_bps=div.get_bps(sym),
-            analysis={"tfs": snap_v.get("tf_scores"), "confidence": snap_v.get("confidence")},
-            rule=snap_v.get("rules"),
-            plan=snap_v.get("plan"),
-            score_total=snap_v.get("total_score"),
-            scores=snap_v.get("tf_scores"),
-            mtf=snap_v.get("tf_scores"),
-            trend_state=snap_v.get("trend_state"),
+            analysis={"tfs": snap.tfs, "confidence": snap.confidence},
+            rule=snap.rules,
+            plan=snap.plan,
+            score_total=snap.total_score,
+            scores=snap.scores,
+            mtf=snap.mtf_summary,
+            trend_state=snap.trend_state,
         )
 
     tasks.append(asyncio.create_task(run_analysis_loop(CFG, CFG.SYMBOLS, market_cache, div, on_snapshot)))
-    tasks.append(asyncio.create_task(INTQ.tick()))
+    tasks.append(asyncio.create_task(INTQ.run()))
     tasks.append(asyncio.create_task(run_chart_janitor(CFG)))
 
     async def snapshot_loop():

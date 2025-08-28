@@ -22,7 +22,8 @@ class Settings(BaseModel):
     COOLDOWN_S: int = int(os.getenv("COOLDOWN_S", "180"))
     MAX_DIVERGENCE_BPS: int = int(os.getenv("MAX_DIVERGENCE_BPS", "15"))
     # [ANCHOR:M6_SETTINGS_CHART]
-    CHART_TFS: str = os.getenv("CHART_TFS", "15m,4h")
+    # "15m,4h" -> ["15m","4h"]
+    CHART_TFS: list[str] = [s.strip() for s in os.getenv("CHART_TFS", "15m,4h").split(",") if s.strip()]
     CHART_PRICE_OVERLAYS: str = os.getenv("CHART_PRICE_OVERLAYS", "ema50,ema200,bb20_2")
     CHART_PANELS_15m: str = os.getenv("CHART_PANELS_15m", "price,RSI,ROTATE")
     CHART_PANELS_4h: str = os.getenv("CHART_PANELS_4h", "price,ADXDI,ROTATE")
@@ -39,6 +40,7 @@ class Settings(BaseModel):
     CHART_FORCE_N_CYCLES: int = int(os.getenv("CHART_FORCE_N_CYCLES", "10"))
     CHART_FORCE_FIRST_RENDER: bool = os.getenv("CHART_FORCE_FIRST_RENDER", "false").lower() == "true"
     CHART_FINGERPRINT_RESET: bool = os.getenv("CHART_FINGERPRINT_RESET", "false").lower() == "true"
+    CHART_COOLDOWN_S: int = int(os.getenv("CHART_COOLDOWN_S", "0"))
 
 
     # SIGNALS
@@ -218,13 +220,25 @@ def load_env_chain() -> Settings:
     for k in field_names:
         v = os.getenv(k)
         if v is not None:
-            field_values[k] = v
+            if k == "CHART_TFS":
+                field_values[k] = [s.strip() for s in v.split(",") if s.strip()]
+            else:
+                field_values[k] = v
 
     s = Settings(**field_values)
 
     print(
-        f"[ENV][DUMP] ANALYSIS_TF={s.ANALYSIS_TF}  TF_WEIGHTS={s.TF_WEIGHTS}  "
-        f"CHART_TFS={s.CHART_TFS}  CHART_MODE={s.CHART_MODE}"
+        "[ENV][DUMP] "
+        f"LIVE_GUARD_ENABLE={s.LIVE_GUARD_ENABLE} "
+        f"LIVE_CONFIRM_MODE={s.LIVE_CONFIRM_MODE} "
+        f"CONFIRM_TIMEOUT_S={s.CONFIRM_TIMEOUT_S} "
+        f"LIVE_MIN_NOTIONAL_USDT={s.LIVE_MIN_NOTIONAL_USDT} "
+        f"CHART_FORCE_FIRST_RENDER={s.CHART_FORCE_FIRST_RENDER} "
+        f"CHART_MIN_SCORE_DELTA={s.CHART_MIN_SCORE_DELTA} "
+        f"CHART_MIN_DIVERGENCE_BPS={s.CHART_MIN_DIVERGENCE_BPS} "
+        f"CHART_COOLDOWN_S={s.CHART_COOLDOWN_S} "
+        f"CHART_TFS={s.CHART_TFS} "
+        f"CHART_MODE={s.CHART_MODE}"
     )
 
     for k in ["DISCORD_GUILD_ID", "DISCORD_CHANNEL_LOGS", "DISCORD_CHANNEL_TRADES",
