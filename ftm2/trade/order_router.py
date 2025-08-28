@@ -65,6 +65,10 @@ class OrderRouter:
         return True
 
     def place_entry(self, symbol: str, dec: SizingDecision, mark_price: float, trace: DecisionTrace | None = None):
+        self.filters.use(symbol)
+        for need in ("q_price", "q_qty", "min_ok"):
+            if not hasattr(self.filters, need):
+                raise RuntimeError(f"ExchangeFilters has no {need}")
         p, q = dec.sl, dec.qty
         entry_price = mark_price
         if not self._live_guard(symbol, q, entry_price, trace):
@@ -113,6 +117,10 @@ class OrderRouter:
             return None
 
     def place_brackets(self, symbol: str, side: str, qty: float, entry_price: float, sl: float, tp: float):
+        self.filters.use(symbol)
+        for need in ("q_price", "q_qty", "min_ok"):
+            if not hasattr(self.filters, need):
+                raise RuntimeError(f"ExchangeFilters has no {need}")
         reduce_side = "SELL" if side=="LONG" else "BUY"
         sl_price, sl_qty = quantize(self.filters, sl, qty)
         tp_price, tp_qty = quantize(self.filters, tp, qty)

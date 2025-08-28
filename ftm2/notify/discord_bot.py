@@ -1,5 +1,6 @@
 # [ANCHOR:DISCORD_BOT]
 import asyncio, os, traceback, time
+from pathlib import Path
 from typing import Optional
 import discord
 from ftm2.signals.dedupe import should_emit
@@ -227,33 +228,37 @@ async def update_analysis(
     if not ready:
         print(f"[CHART][SKIP] {symbol} cause={info.get('cause')}")
     else:
-        paths = render_analysis_charts(snapshot, _cfg.CHART_DIR)
-        if paths:
-            print(f"[CHART][RENDER] {symbol} saved={paths}")
+        Path(_cfg.CHART_DIR).mkdir(parents=True, exist_ok=True)
+        try:
+            paths = render_analysis_charts(snapshot, _cfg.CHART_DIR)
+            if paths:
+                print(f"[CHART][RENDER] {symbol} saved={paths}")
 
-            ids = _analysis_cards.get(symbol, {})
-            old_id = ids.get("chart")
-            if old_id:
-                try:
-                    old = await ch.fetch_message(old_id)
-                    await old.delete()
-                except Exception:
-                    pass
-            files = [discord.File(p) for p in paths if os.path.exists(p)]
-            new_msg = await ch.send(files=files)
-            print(
-                f"[DISCORD][CHART][SEND] {symbol} msg_id={new_msg.id} paths={paths}"
-            )
-
-            ids["chart"] = new_msg.id
-            _analysis_cards[symbol] = ids
-            save_analysis_cards(_analysis_cards)
-            if _cfg.CHART_MODE == "none":
-                for p in paths:
+                ids = _analysis_cards.get(symbol, {})
+                old_id = ids.get("chart")
+                if old_id:
                     try:
-                        os.remove(p)
+                        old = await ch.fetch_message(old_id)
+                        await old.delete()
                     except Exception:
                         pass
+                files = [discord.File(p) for p in paths if os.path.exists(p)]
+                new_msg = await ch.send(files=files)
+                print(
+                    f"[DISCORD][CHART][SEND] {symbol} msg_id={new_msg.id} paths={paths}"
+                )
+
+                ids["chart"] = new_msg.id
+                _analysis_cards[symbol] = ids
+                save_analysis_cards(_analysis_cards)
+                if _cfg.CHART_MODE == "none":
+                    for p in paths:
+                        try:
+                            os.remove(p)
+                        except Exception:
+                            pass
+        except Exception as e:
+            send_log(f"[CHART][ERR] save failed: {e}")
 
     embed = build_analysis_embed(view, divergence_bps, interval_s)
     now_txt = time.strftime("%H:%M:%S", time.localtime())
