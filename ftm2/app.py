@@ -35,6 +35,11 @@ from ftm2.analysis.adapter import to_analysis_snapshot
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 from ftm2.strategy.trace import DecisionTrace
 from ftm2.account.leverage_sync import enforce_leverage_and_margin
+from ftm2.runtime.state import RuntimeState
+from ftm2.journal.writer import Journal
+from ftm2.dashboard.collect import collect as dash_collect
+from ftm2.dashboard.render import render_ops_board
+from ftm2.dashboard.board import OpsBoard
 
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
@@ -56,6 +61,9 @@ CSV = None
 LEDGER = None
 div: DivergenceMonitor | None = None
 INTQ: IntentQueue | None = None
+RT = RuntimeState(CFG)
+journal = Journal(CFG)
+RT.journal = journal
 
 
 
@@ -199,8 +207,9 @@ async def main():
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ
     brkt = Bracket(CFG, bx, bx.filters)
-    ROUTER = OrderRouter(CFG, bx.filters, bracket=brkt)
+    ROUTER = OrderRouter(CFG, bx.filters, bracket=brkt, rt=RT)
     GUARD = GuardRails(CFG)
+    GUARD.rt = RT
     BX = bx
     tracker = PositionTracker()
     register_tracker(tracker)
@@ -215,9 +224,10 @@ async def main():
     LEDGER = DailyLedger(CFG, CSV)
 
     DB.CSV = CSV; DB.LEDGER = LEDGER
-    US.CSV = CSV; US.LEDGER = LEDGER
-    MS.CSV = CSV; MS.LEDGER = LEDGER
+    US.CSV = CSV; US.LEDGER = LEDGER; US.RT = RT
+    MS.CSV = CSV; MS.LEDGER = LEDGER; MS.RT = RT
     ST.CSV = CSV
+    RT.bracket = brkt
 
     div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
     MS.DIVERGENCE = div
@@ -236,6 +246,7 @@ async def main():
 
     from ftm2.notify import dispatcher as NOTIFY
     INTQ = IntentQueue(CFG, div, ROUTER, CSV, NOTIFY)
+    ops_board = OpsBoard(CFG, NOTIFY, dash_collect, render_ops_board)
     NOTIFY.emit("system", f"[NOTIFY_MAP] {NOTIFY.notifier.route}")
     NOTIFY.emit("intent", "📡 [테스트] 신호 채널 확인")
     NOTIFY.emit("fill", "💹 [테스트] 트레이드 채널 확인")
@@ -250,6 +261,14 @@ async def main():
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
     tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
+    async def dashboard_task():
+        while True:
+            try:
+                await ops_board.tick(RT, None, RT.bracket, guard=None)
+            except Exception as e:
+                NOTIFY.emit("error", f"dash tick err: {type(e).__name__}: {e}")
+            await asyncio.sleep(CFG.DASH_INTERVAL_S)
+    tasks.append(asyncio.create_task(dashboard_task()))
 
     market_cache = {}
 
