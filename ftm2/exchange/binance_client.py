@@ -7,11 +7,15 @@ import httpx, websockets
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.quantize import ExchangeFilters
+from ftm2.notify.discord_bot import send_trade
 
 CFG = load_env_chain()
 
 
 HEADERS = {"X-MBX-APIKEY": CFG.BINANCE_API_KEY}
+
+FATAL_USER_ERRORS = {-1013, -1111, -1113, -4164, -2019}
+RETRYABLE_STATUS = {429, 418, 500, 502, 503, 504}
 
 
 class BinanceClient:
@@ -96,10 +100,30 @@ class BinanceClient:
 
     def new_order(self, **kwargs) -> Dict[str, Any]:
         # expects kwargs like: symbol, side, type, quantity, price?, timeInForce?, positionSide?, workingType=MARK_PRICE, ...
-        r = self.trade_rest_signed("POST", "/fapi/v1/order", kwargs)
-        # Rate-limit headers visible via r.headers.get("X-MBX-USED-WEIGHT-1m")
-        r.raise_for_status()
-        return r.json()
+        for attempt in range(1, CFG.RETRY_MAX + 1):
+            r = self.trade_rest_signed("POST", "/fapi/v1/order", kwargs)
+            try:
+                r.raise_for_status()
+                return r.json()
+            except httpx.HTTPStatusError as e:
+                body = e.response.text
+                code = None
+                msg = body
+                try:
+                    j = e.response.json()
+                    code = j.get("code")
+                    msg = j.get("msg", body)
+                except Exception:
+                    pass
+                symbol = kwargs.get("symbol")
+                send_trade(f"❌ 진입 주문 실패: {symbol} status={e.response.status_code} code={code} msg={msg}")
+                if code in FATAL_USER_ERRORS or e.response.status_code == 400:
+                    raise
+                if e.response.status_code in RETRYABLE_STATUS and attempt < CFG.RETRY_MAX:
+                    backoff_ms = CFG.BACKOFF_429_MS if e.response.status_code in (418, 429) else CFG.BACKOFF_NET_MS
+                    time.sleep(backoff_ms / 1000)
+                    continue
+                raise
 
     # [ANCHOR:M5_BINANCE_REST]
     def get_account_v2(self):

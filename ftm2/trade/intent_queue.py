@@ -74,6 +74,11 @@ class IntentQueue:
         while True:
             try:
                 for sym, it in list(self.intents.items()):
+                    filters = self.router.filters
+                    filters.use(sym)
+                    for need in ("q_price", "q_qty", "min_ok"):
+                        if not hasattr(filters, need):
+                            raise RuntimeError(f"ExchangeFilters has no {need}")
                     if not it.gates_ok:
                         continue
                     if it.autofire:

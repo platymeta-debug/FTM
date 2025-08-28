@@ -62,6 +62,8 @@ async def run_analysis_loop(cfg, symbols, market_cache, divergence, on_snapshot)
 
     # [ANCHOR:M6_ENGINE_BOOT] 최초 캔들 부트스트랩
     for sym in symbols:
+        if bx.filters:
+            bx.filters.use(sym)
         cache = market_cache.setdefault(sym, {})
         for tf in tfs:
             df = cache.get(tf)
@@ -75,6 +77,8 @@ async def run_analysis_loop(cfg, symbols, market_cache, divergence, on_snapshot)
         try:
             started = datetime.now(timezone.utc).timestamp()
             for sym in symbols:
+                if bx.filters:
+                    bx.filters.use(sym)
                 cache = market_cache.setdefault(sym, {})
                 for tf in tfs:
                     if _need_more(cache.get(tf), 100):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Literal
+import os
 
 @dataclass
 class SizingDecision:
@@ -74,6 +75,9 @@ def sizing_decision(
                 return None  # 조건 불충족 시 미진입
         else:
             return None
+
+    min_env = float(os.getenv(f"MIN_QTY_{symbol}", "0"))
+    target_qty = max(target_qty, min_env)
 
     # 4) SL/TP (ATR 기반, TP는 R multiple)
     sl = price - cfg.SL_MULT*atr if side=="LONG" else price + cfg.SL_MULT*atr
