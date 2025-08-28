@@ -106,6 +106,7 @@ class IntentQueue:
                                     "logs",
                                     self.cfg.NOTIFY_THROTTLE_MS,
                                 )
+
                             except Exception:
                                 pass
                             continue
@@ -127,6 +128,7 @@ class IntentQueue:
                                 self.intents.pop(sym, None)
                                 try:
                                     self.notify.send_log(f"{sym} 의도 취소: 재시도 초과")
+
                                 except Exception:
                                     pass
                 await asyncio.sleep(0.2)

@@ -87,6 +87,7 @@ class OrderRouter:
                 raise RuntimeError(f"ExchangeFilters has no {need}")
         q_price, q_qty = quantize(self.filters, entry_price, q)
 
+
         if self.rt and self.market:
             from ftm2.trade.gates import pre_trade_gates
             ok, reasons = pre_trade_gates(self.rt, self.cfg, self.market, symbol, [])
@@ -129,6 +130,7 @@ class OrderRouter:
                 channel=ch,
                 ttl_ms=self.cfg.NOTIFY_THROTTLE_MS,
             )
+
             return None
 
         if not self._live_guard(symbol, float(q_qty), float(q_price), trace):
@@ -148,6 +150,7 @@ class OrderRouter:
             self.notify.send_trade(
                 f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {float(q_qty)} / {dec.reason}"
             )
+
             if trace:
                 trace.reasons.append("ENTER")
                 log_decision(trace)

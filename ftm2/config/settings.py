@@ -24,6 +24,7 @@ class Settings(BaseModel):
     RENDER_CHARTS: bool = os.getenv("RENDER_CHARTS", "false").lower() == "true"
     RENDER_ON_NEW_BAR: bool = os.getenv("RENDER_ON_NEW_BAR", "true").lower() == "true"
     RENDER_INTERVAL_SEC: int = int(os.getenv("RENDER_INTERVAL_SEC", "180"))
+
     LIVE_CONFIRM_MODE: str = os.getenv("LIVE_CONFIRM_MODE", "auto")
     CONFIRM_TIMEOUT_S: int = int(os.getenv("CONFIRM_TIMEOUT_S", "15"))
     ANALYZE_INTERVAL_S: int = int(os.getenv("ANALYZE_INTERVAL_S", "30"))

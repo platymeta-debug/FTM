@@ -126,6 +126,7 @@ class ExchangeFilters:
         k = (need / step).to_integral_value(rounding=ROUND_UP)
         return (k * step).quantize(step)
 
+
     q_px = q_price
     quantize_price = q_price
     quantize_qty = q_qty
