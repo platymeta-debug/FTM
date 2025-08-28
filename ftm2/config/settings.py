@@ -219,6 +219,7 @@ class Settings(BaseModel):
     SNAPSHOT_INTERVAL_SEC: int = int(os.getenv("SNAPSHOT_INTERVAL_SEC", "300"))
     RECOVER_LAST_SNAPSHOT: bool = os.getenv("RECOVER_LAST_SNAPSHOT", "true").lower() == "true"
 
+
     # --- User stream / REST sync ---
     LISTENKEY_KEEPALIVE_SEC: int = int(os.getenv("LISTENKEY_KEEPALIVE_SEC", "1800"))
     REST_RESYNC_SEC: int = int(os.getenv("REST_RESYNC_SEC", "45"))
