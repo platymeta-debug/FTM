@@ -4,7 +4,6 @@ import time, math
 from typing import Literal, Optional
 from ftm2.exchange.binance_client import BinanceClient
 from ftm2.notify import dispatcher
-from ftm2.notify.dispatcher import send_signal
 from ftm2.trade.position_sizer import SizingDecision
 from ftm2.exchange.quantize import ExchangeFilters
 from ftm2.strategy.trace import DecisionTrace
@@ -19,11 +18,11 @@ def log_decision(trace: DecisionTrace):
     )
 
     if "ENTER" in trace.reasons:
-        send_signal(
+        dispatcher.push_signal(
             f"{trace.symbol} 진입 신호 → {trace.direction} / {trace.decision_score:+.1f}"
         )
     else:
-        send_signal(
+        dispatcher.push_signal(
             f"{trace.symbol} 의도만: {trace.direction} / {trace.decision_score:+.1f} "
             f"/ 사유: {', '.join(trace.reasons)}"
         )
@@ -90,7 +89,7 @@ class OrderRouter:
 
         if self.rt and self.market:
             from ftm2.trade.gates import pre_trade_gates
-            ok, reasons = pre_trade_gates(self.rt, self.cfg, self.market, symbol, [])
+            ok, reasons = pre_trade_gates(self.rt, self.cfg, self.market, symbol, dec)
             if trace:
                 trace.gates.update(dict(reasons))
             if not ok:
@@ -109,12 +108,11 @@ class OrderRouter:
                 if trace:
                     trace.reasons.append("below min notional")
                     log_decision(trace)
-                ch = "trades" if self.cfg.SEND_SKIP_TO_TRADES else "logs"
+                to = "trades" if self.cfg.SEND_SKIP_TO_TRADES else "logs"
                 self.notify.send_once(
                     key=f"skip_min_{symbol}",
                     text=f"❌ 최소 명목 미달로 스킵: {symbol} px~{entry_price:.2f} qty_req≥{self.filters.min_qty_for(entry_price, symbol)}",
-                    channel=ch,
-                    ttl_ms=self.cfg.NOTIFY_THROTTLE_MS,
+                    to=to,
                 )
                 return None
 
@@ -123,12 +121,11 @@ class OrderRouter:
             if trace:
                 trace.reasons.append("qty quantized zero")
                 log_decision(trace)
-            ch = "trades" if self.cfg.SEND_SKIP_TO_TRADES else "logs"
+            to = "trades" if self.cfg.SEND_SKIP_TO_TRADES else "logs"
             self.notify.send_once(
                 key=f"skip_qty0_{symbol}",
                 text=f"❌ 진입 스킵: {symbol} {dec.side} — 수량이 0",
-                channel=ch,
-                ttl_ms=self.cfg.NOTIFY_THROTTLE_MS,
+                to=to,
             )
 
             return None
@@ -147,7 +144,7 @@ class OrderRouter:
             print(f"[ORDER][TRY] {symbol} {dec.side} qty={float(q_qty)}")
             od = self.bx.new_order(**params)
             print(f"[ORDER][RESP] {od}")
-            self.notify.send_trade(
+            self.notify.push_signal(
                 f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {float(q_qty)} / {dec.reason}"
             )
 
@@ -162,7 +159,7 @@ class OrderRouter:
             return od
         except Exception as e:
             print(f"[ORDER][ERR] {e}")
-            self.notify.send_trade(f"❌ 진입 주문 실패: {symbol} {e}")
+            self.notify.push_signal(f"❌ 진입 주문 실패: {symbol} {e}")
             if trace:
                 trace.reasons.append("order failed")
                 log_decision(trace)
@@ -187,9 +184,9 @@ class OrderRouter:
                 self.bx.new_order(symbol=symbol, side=reduce_side, type="TAKE_PROFIT",
                                     price=tp_price, stopPrice=tp_price, timeInForce=self.cfg.TIME_IN_FORCE,
                                     reduceOnly=True, workingType=self.cfg.WORKING_PRICE, newClientOrderId=_cid(symbol,"TP"))
-            self.notify.send_trade(f"📎 브래킷 설정: SL≈{sl_price}, TP≈{tp_price} (reduceOnly)")
+            self.notify.push_trade(f"📎 브래킷 설정: SL≈{sl_price}, TP≈{tp_price} (reduceOnly)")
         except Exception as e:
-            self.notify.send_trade(f"⚠️ 브래킷 설정 실패: {e}")
+            self.notify.push_trade(f"⚠️ 브래킷 설정 실패: {e}")
 
     # 추적손절(트레일) 계산 헬퍼 — R 단위
     def trail_price(self, entry: float, atr: float, side: str, r_unreal: float, cfg):
@@ -211,10 +208,10 @@ def close_position_all(symbol: str) -> str:
         # 양방향 모두 reduceOnly 시장가 시도
         bx.new_order(symbol=symbol, side="BUY", type="MARKET", reduceOnly=True)
         bx.new_order(symbol=symbol, side="SELL", type="MARKET", reduceOnly=True)
-        dispatcher.send_trade(f"🔻 {symbol} 전량 청산 주문 전송")
+        dispatcher.push_trade(f"🔻 {symbol} 전량 청산 주문 전송")
         if CSV:
             CSV.log("POSITION_CLOSE", symbol=symbol, side="", exit="", realized="", fee="", roe="", elapsed_sec="", reason="close_all")
         return f"{symbol} 청산 주문 전송"
     except Exception as e:
-        dispatcher.send_trade(f"⚠️ {symbol} 청산 실패: {e}")
+        dispatcher.push_trade(f"⚠️ {symbol} 청산 실패: {e}")
         return f"{symbol} 청산 실패: {e}"
