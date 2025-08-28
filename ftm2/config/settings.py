@@ -38,6 +38,8 @@ class Settings(BaseModel):
     CHART_MIN_DIVERGENCE_BPS: float = float(os.getenv("CHART_MIN_DIVERGENCE_BPS", "2.0"))
     CHART_FORCE_N_CYCLES: int = int(os.getenv("CHART_FORCE_N_CYCLES", "10"))
     CHART_FORCE_FIRST_RENDER: bool = os.getenv("CHART_FORCE_FIRST_RENDER", "false").lower() == "true"
+    CHART_FINGERPRINT_RESET: bool = os.getenv("CHART_FINGERPRINT_RESET", "false").lower() == "true"
+
 
     # SIGNALS
     ENTER_TH: int = int(os.getenv("ENTER_TH", "60"))

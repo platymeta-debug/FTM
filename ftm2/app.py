@@ -13,7 +13,7 @@ from ftm2.exchange.binance_client import BinanceClient
 from ftm2.exchange import streams_market
 from ftm2.exchange.streams_user import user_stream
 from ftm2.trade.position_sizer import sizing_decision
-from ftm2.trade.order_router import OrderRouter
+from ftm2.trade.order_router import OrderRouter, log_decision
 from ftm2.risk.guardrails import GuardRails
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.reconcile.reconciler import resync_loop
@@ -31,6 +31,7 @@ from ftm2.charts.janitor import run_chart_janitor
 from ftm2.trade.intent_queue import IntentQueue
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 from ftm2.strategy.compat import to_viewdict
+from ftm2.strategy.trace import DecisionTrace
 
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
@@ -124,16 +125,51 @@ async def on_market(msg):
         print(f"[SCORE][{sym}] close={last['close']:.2f} | Long={L} Short={S} | ADX={last['adx']:.1f} RSI={last['rsi']:.1f} Z={last['z']:.2f} MTF={mtf_ctx and 'ON' or 'OFF'} TREND={is_trend}")
         # --- 라우팅: 임계값/대칭/쿨다운/데일리컷 체크 후 진입 ---
         if ROUTER and GUARD and BX:
-            side = "LONG" if L>=S else "SHORT"
-            sc = L if side=="LONG" else S
-            sc_opp = S if side=="LONG" else L
-            if sc >= CFG.ENTRY_SCORE and sc_opp <= CFG.OPPOSITE_MAX and GUARD.cooldown_ok(sym) and GUARD.daily_ok():
-                dec = sizing_decision(sym, side, L, S, last['close'], last['atr'], BX.filters,
-                                      pos_state=None, cfg=CFG, is_trend=is_trend,
-                                      mtf_bias=(1 if (mtf_ctx and True) else 0))
-                if dec and dec.qty>0:
-                    ROUTER.place_entry(sym, dec, mark_price=last['close'])
+            side = "LONG" if L >= S else "SHORT"
+            sc = L if side == "LONG" else S
+            sc_opp = S if side == "LONG" else L
+            trace = DecisionTrace(symbol=sym, decision_score=sc if side == "LONG" else -sc,
+                                  total_score=sc, direction=side)
+            cd_ok = GUARD.cooldown_ok(sym)
+            daily_ok = GUARD.daily_ok()
+            trace.gates.update({
+                "ENTRY_SCORE": CFG.ENTRY_SCORE,
+                "OPPOSITE_MAX": CFG.OPPOSITE_MAX,
+                "abs(score)": sc,
+                "opp_score": sc_opp,
+                "cooldown_ok": cd_ok,
+                "daily_ok": daily_ok,
+            })
+            if sc >= CFG.ENTRY_SCORE and sc_opp <= CFG.OPPOSITE_MAX and cd_ok and daily_ok:
+                dec = sizing_decision(
+                    sym,
+                    side,
+                    L,
+                    S,
+                    last['close'],
+                    last['atr'],
+                    BX.filters,
+                    pos_state=None,
+                    cfg=CFG,
+                    is_trend=is_trend,
+                    mtf_bias=(1 if (mtf_ctx and True) else 0),
+                )
+                if dec and dec.qty > 0:
+                    ROUTER.place_entry(sym, dec, mark_price=last['close'], trace=trace)
                     GUARD.arm_cooldown(sym)
+                else:
+                    trace.reasons.append("no sizing")
+                    log_decision(trace)
+            else:
+                if sc < CFG.ENTRY_SCORE:
+                    trace.reasons.append("below entry score")
+                if sc_opp > CFG.OPPOSITE_MAX:
+                    trace.reasons.append("opp above max")
+                if not cd_ok:
+                    trace.reasons.append("in cooldown")
+                if not daily_ok:
+                    trace.reasons.append("daily loss lock")
+                log_decision(trace)
     elif st.endswith("@markPrice@1s"):
         sym = data.get("s")
         mark = float(data.get("p", 0) or 0)
