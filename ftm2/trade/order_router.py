@@ -34,20 +34,6 @@ def _cid(sym: str, side: str) -> str:
 def quantize(filters: ExchangeFilters, price: float, qty: float):
     return filters.q_price(price), filters.q_qty(qty)
 
-
-def _preflight_and_quantize(sym: str, side: str, raw_qty: float, working_price: float, env_cfg, filters):
-    filters.use(sym)
-    for need in ("q_price", "q_qty", "min_ok", "clamp_to_min_notional", "min_qty_for_notional"):
-        if not hasattr(filters, need):
-            raise RuntimeError(f"ExchangeFilters has no {need}")
-    px_q = filters.q_price(sym, working_price)
-    qty_q = filters.q_qty(sym, raw_qty)
-    min_usdt = env_cfg.LIVE_MIN_NOTIONAL_USDT
-    adj_qty = filters.clamp_to_min_notional(sym, px_q, qty_q, min_usdt)
-    if adj_qty is None:
-        return None, px_q, qty_q, False
-    return adj_qty, px_q, qty_q, True
-
 class OrderRouter:
     def __init__(self, cfg, filters: ExchangeFilters):
         self.cfg = cfg
@@ -90,34 +76,56 @@ class OrderRouter:
                 entry_price = mark_price * (1 - dec.limit_offset_ticks * tick)
             else:
                 entry_price = mark_price * (1 + dec.limit_offset_ticks * tick)
-        qty_adj, q_price, q_qty, ok = _preflight_and_quantize(symbol, dec.side, q, entry_price, self.cfg, self.filters)
-        if not ok or qty_adj is None:
-            need = self.filters.min_qty_for_notional(symbol, q_price, self.cfg.LIVE_MIN_NOTIONAL_USDT)
-            send_trade(f"❌ 최소 명목 미달로 스킵: {symbol} px~{float(q_price)} qty_req≥{float(need)}")
+
+        self.filters.use(symbol)
+        for need in ("q_price", "q_qty", "min_ok", "min_qty_for"):
+            if not hasattr(self.filters, need):
+                raise RuntimeError(f"ExchangeFilters has no {need}")
+        q_price, q_qty = quantize(self.filters, entry_price, q)
+
+        # --- 최소 명목가 보정/검증 ---
+        if not self.filters.min_ok(entry_price, q_qty):
+            if self.cfg.ORDER_SCALE_TO_MIN:
+                q_min = self.filters.min_qty_for(entry_price, symbol=symbol)
+                if q_min and q_min > 0:
+                    q_qty = self.filters.q_qty(symbol, q_min)
+            else:
+                if trace:
+                    trace.reasons.append("below min notional")
+                    log_decision(trace)
+                send_trade(
+                    f"⏭️ 진입 스킵: {symbol} {dec.side} — 최소 명목가 미만 (qty={q_qty}, px≈{entry_price:.4f})"
+                )
+                return None
+
+        # 보정 후에도 0이면 스킵
+        if q_qty <= 0:
             if trace:
-                trace.reasons.append("below min notional")
+                trace.reasons.append("qty quantized zero")
                 log_decision(trace)
+            send_trade(f"⏭️ 진입 스킵: {symbol} {dec.side} — 수량이 0")
             return None
-        if not self._live_guard(symbol, float(qty_adj), float(q_price), trace):
+
+        if not self._live_guard(symbol, float(q_qty), float(q_price), trace):
             if trace:
                 log_decision(trace)
             return None
 
         side = "BUY" if dec.side=="LONG" else "SELL"
         params = dict(symbol=symbol, side=side, type="MARKET" if dec.entry_type=="market" else "LIMIT",
-                      quantity=float(qty_adj), newClientOrderId=_cid(symbol, side))
+                      quantity=float(q_qty), newClientOrderId=_cid(symbol, side))
         if dec.entry_type=="limit":
             params.update(price=float(q_price), timeInForce=self.cfg.TIME_IN_FORCE)
         try:
-            print(f"[ORDER][TRY] {symbol} {dec.side} qty={float(qty_adj)}")
+            print(f"[ORDER][TRY] {symbol} {dec.side} qty={float(q_qty)}")
             od = self.bx.new_order(**params)
             print(f"[ORDER][RESP] {od}")
-            send_trade(f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {float(qty_adj)} / {dec.reason}")
+            send_trade(f"✅ 진입 주문 전송: {symbol} {dec.side} 수량 {float(q_qty)} / {dec.reason}")
             if trace:
                 trace.reasons.append("ENTER")
                 log_decision(trace)
             if CSV:
-                CSV.log("ORDER_NEW", symbol=symbol, side=dec.side, price=float(q_price), qty=float(qty_adj),
+                CSV.log("ORDER_NEW", symbol=symbol, side=dec.side, price=float(q_price), qty=float(q_qty),
                         sl=dec.sl, tp=dec.tp, leverage=self.cfg.LEVERAGE, margin=self.cfg.MARGIN_TYPE,
                         reason=dec.reason,
                         route={"slippage":0, "post_only":self.cfg.POST_ONLY, "reduce_only":False, "type":params.get("type")})

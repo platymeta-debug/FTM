@@ -113,6 +113,19 @@ class ExchangeFilters:
     def step_size(self, symbol: str) -> Decimal:
         return self.map[symbol].step
 
+    def min_notional_value(self, symbol: str) -> Decimal:
+        return self.map[symbol].min_notional
+
+    def min_qty_for(self, price, symbol: str):
+        from decimal import Decimal, ROUND_UP
+        px = self._coerce_decimal(price)
+        if px <= 0:
+            return Decimal("0")
+        need = (self.map[symbol].min_notional / px)
+        step = self.map[symbol].step
+        k = (need / step).to_integral_value(rounding=ROUND_UP)
+        return (k * step)
+
     q_px = q_price
     quantize_price = q_price
     quantize_qty = q_qty

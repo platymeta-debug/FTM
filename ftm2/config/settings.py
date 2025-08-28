@@ -11,6 +11,10 @@ class Settings(BaseModel):
     WORKING_PRICE: str = os.getenv("WORKING_PRICE", "MARK_PRICE")
     LIVE_GUARD_ENABLE: bool = os.getenv("LIVE_GUARD_ENABLE", "true").lower() == "true"
     LIVE_MIN_NOTIONAL_USDT: float = float(os.getenv("LIVE_MIN_NOTIONAL_USDT", "10"))
+    ORDER_SCALE_TO_MIN: bool = os.getenv("ORDER_SCALE_TO_MIN", "true").lower() == "true"
+    INTENT_AUTOFIRE_SCALE_TO_MIN: bool = os.getenv("INTENT_AUTOFIRE_SCALE_TO_MIN", "true").lower() == "true"
+    INTENT_BACKOFF_MS: int = int(os.getenv("INTENT_BACKOFF_MS", "1500"))
+    INTENT_MAX_RETRY: int = int(os.getenv("INTENT_MAX_RETRY", "5"))
     LIVE_CONFIRM_MODE: str = os.getenv("LIVE_CONFIRM_MODE", "auto")
     CONFIRM_TIMEOUT_S: int = int(os.getenv("CONFIRM_TIMEOUT_S", "15"))
     ANALYZE_INTERVAL_S: int = int(os.getenv("ANALYZE_INTERVAL_S", "30"))
