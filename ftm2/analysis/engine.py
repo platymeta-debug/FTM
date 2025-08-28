@@ -2,6 +2,8 @@ from datetime import datetime, timezone
 import pandas as pd
 import asyncio
 
+STATE: dict[str, str] = {}
+
 from ftm2.strategy.score import score_snapshot, _parse_tf_weights
 
 BOOT_LIMIT = 500  # 초기 캔들 개수 (필요시 .env로 빼도 됨)
@@ -80,6 +82,13 @@ async def run_analysis_loop(cfg, symbols, market_cache, divergence, on_snapshot)
             snap = score_snapshot(sym, cache, tfs, tf_weights)
             bps = divergence.get_bps(sym)
             snap.rules["divergence_bps"] = bps
+
+            fp_key = f"fp:{sym}"
+            fp = getattr(snap, "fingerprint", None)
+            last_fp = STATE.get(fp_key)
+            if fp and last_fp == fp:
+                continue
+            STATE[fp_key] = fp
             await on_snapshot(sym, snap)
 
         elapsed = datetime.now(timezone.utc).timestamp() - started

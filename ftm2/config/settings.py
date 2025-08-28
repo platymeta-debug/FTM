@@ -38,6 +38,18 @@ class Settings(BaseModel):
     CHART_MIN_DIVERGENCE_BPS: float = float(os.getenv("CHART_MIN_DIVERGENCE_BPS", "2.0"))
     CHART_FORCE_N_CYCLES: int = int(os.getenv("CHART_FORCE_N_CYCLES", "10"))
     CHART_FORCE_FIRST_RENDER: bool = os.getenv("CHART_FORCE_FIRST_RENDER", "false").lower() == "true"
+    CHART_FINGERPRINT_RESET: bool = os.getenv("CHART_FINGERPRINT_RESET", "false").lower() == "true"
+
+    # SIGNALS
+    ENTER_TH: int = int(os.getenv("ENTER_TH", "60"))
+    COOLDOWN_SEC: int = int(os.getenv("COOLDOWN_SEC", "300"))
+    SCORE_BUCKET: int = int(os.getenv("SCORE_BUCKET", "5"))
+    EDGE_TRIGGER: bool = os.getenv("EDGE_TRIGGER", "true").lower() == "true"
+    ALLOW_INTENT_ONLY: bool = os.getenv("ALLOW_INTENT_ONLY", "false").lower() == "true"
+    MIN_REASON_COUNT: int = int(os.getenv("MIN_REASON_COUNT", "1"))
+
+    # CHARTS
+    CHART_THROTTLE_SEC: int = int(os.getenv("CHART_THROTTLE_SEC", "60"))
     # 민감키는 import 시점 os.getenv 사용을 피한다
     BINANCE_API_KEY: str | None = None
     BINANCE_API_SECRET: str | None = None

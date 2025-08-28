@@ -30,11 +30,6 @@ class IntentQueue:
         if abs(score) < self.cfg.ENTRY_TH:
             trace.reasons.append("below enter threshold")
             log_decision(trace)
-
-            return
-        if abs(score) < self.cfg.ENTRY_TH:
-            trace.reasons.append("below enter threshold")
-            log_decision(trace)
             return
         direction = snap["direction"] if isinstance(snap, dict) else snap.direction
         score = snap["total_score"] if isinstance(snap, dict) else snap.total_score
