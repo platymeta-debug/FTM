@@ -28,7 +28,9 @@ class AnalysisNotify:
         )
         if (not changed) or (not self._edit_ok(f"analysis_{sym}", self.cfg.ANALYSIS_EDIT_MIN_MS)):
             return
-        text = self.views.render(sym, score=score, trend=trend, ticket=ticket, confidence=confidence, regime=regime)
+        # [ANCHOR:ANALYSIS_REASONS_INLINE]
+        reasons = getattr(ticket, "reasons", [])[:3] if ticket else []
+        text = self.views.render(sym, score=score, trend=trend, ticket=ticket, confidence=confidence, regime=regime, reasons=reasons)
         self._upsert_sticky(self.cfg.CHANNEL_SIGNALS, f"analysis_{sym}", text,
                              lifetime_min=self.cfg.ANALYSIS_LIFETIME_MIN)
         self.prev[sym] = {"score": score, "trend": trend, "has_ticket": bool(ticket)}

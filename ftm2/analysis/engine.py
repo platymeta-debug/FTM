@@ -13,6 +13,8 @@ class AnalysisEngine:
     def __init__(self, cfg, market=None):
         self.cfg = cfg
         self.market = market
+        self.snapshots = {}
+        self.scoring = None
 
     def trend(self, sym: str, tf: str) -> str:
         return "FLAT"
@@ -71,7 +73,7 @@ class AnalysisEngine:
         if rr < self.cfg.MIN_RR:
             return None
 
-        return SetupTicket(
+        tk = SetupTicket(
             id=f"{sym}_{int(time()*1000)}",
             symbol=sym,
             side=side,
@@ -87,6 +89,14 @@ class AnalysisEngine:
             confidence=confidence if confidence is not None else 0.8,
             regime=regime,
         )
+
+        # [ANCHOR:TICKET_REASONS_ATTACH]
+        from ftm2.analysis.reasons import top_reasons
+        tk.rr = rr
+        tk.confidence = getattr(self.scoring, "last_conf", 0.8)
+        tk.regime = getattr(self.scoring, "last_regime", "NORMAL")
+        tk.reasons = top_reasons(self.snapshots.get(sym), score, tk.confidence, tk.regime)
+        return tk
 
 BOOT_LIMIT = 500  # 초기 캔들 개수 (필요시 .env로 빼도 됨)
 
