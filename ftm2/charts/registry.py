@@ -1,16 +1,19 @@
 # ftm2/charts/registry.py
 import os
 import hashlib
+import time
 from typing import Dict, Tuple, Any
 
 # --- 전역 캐시(먼저 선언!) ---
 _LAST_FP: Dict[str, str] = {}       # 심볼별 최근 fingerprint
 _LAST_SCORE: Dict[str, float] = {}  # 심볼별 최근 총점(가중)
+_LAST_RENDER: Dict[str, float] = {} # 심볼별 최근 렌더 타임스탬프
 
 def reset_cache() -> None:
     """분석 차트 렌더 판단 캐시 초기화"""
     _LAST_FP.clear()
     _LAST_SCORE.clear()
+    _LAST_RENDER.clear()
 
 # ---- 유틸 ----
 def _get_score(snapshot) -> float:
@@ -34,56 +37,63 @@ def _get_tfs(snapshot) -> str:
 def compute_fingerprint(snapshot) -> str:
     """
     스냅샷 핵심 요소로 간단한 지문 생성.
-    (심볼/라스트가격(소수2)/총점(소수1)/신뢰도(소수2)/TF묶음)
+    (dir, total_score, mtf_hash, last_close_ts)
     """
-    sym = getattr(snapshot, "symbol", "UNK")
-    payload = f"{sym}|{_get_price(snapshot):.2f}|{_get_score(snapshot):.1f}|{_get_conf(snapshot):.2f}|{_get_tfs(snapshot)}"
+    direction = getattr(snapshot, "direction", "").upper()
+    total = _get_score(snapshot)
+    tf_scores = getattr(snapshot, "tf_scores", {}) or {}
+    mtf_hash = hashlib.md5(str(sorted(tf_scores.items())).encode("utf-8")).hexdigest()[:4]
+    # indicators에서 마지막 ts 추출
+    last_ts = 0
+    indicators = getattr(snapshot, "indicators", {}) or {}
+    try:
+        for df in indicators.values():
+            if hasattr(df, "iloc") and len(df) > 0:
+                ts = float(df.iloc[-1].get("ts", 0.0))
+                if ts > last_ts:
+                    last_ts = ts
+    except Exception:
+        pass
+    payload = f"{direction}|{total:.1f}|{mtf_hash}|{int(last_ts)}"
     return hashlib.md5(payload.encode("utf-8")).hexdigest()[:8]
-
-def should_render(cfg: Any, snapshot) -> Tuple[bool, Dict[str, Any]]:
-    """
-    차트 렌더 여부 판단.
-      - 최초 1회 강제 렌더 (CHART_FORCE_FIRST_RENDER)
-      - 점수 변화(CHART_MIN_SCORE_DELTA) 또는 괴리(CHART_MIN_DIVERGENCE_BPS) 기준 충족
-      - fingerprint 변화가 있어야 함
-    """
+def render_ready(snapshot, cfg) -> Tuple[bool, Dict[str, Any]]:
+    """차트 렌더 여부 판단."""
     sym = getattr(snapshot, "symbol", "UNK")
     new_fp = compute_fingerprint(snapshot)
     last_fp = _LAST_FP.get(sym)
 
-    # ENV/설정 파라미터
     force_first = bool(getattr(cfg, "CHART_FORCE_FIRST_RENDER", False))
     min_delta = float(getattr(cfg, "CHART_MIN_SCORE_DELTA", 0.5))
     min_div   = float(getattr(cfg, "CHART_MIN_DIVERGENCE_BPS", 1.0))
     div_bps   = float(getattr(snapshot, "divergence_bps", 0.0))
+    cooldown  = int(getattr(cfg, "CHART_COOLDOWN_S", 0))
 
     score     = _get_score(snapshot)
     last_score = _LAST_SCORE.get(sym, score)
     delta     = abs(score - last_score)
 
-    # 최초 렌더 강제
+    now = time.time()
+    last_r = _LAST_RENDER.get(sym, 0.0)
+    if cooldown > 0 and (now - last_r) < cooldown:
+        return False, {"cause": "cooldown", "remain": cooldown - (now - last_r)}
+
     if last_fp is None:
         _LAST_FP[sym] = new_fp
         _LAST_SCORE[sym] = score
         if force_first:
+            _LAST_RENDER[sym] = now
             return True, {"cause": "first-render", "fp": new_fp}
-        # 강제 렌더가 아니라면 다음 변화까지 대기
-        return False, {"cause": "first-seen-no-force", "fp": new_fp}
+        return False, {"cause": "first-seen", "fp": new_fp}
 
-    # fingerprint가 바뀌지 않으면 스킵
     if new_fp == last_fp:
         return False, {"cause": "fingerprint-same", "fp": new_fp}
 
-    # 변화 기준(점수/괴리) 충족 시 렌더
     if (delta >= min_delta) or (div_bps >= min_div):
         _LAST_FP[sym] = new_fp
         _LAST_SCORE[sym] = score
+        _LAST_RENDER[sym] = now
         return True, {"cause": "changed", "delta": delta, "div_bps": div_bps, "fp": new_fp}
 
-    # 기준 미충족 → 스킵 (fingerprint는 갱신해도 무방)
     _LAST_FP[sym] = new_fp
-    return False, {"cause": "changed-but-below-threshold", "delta": delta, "div_bps": div_bps, "fp": new_fp}
-
-def render_ready() -> bool:
-    """필요시 사용할 수 있는 간단한 게이트 함수 (현재는 항상 True)"""
-    return True
+    _LAST_SCORE[sym] = score
+    return False, {"cause": "below-threshold", "delta": delta, "div_bps": div_bps, "fp": new_fp}
