@@ -1,15 +1,41 @@
-# [ANCHOR:LEV_SYNC_ENFORCE]
-async def enforce_leverage_and_margin(client, cfg, symbols):
-    for sym in symbols:
-        mode = cfg.MARGIN_MODE_OVERRIDE.get(sym, cfg.MARGIN_MODE_DEFAULT).upper()
-        lev = int(cfg.LEVERAGE_OVERRIDE.get(sym, cfg.LEVERAGE_DEFAULT))
+# [ANCHOR:ENSURE]
+from __future__ import annotations
+import asyncio
+from typing import Literal
+
+from ftm2.notify import dispatcher
+
+
+async def ensure(
+    client,
+    sym: str,
+    *,
+    leverage: int,
+    margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED",
+) -> None:
+    """Ensure leverage and margin type are set on the exchange.
+
+    If the current settings differ, attempt to update once with a retry.
+    Failures are logged via emit_once.
+    """
+    for attempt in range(2):
         try:
-            await client.set_margin_mode(sym, mode)
-        except Exception:
-            pass
-        try:
-            await client.set_leverage(sym, lev)
-        except Exception:
-            pass
-        if hasattr(client, "notify"):
-            client.notify.emit("system", f"⚙️ {sym} margin={mode} lev={lev} 적용")
+            cur = await client.get_leverage(sym)
+            cur_mode = await client.get_margin_type(sym)
+            if cur != leverage:
+                await client.set_leverage(sym, leverage)
+            if cur_mode.upper() != margin_type.upper():
+                await client.set_margin_mode(sym, margin_type)
+            return
+        except Exception as e:
+            if attempt == 0:
+                await asyncio.sleep(0.5)
+                continue
+            dispatcher.emit_once(
+                f"levsync_fail_{sym}",
+                "error",
+                f"leverage sync failed for {sym}: {e}",
+                ttl_ms=60000,
+            )
+            return
+

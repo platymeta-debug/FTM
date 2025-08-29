@@ -63,6 +63,7 @@ async def market_stream(symbols, interval, on_msg):
     url = f"{base}/stream?streams={'/'.join(names)}"
     print(f"[MKT_WS] connecting → {url}")
     test_task = None
+    # [ANCHOR:WS_BACKOFF]
     backoff = 1
     while True:
         try:

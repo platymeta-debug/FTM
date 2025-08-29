@@ -1,5 +1,9 @@
 # [ANCHOR:WEB_APP]
-import os, asyncio, uvicorn
+import os, asyncio
+try:
+    import uvicorn
+except ImportError:
+    uvicorn = None
 from fastapi import FastAPI, Depends, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -87,4 +91,8 @@ def init(app, cfg, rt, market, bracket, notify):
 
 def run_standalone(cfg, rt, market, bracket, notify):
     init(app, cfg, rt, market, bracket, notify)
+    if uvicorn is None:
+        raise RuntimeError(
+            "uvicorn not installed; set WEB_ENABLE=false or install uvicorn"
+        )
     uvicorn.run(app, host=os.getenv("WEB_HOST","0.0.0.0"), port=int(os.getenv("WEB_PORT","8088")))

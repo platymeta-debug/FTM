@@ -12,14 +12,21 @@ class AnalysisNotify:
             return fn(key, ms)
         return True
 
-    def _upsert_sticky(self, ch: str, key: str, text: str, lifetime_min: int):
-        upsert = getattr(self.notify, "upsert_sticky", None)
-        if callable(upsert):
-            upsert(ch, key, text, lifetime_min=lifetime_min)
-        else:
-            self.notify.emit("system", text)
+    async def _upsert_sticky(self, ch: str, key: str, text: str, lifetime_min: int):
+        # [ANCHOR:ANALYSIS_STICKY_UPSERT]
+        from ftm2.notify import discord_bot
 
-    def upsert_analysis(self, sym: str, score: int, trend: str, ticket, confidence: float | None = None, regime: str | None = None):
+        await discord_bot.upsert(ch, text, sticky_key=key)
+
+    async def upsert_analysis(
+        self,
+        sym: str,
+        score: int,
+        trend: str,
+        ticket,
+        confidence: float | None = None,
+        regime: str | None = None,
+    ):
 
         changed = (
             abs(score - self.prev.get(sym, {}).get("score", 0)) >= self.cfg.ANALYSIS_SCORE_DELTA_MIN
@@ -30,7 +37,19 @@ class AnalysisNotify:
             return
         # [ANCHOR:ANALYSIS_REASONS_INLINE]
         reasons = getattr(ticket, "reasons", [])[:3] if ticket else []
-        text = self.views.render(sym, score=score, trend=trend, ticket=ticket, confidence=confidence, regime=regime, reasons=reasons)
-        self._upsert_sticky(self.cfg.CHANNEL_SIGNALS, f"analysis_{sym}", text,
-                             lifetime_min=self.cfg.ANALYSIS_LIFETIME_MIN)
+        text = self.views.render(
+            sym,
+            score=score,
+            trend=trend,
+            ticket=ticket,
+            confidence=confidence,
+            regime=regime,
+            reasons=reasons,
+        )
+        await self._upsert_sticky(
+            self.cfg.CHANNEL_SIGNALS,
+            f"analysis::{sym}",
+            text,
+            lifetime_min=self.cfg.ANALYSIS_LIFETIME_MIN,
+        )
         self.prev[sym] = {"score": score, "trend": trend, "has_ticket": bool(ticket)}

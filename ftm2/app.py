@@ -1,28 +1,25 @@
 # [ANCHOR:APP_MARKET_PIPELINE]
-import asyncio, os
-import pandas as pd
+import asyncio
+import logging
+import os
 from collections import defaultdict
+from datetime import timezone
+
+import pandas as pd
+
 from ftm2.indicators.core import add_indicators
 from ftm2.strategy.scorer import score_row
-from datetime import timezone
-import asyncio
-import pandas as pd
-import logging
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
-from ftm2.exchange import streams_market
-from ftm2.exchange.streams_user import user_stream
+from ftm2.exchange import streams_market, streams_user
 from ftm2.trade.position_sizer import sizing_decision
-from ftm2.trade.order_router import OrderRouter, log_decision
+from ftm2.trade import order_router
 from ftm2.trade.bracket import Bracket
 from ftm2.risk.guardrails import GuardRails
 from ftm2.trade.position_tracker import PositionTracker
 from ftm2.reconcile.reconciler import resync_loop
 from ftm2.notify.discord_bot import start_notifier, register_hooks, register_tracker
-from ftm2.trade import order_router
-from ftm2.indicators.all import add_indicators
-from ftm2.strategy.scorer import score_row
 from ftm2.storage.csv_logger import CsvLogger
 from ftm2.risk.ledger import DailyLedger, LossCutController
 from ftm2.reconcile.income_poll import income_poll_loop
@@ -47,8 +44,9 @@ from ftm2.notify import dispatcher as notify
 
 # 전역 주입 포인트(간단)
 from ftm2.notify import discord_bot as DB
-from ftm2.exchange import streams_user as US
-from ftm2.exchange import streams_market as MS
+
+US = streams_user
+MS = streams_market
 
 log = logging.getLogger(__name__)
 from ftm2 import strategy as ST
@@ -68,7 +66,7 @@ object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
 
 
 BUFFERS: dict[str, pd.DataFrame] = {}
-ROUTER: OrderRouter | None = None
+ROUTER: order_router.OrderRouter | None = None
 GUARD: GuardRails | None = None
 BX: BinanceClient | None = None
 CSV = None
@@ -192,7 +190,7 @@ async def on_market(msg):
                         pass
                 else:
                     trace.reasons.append("no sizing")
-                    log_decision(trace)
+                    order_router.log_decision(trace)
             else:
                 if sc < CFG.ENTRY_SCORE:
                     trace.reasons.append("below entry score")
@@ -202,7 +200,7 @@ async def on_market(msg):
                     trace.reasons.append("in cooldown")
                 if not daily_ok:
                     trace.reasons.append("daily loss lock")
-                log_decision(trace)
+                order_router.log_decision(trace)
     elif st.endswith("@markPrice@1s"):
         sym = data.get("s")
         mark = float(data.get("p", 0) or 0)
@@ -213,6 +211,7 @@ async def on_market(msg):
 
 
 async def main():
+    await notify.flush_boot_queue()
     print(f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}")
     print(f"[FTM2] APIKEY={(CFG.BINANCE_API_KEY[:4] + '…') if CFG.BINANCE_API_KEY else 'EMPTY'}")
     bx = BinanceClient()
@@ -224,7 +223,7 @@ async def main():
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ
     brkt = Bracket(CFG, bx, bx.filters)
-    ROUTER = OrderRouter(CFG, bx, bracket=brkt, rt=RT, sync_guard=sync_guard)
+    ROUTER = order_router.OrderRouter(CFG, bx, bracket=brkt, rt=RT, sync_guard=sync_guard)
     GUARD = GuardRails(CFG)
     GUARD.rt = RT
     BX = bx
@@ -258,8 +257,7 @@ async def main():
             print("[NOTIFY_FALLBACK]", text)
 
     async def _close_all(sym):
-        from ftm2.trade import order_router as OR
-        return await OR.close_position_all(sym)
+        return await order_router.close_position_all(sym)
 
     INTQ = IntentQueue(CFG, div, ROUTER, CSV, notify)
     ops_board = OpsBoard(CFG, notify, dash_collect, render_ops_board)
@@ -273,12 +271,11 @@ async def main():
     tasks = [
         asyncio.create_task(start_notifier(CFG)),
         asyncio.create_task(streams_market.market_stream(CFG.SYMBOLS, CFG.INTERVAL, on_market)),
-        asyncio.create_task(user_stream(bx, tracker, CFG)),
+        asyncio.create_task(streams_user.user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
 
     # [ANCHOR:WEB_BOOT_GUARDED]
-    import os
     WEB_ENABLE = os.getenv("WEB_ENABLE","false").lower() in ("1","true","yes")
     broadcaster = None
     if WEB_ENABLE:

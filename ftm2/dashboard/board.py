@@ -2,6 +2,9 @@ import time
 
 
 
+from ftm2.notify import discord_bot
+
+
 class OpsBoard:
     def __init__(self, cfg, notify, collector, renderer):
         self.cfg, self.notify = cfg, notify
@@ -15,20 +18,20 @@ class OpsBoard:
             return
         ops = self.collect(rt, self.cfg, market, bracket, guard)
         text = self.render(ops)
-        # [ANCHOR:DASH_SAFE_SEND]
+        # [ANCHOR:DASH_UPSERT_ONLY_IF_CHANGED]
+        if text == getattr(self, "_last_payload", None):
+            return
         try:
-            card = getattr(self, "_card", None)
-            if card and (now - card["created_at"] < self.cfg.DASH_LIFETIME_MIN * 60):
-                await self.notify.dc.edit(card["id"], text)
-
-            else:
-                mid = await self.notify.dc.send(self.cfg.CHANNEL_SIGNALS, text)
-                self._card = {"id": mid, "created_at": now}
+            await discord_bot.upsert(
+                self.cfg.CHANNEL_SIGNALS,
+                text,
+                sticky_key="ops_board",
+            )
+            self._last_payload = text
             self._last_edit = now
         except Exception as e:
             try:
                 await self.notify.dc.send(
-
                     self.cfg.CHANNEL_LOGS,
                     f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
                 )
