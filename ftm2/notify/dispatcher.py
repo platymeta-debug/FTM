@@ -17,8 +17,9 @@ class Notifier:
 
         # 이벤트 → 채널 맵(기본)
         self.route = {
-            "intent": "signals",
-            "gate_skip": "signals",
+            "intent": "logs",
+            "gate_skip": "logs",
+            "intent_cancel": "logs",
             "order_submitted": "signals",
             "order_failed": "signals",
             "fill": "trades",

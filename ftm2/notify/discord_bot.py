@@ -58,15 +58,18 @@ def send_signal(text: str, embed=None): _send_queue.put_nowait(("signals", text,
 _last_emit_cache = {}
 
 
-async def upsert(channel_key_or_name, text, *, dedupe_ms=3000, max_age_edit_s=3300):
+async def upsert(channel_key_or_name, text, *, sticky_key=None, dedupe_ms=3000, max_age_edit_s=3300):
     now = time.time() * 1000
     k = (channel_key_or_name, text)
     if now - _last_emit_cache.get(k, 0) < dedupe_ms:
         return None
     _last_emit_cache[k] = now
 
+    key = sticky_key or channel_key_or_name
     mid_store = getattr(upsert, "_store", {})
-    store = mid_store.setdefault(channel_key_or_name, {"id": None, "ts": 0})
+    if not hasattr(upsert, "_store"):
+        upsert._store = mid_store
+    store = mid_store.setdefault(key, {"id": None, "ts": 0})
     try:
         if store["id"] and (time.time() - store["ts"] < max_age_edit_s):
             return await dispatcher.dc.edit(store["id"], text)
