@@ -66,6 +66,7 @@ notify.configure_channels(
 
 object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
 
+
 BUFFERS: dict[str, pd.DataFrame] = {}
 ROUTER: OrderRouter | None = None
 GUARD: GuardRails | None = None
@@ -275,6 +276,7 @@ async def main():
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
+
     # [ANCHOR:WEB_BOOT_GUARDED]
     import os
     WEB_ENABLE = os.getenv("WEB_ENABLE","false").lower() in ("1","true","yes")
@@ -298,6 +300,7 @@ async def main():
         except Exception as e:
             notify.emit("error", f"[WEB_DISABLED] init failed: {type(e).__name__}: {e}")
             WEB_ENABLE = False
+
     tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
     async def dashboard_task():
         while True:

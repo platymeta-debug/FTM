@@ -113,6 +113,7 @@ async def send(channel_key_or_name: str, text: str):
 async def edit(message_id, text: str):
     return None
 
+
 # [ANCHOR:DISPATCHER_DC_ADAPTER_V2]
 import asyncio
 
@@ -169,6 +170,7 @@ async def _edit_impl(message_id, text: str):
         emit("system", f"[DRY][edit->{message_id}] {text}")
     return None
 
+=
 class _DCUseCtx:
     def __init__(self, parent, channel_key_or_name):
         self.parent = parent
@@ -191,6 +193,7 @@ class _DCAdapter:
 
 # 항상 dc를 노출(초기화 실패/DRY 상황에서도 None이 되지 않게)
 dc = _DCAdapter()
+
 
 def configure_channels(**kw):
     """
