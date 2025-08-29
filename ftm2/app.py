@@ -8,6 +8,7 @@ from datetime import timezone
 import asyncio
 import pandas as pd
 import logging
+import inspect
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -57,12 +58,6 @@ from ftm2 import strategy as ST
 
 CFG = load_env_chain()
 # [ANCHOR:DISPATCHER_BOOTSTRAP]
-notify.ensure_dc()
-notify.configure_channels(
-    signals=os.getenv("CHANNEL_SIGNALS"),
-    trades=os.getenv("CHANNEL_TRADES"),
-    logs=os.getenv("CHANNEL_LOGS"),
-)
 
 object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
 
@@ -215,6 +210,18 @@ async def on_market(msg):
 async def main():
     print(f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}")
     print(f"[FTM2] APIKEY={(CFG.BINANCE_API_KEY[:4] + '…') if CFG.BINANCE_API_KEY else 'EMPTY'}")
+    notify.configure_channels({
+        "signals": "signals",
+        "trades": "trades",
+        "logs": "logs",
+    })
+    fbq = getattr(notify, "flush_boot_queue", None)
+    if fbq:
+        if inspect.iscoroutinefunction(fbq):
+            await fbq()
+        else:
+            fbq()
+
     bx = BinanceClient()
     t = bx.server_time()
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
@@ -249,7 +256,12 @@ async def main():
     div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
     MS.DIVERGENCE = div
 
-    await enforce_leverage_and_margin(bx, CFG, CFG.SYMBOLS)
+    for sym in CFG.SYMBOLS:
+        mode = CFG.MARGIN_MODE_OVERRIDE.get(sym, CFG.MARGIN_MODE_DEFAULT).upper()
+        lev = int(CFG.LEVERAGE_OVERRIDE.get(sym, CFG.LEVERAGE_DEFAULT))
+        await enforce_leverage_and_margin(
+            bx, sym, leverage=lev, margin_type=mode, notify=notify
+        )
 
     def _notify(text):
         try:
@@ -263,7 +275,7 @@ async def main():
 
     INTQ = IntentQueue(CFG, div, ROUTER, CSV, notify)
     ops_board = OpsBoard(CFG, notify, dash_collect, render_ops_board)
-    notify.emit("system", f"[NOTIFY_MAP] {notify.notifier.route}")
+    notify.emit("system", f"[NOTIFY_MAP] {notify.ROUTE_MAP}")
     notify.emit("intent", "📡 [테스트] 신호 채널 확인")
     notify.emit("fill", "💹 [테스트] 트레이드 채널 확인")
 
