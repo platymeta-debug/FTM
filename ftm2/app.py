@@ -1,13 +1,14 @@
 # [ANCHOR:APP_MARKET_PIPELINE]
-import asyncio, os
-import pandas as pd
+import asyncio
+import logging
+import os
 from collections import defaultdict
+from datetime import timezone
+
+import pandas as pd
+
 from ftm2.indicators.core import add_indicators
 from ftm2.strategy.scorer import score_row
-from datetime import timezone
-import asyncio
-import pandas as pd
-import logging
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -21,8 +22,6 @@ from ftm2.trade.position_tracker import PositionTracker
 from ftm2.reconcile.reconciler import resync_loop
 from ftm2.notify.discord_bot import start_notifier, register_hooks, register_tracker
 from ftm2.trade import order_router
-from ftm2.indicators.all import add_indicators
-from ftm2.strategy.scorer import score_row
 from ftm2.storage.csv_logger import CsvLogger
 from ftm2.risk.ledger import DailyLedger, LossCutController
 from ftm2.reconcile.income_poll import income_poll_loop
@@ -278,7 +277,6 @@ async def main():
     ]
 
     # [ANCHOR:WEB_BOOT_GUARDED]
-    import os
     WEB_ENABLE = os.getenv("WEB_ENABLE","false").lower() in ("1","true","yes")
     broadcaster = None
     if WEB_ENABLE:
