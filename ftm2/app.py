@@ -6,9 +6,9 @@ from collections import defaultdict
 from datetime import timezone
 
 import pandas as pd
+import logging
+import inspect
 
-from ftm2.indicators.core import add_indicators
-from ftm2.strategy.scorer import score_row
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -213,13 +213,13 @@ async def main():
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
 
-    from ftm2.notify import dispatcher as notify_dp
-    notify_dp.configure_channels(
-        signals=os.getenv("CHANNEL_SIGNALS"),
-        trades=os.getenv("CHANNEL_TRADES"),
-        logs=os.getenv("CHANNEL_LOGS"),
-    )
-    await notify_dp.flush_boot_queue()
+    fbq = getattr(notify, "flush_boot_queue", None)
+    if fbq:
+        if inspect.iscoroutinefunction(fbq):
+            await fbq()
+        else:
+            fbq()
+
 
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ

@@ -1,6 +1,73 @@
-# --- dispatcher.py: discord_bot 바인딩(재귀 방지 + 폴백 포함) ---
-from types import SimpleNamespace
-from ftm2.notify import discord_bot as _bot
+import os
+from ftm2.config.settings import load_env_chain
+from ftm2.notify import discord_bot
+
+
+class Notifier:
+    # [ANCHOR:NOTIFIER_INIT]
+    def __init__(self, cfg, discord_client):
+        self.cfg = cfg
+        self.dc = discord_client
+        self._throttle: dict[str, float] = {}
+        # 채널 바인딩 (이름 또는 ID 지원)
+        self.ch_signals = cfg.CHANNEL_SIGNALS
+        self.ch_trades = cfg.CHANNEL_TRADES
+        self.ch_logs = cfg.CHANNEL_LOGS
+
+        # 이벤트 → 채널 맵(기본)
+        self.route = {
+            "intent": "signals",
+            "gate_skip": "signals",
+            "order_submitted": "signals",
+            "order_failed": "signals",
+            "fill": "trades",
+            "close": "trades",
+            "pnl": "trades",
+            "system": "logs",
+            "error": "logs",
+            "chart": "logs",
+        }
+
+    def _send(self, which: str, text: str):
+        ch = {
+            "signals": self.ch_signals,
+            "trades": self.ch_trades,
+            "logs": self.ch_logs,
+        }[which]
+        self.dc.send(ch, text)
+
+    def push_signal(self, text: str):
+        """Directly send to signal channel."""
+        self._send("signals", text)
+
+    def push_trade(self, text: str):
+        """Directly send to trade channel."""
+        self._send("trades", text)
+
+    def push_log(self, text: str):
+        """Directly send to log channel."""
+        self._send("logs", text)
+
+
+    def emit(self, event: str, text: str):
+        which = self.route.get(event, "logs")
+        if self.cfg.NOTIFY_STRICT:
+            if event in ("intent", "order_submitted", "order_failed", "gate_skip") and text.startswith("💹"):
+                text = text.replace("💹", "📡", 1)
+            if event in ("fill", "close", "pnl") and text.startswith("📡"):
+                text = text.replace("📡", "💹", 1)
+        self._send(which, text)
+
+    def emit_once(self, key: str, event: str, text: str, ttl_ms: int | None = None):
+        ttl = ttl_ms or self.cfg.NOTIFY_THROTTLE_MS
+        now = time.time() * 1000
+        last = self._throttle.get(key, 0)
+        if now - last < ttl:
+            return
+        self._throttle[key] = now
+        emit(event, text)
+
+
 
 async def _missing(*args, **kwargs):
     raise RuntimeError("discord_bot API(send/edit/upsert) 가 구현되어 있지 않습니다.")
@@ -27,6 +94,13 @@ def configure_channels(chmap: dict[str, int | str]) -> None:
     """Configure channel aliases used by the dispatcher."""
     global _CHANNELS
     _CHANNELS = dict(chmap)
+
+
+emit_once = notifier.emit_once
+push_signal = notifier.push_signal
+push_trade = notifier.push_trade
+push_log = notifier.push_log
+send_once = notifier.send_once
 
 
 def _resolve_channel(key_or_name: int | str) -> int | str:
@@ -204,30 +278,83 @@ def emit(kind: str, text: str, route: str | None = None) -> None:
         _BOOT_QUEUE.append((ch, text))
 
 
-def emit_once(key: str, kind: str, text: str, ttl_ms: int = 60000, route: str | None = None) -> None:
-    now = time.time() * 1000
-    exp = _ONCE_CACHE.get(key)
-    if exp and now < exp:
-        return
-    _ONCE_CACHE[key] = now + ttl_ms
-    emit(kind, text, route=route)
+
+class _DCUseCtx:
+    def __init__(self, parent, channel_key_or_name):
+        self.parent = parent
+        self.target = channel_key_or_name
+    async def send(self, text: str):
+        return await _send_impl(self.target, text)
+    async def edit(self, message_id, text: str):
+        return await _edit_impl(message_id, text)
+
+class _DCAdapter:
+    async def send(self, channel_key_or_name: str, text: str):
+        return await _send_impl(channel_key_or_name, text)
+    async def edit(self, message_id, text: str):
+        return await _edit_impl(message_id, text)
+    def use(self, channel_key_or_name: str):
+        """
+        notify.dc.use('signals').send('...') 형태 지원
+        """
+        return _DCUseCtx(self, channel_key_or_name)
+
+# 항상 dc를 노출(초기화 실패/DRY 상황에서도 None이 되지 않게)
+dc = _DCAdapter()
 
 
-def flush_boot_queue() -> None:
+# ==== boot queue state (dispatcher.py) ====
+import asyncio, time
+from typing import Optional
+
+_BOOT_QUEUE: list[tuple[str, str, Optional[str], int]] = []  # (kind, text, route, ttl_ms)
+_BOOT_READY: bool = False
+
+async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
+    which = route or notifier.route.get(kind, "logs")
+    if notifier.cfg.NOTIFY_STRICT:
+        if kind in ("intent", "order_submitted", "order_failed", "gate_skip") and text.startswith("💹"):
+            text = text.replace("💹", "📡", 1)
+        if kind in ("fill", "close", "pnl") and text.startswith("📡"):
+            text = text.replace("📡", "💹", 1)
+    await _send_impl(which, text)
+
+def emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
+    """루프 전이면 큐에 저장, 준비되면 코루틴 태스크 생성"""
+    global _BOOT_READY
+    if not _BOOT_READY:
+        _BOOT_QUEUE.append((kind, text, route, ttl_ms))
+        return None
+    return asyncio.create_task(_emit(kind, text, route, ttl_ms=ttl_ms))
+
+async def flush_boot_queue():
+    """부팅 큐를 비우는 'async' 함수 — 반드시 await 가능해야 함"""
+    global _BOOT_READY
+    _BOOT_READY = True
     while _BOOT_QUEUE:
-        ch, text = _BOOT_QUEUE.pop(0)
-        try:
-            asyncio.get_event_loop().create_task(dc.send(ch, text))
-        except Exception:
-            pass
+        kind, text, route, ttl_ms = _BOOT_QUEUE.pop(0)
+        await _emit(kind, text, route, ttl_ms=ttl_ms)
+
+# 모듈 export 고정 (다른 곳에서 실수로 덮어쓰지 않도록)
+__all__ = [
+    "emit", "emit_once", "flush_boot_queue",
+    "push_signal", "push_trade", "push_log", "send_once",
+    "send", "edit", "dc", "configure_channels", "ensure_dc",
+]
 
 
-# 외부에서 직접 호출 가능하도록 별도 함수 유지
-async def send(channel_key_or_name: str, text: str):
-    await dc.send(channel_key_or_name, text)
+def configure_channels(**kw):
+    """
+    런타임에서 CHANNELS 갱신(예: env 반영).
+    """
+    CHANNELS.update({k: v for k, v in kw.items() if v})
+    if 'emit' in globals():
+        emit("system", f"[NOTIFY_CHANNELS] {CHANNELS}")
 
-
-async def edit(message_id, text: str):
-    return await dc.edit(message_id, text)
-
+def ensure_dc():
+    """외부에서 보증 호출 가능(이미 객체면 그대로 둠)"""
+    global dc
+    if dc is None or not hasattr(dc, "send") or not hasattr(dc, "use"):
+        dc = _DCAdapter()
+    return dc
 
