@@ -68,34 +68,46 @@ async def upsert(channel_key_or_name: str, text: str, *, dedupe_ms=3000, max_age
     key = sticky_key or f"{channel_key_or_name}::default"
 
 
-async def upsert(channel_key_or_name, text, *, sticky_key=None, dedupe_ms=2000, max_age_edit_s=3300):
+
+async def upsert(
+    channel_key_or_name,
+    text,
+    *,
+    sticky_key: str,
+    dedupe_ms: int = 2000,
+    max_age_edit_s: int = 3300,
+):
+    """Send or edit a single sticky message per channel."""
 
     now = time.time() * 1000
-    k = (channel_key_or_name, text)
+    h = hash(text)
+    k = (channel_key_or_name, h)
     if now - _last_emit_cache.get(k, 0) < dedupe_ms:
         return None
     _last_emit_cache[k] = now
 
-    key = sticky_key or channel_key_or_name
-    mid_store = getattr(upsert, "_store", {})
-    if not hasattr(upsert, "_store"):
-        upsert._store = mid_store
-    store = mid_store.setdefault(key, {"id": None, "ts": 0})
 
+    store = getattr(upsert, "_store", {})
+    s = store.setdefault(sticky_key, {"id": None, "ts": 0})
     try:
-        if last_mid and (time.time() - (last_ts/1000.0) < max_age_edit_s):
-            mid = await dispatcher.dc.edit(last_mid, text)
-            _last_payload_hash[key] = (now, last_mid, ph)
-            return mid
-        else:
-            mid = await dispatcher.dc.send(channel_key_or_name, text)
-            _last_payload_hash[key] = (now, mid, ph)
-            return mid
-    except Exception:
-        # 수정 실패(30046 등) -> 새로 보냄
+        if s["id"] and (time.time() - s["ts"] < max_age_edit_s):
+            return await dispatcher.dc.edit(s["id"], text)
         mid = await dispatcher.dc.send(channel_key_or_name, text)
-        _last_payload_hash[key] = (now, mid, ph)
+        s["id"], s["ts"] = mid, time.time()
         return mid
+    except Exception as e:
+        if getattr(e, "code", None) == 30046:  # edit restriction
+            try:
+                mid = await dispatcher.dc.send(channel_key_or_name, text)
+                s["id"], s["ts"] = mid, time.time()
+                return mid
+            except Exception:
+                pass
+        await dispatcher.dc.send(
+            "logs", f"[UPSERT_FAIL->{channel_key_or_name}] {type(e).__name__}: {e}\n{text}"
+        )
+        return None
+
 
 
 async def send_signal_to_discord(sym: str, side: str, score: float, reasons: list[str], img_path: str | None = None):

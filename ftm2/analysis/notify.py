@@ -17,7 +17,23 @@ class AnalysisNotify:
             return fn(key, ms)
         return True
 
-    def upsert_analysis(self, sym: str, score: int, trend: str, ticket, confidence: float | None = None, regime: str | None = None):
+
+    async def _upsert_sticky(self, ch: str, key: str, text: str, lifetime_min: int):
+        # [ANCHOR:ANALYSIS_STICKY_UPSERT]
+        from ftm2.notify import discord_bot
+
+        await discord_bot.upsert(ch, text, sticky_key=key)
+
+    async def upsert_analysis(
+        self,
+        sym: str,
+        score: int,
+        trend: str,
+        ticket,
+        confidence: float | None = None,
+        regime: str | None = None,
+    ):
+
 
         changed = (
             abs(score - self.prev.get(sym, {}).get("score", 0)) >= self.cfg.ANALYSIS_SCORE_DELTA_MIN
@@ -28,13 +44,19 @@ class AnalysisNotify:
             return
         # [ANCHOR:ANALYSIS_REASONS_INLINE]
         reasons = getattr(ticket, "reasons", [])[:3] if ticket else []
-        text = self.views.render(sym, score=score, trend=trend, ticket=ticket, confidence=confidence, regime=regime, reasons=reasons)
-        asyncio.create_task(
-            upsert(
-                self.cfg.CHANNEL_SIGNALS,
-                text,
-                sticky_key=f"analysis::{sym}",
-                max_age_edit_s=self.cfg.ANALYSIS_LIFETIME_MIN * 60,
-            )
+        text = self.views.render(
+            sym,
+            score=score,
+            trend=trend,
+            ticket=ticket,
+            confidence=confidence,
+            regime=regime,
+            reasons=reasons,
+        )
+        await self._upsert_sticky(
+            self.cfg.CHANNEL_SIGNALS,
+            f"analysis::{sym}",
+            text,
+            lifetime_min=self.cfg.ANALYSIS_LIFETIME_MIN,
         )
         self.prev[sym] = {"score": score, "trend": trend, "has_ticket": bool(ticket)}

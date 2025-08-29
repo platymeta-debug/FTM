@@ -3,7 +3,6 @@ from ftm2.notify import dispatcher
 from ftm2.notify.discord_bot import upsert
 from ftm2.journal.events import JEvent
 from ftm2.trade.order_fsm import OFSM, OState
-from ftm2.trade.cid import build_cid
 from ftm2.exchange.retry import with_retry, is_min_notional
 from ftm2.exchange.timeguard import TimeGuard
 
@@ -81,7 +80,8 @@ class OrderRouter:
             return False
 
         # 3) CID/FSM/시간가드
-        cid = build_cid("FTM2", sym, tk.id, bar_ts)
+        # [ANCHOR:CID_BUILD]
+        cid = f"{sym}-{tk.side}-{bar_ts}-{tk.id}"
         fsm = OFSM(sym, cid)
         fsm.to(OState.NEW)
         tg = TimeGuard(self.client, lambda m: self.notify.emit("system", "timeguard: " + m))
@@ -154,8 +154,11 @@ class OrderRouter:
             self.notify.emit("order_failed", f"📡 {sym} 체결 확인 실패")
             return False
         self.rt.positions[sym] = pos
-        tps = await self.bracket.place_from_ticket(sym, tk, abs(pos.qty))
         sl = tk.stop_px
+        tps = []
+        if self.bracket:
+            atr = getattr(tk, "atr", 0.0)
+            await self.bracket.set_brackets(sym, tk.side, pos.entry_price, abs(pos.qty), atr=atr)
         fsm.to(OState.BRACKETS_SET)
 
         # 7) 상태/쿨다운/아이뎀
