@@ -163,6 +163,9 @@ async def run_analysis_loop(cfg, symbols, market_cache, divergence, on_snapshot)
                 boot = await bootstrap_candles(bx, sym, [tf])
                 cache[tf] = boot[tf]
                 print(f"[ANALYSIS][BOOT] {sym} {tf} bars={len(boot[tf])}")
+    from ftm2.notify import dispatcher as notify
+    notify.emit("system","[ANALYSIS] boot hydration complete")
+    cfg.ANALYSIS_READY.set()
 
     # [ANCHOR:M6_ENGINE_LOOP] 분석 루프
     while True:
