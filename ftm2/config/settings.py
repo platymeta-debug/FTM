@@ -10,17 +10,24 @@ import logging
 log = logging.getLogger(__name__)
 
 
-def _json_list(key: str, default: list[str]) -> list[str]:
+def _list_env(key: str, default: list[str]) -> list[str]:
+    """Parse env var as list.
+    Accepts JSON list ("[1,2]") or comma-separated string ("A,B").
+    """
     raw = os.getenv(key)
     if not raw:
         return default
-    try:
-        val = json.loads(raw)
-        if isinstance(val, list):
-            return val
-    except Exception:
-        log.warning("invalid JSON list for %s: %s", key, raw)
-    return default
+    s = raw.strip()
+    if s.startswith("["):
+        try:
+            val = json.loads(s)
+            if isinstance(val, list):
+                return [str(v) for v in val]
+        except Exception:
+            log.warning("invalid JSON list for %s: %s", key, raw)
+        return default
+    # comma separated
+    return [x.strip() for x in s.split(",") if x.strip()] or default
 
 class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # legacy field
@@ -63,7 +70,7 @@ class Settings(BaseModel):
     ORDER_RETRIES: int = int(os.getenv("ORDER_RETRIES", "3"))
     ORDER_BACKOFF_MS: int = int(os.getenv("ORDER_BACKOFF_MS", "500"))
     # [ANALYSIS/TICKET PARAMS]
-    SCORING_TFS: list[str] = _json_list(
+    SCORING_TFS: list[str] = _list_env(
         "SCORING_TFS", ["1m", "15m", "1h", "4h"]
     )
     LONG_MIN_SCORE: int = int(os.getenv("LONG_MIN_SCORE", "60"))
@@ -149,7 +156,7 @@ class Settings(BaseModel):
     RECV_WINDOW_MS: int = int(os.getenv("RECV_WINDOW_MS", "5000"))
     HTTP_TIMEOUT_S: float = float(os.getenv("HTTP_TIMEOUT_S", "5"))
 
-    SYMBOLS: list[str] = _json_list("SYMBOLS", ["BTCUSDT", "ETHUSDT"])
+    SYMBOLS: list[str] = _list_env("SYMBOLS", ["BTCUSDT", "ETHUSDT"])
     INTERVAL: str = os.getenv("INTERVAL", "1m")
     LOOKBACK: int = int(os.getenv("LOOKBACK", "300"))
 
