@@ -1,6 +1,15 @@
 import time
 from dataclasses import dataclass
 from ftm2.runtime.positions import PosSnap
+from ftm2.notify.dispatcher import discord_safe_send
+
+# [ANCHOR:DISCORD_TRADE_CARD]
+def _safe_margin_mode(obj) -> str:
+    mm = getattr(obj, "margin_mode", None)
+    if mm:
+        return str(mm)
+    iso = getattr(obj, "isolated", None)
+    return "isolated" if iso is True else "cross"
 
 # [ANCHOR:DISCORD_TRADE_CARD]
 def _safe_margin_mode(obj) -> str:
@@ -109,11 +118,19 @@ class TradeCards:
             ]
         ]
         if card:
-            await self.dc.edit(card.message_id, txt, components=components)
+            await discord_safe_send(
+                self.dc.edit,
+                message_id=card.message_id,
+                text=txt,
+                components=components,
+            )
             card.last_edit_at = now
         else:
-            mid = await self.dc.send(
-                self.cfg.CHANNEL_TRADES, txt, components=components
+            mid = await discord_safe_send(
+                self.dc.send,
+                channel_key_or_name=self.cfg.CHANNEL_TRADES,
+                text=txt,
+                components=components,
             )
             card = CardRef(message_id=mid, created_at=now, last_edit_at=now)
             self.cards[sym] = card

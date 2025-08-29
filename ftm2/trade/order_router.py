@@ -1,6 +1,7 @@
 import time
 from ftm2.notify import dispatcher
 from ftm2.notify.discord_bot import upsert
+from ftm2.notify.dispatcher import discord_safe_send
 from ftm2.journal.events import JEvent
 from ftm2.trade.order_fsm import OFSM, OState
 from ftm2.exchange.retry import with_retry, is_min_notional
@@ -56,8 +57,10 @@ class OrderRouter:
         # 0) 티켓 게이트
         tk = self.rt.active_ticket.get(sym)
         if not tk:
-            await self.notify.emit(
-                "gate_skip", f"📡 {sym} 티켓없음 → 진입 금지", ttl_ms=120_000
+            await discord_safe_send(
+                self.notify.send,
+                channel_key_or_name=self.cfg.CHANNEL_LOGS,
+                text=f"📡 {sym} 티켓없음 → 진입 금지",
             )
             return False  # [ANCHOR:INTENT_GATE]
 
