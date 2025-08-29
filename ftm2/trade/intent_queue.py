@@ -120,8 +120,8 @@ class IntentQueue:
                             if it.attempts >= self.cfg.INTENT_MAX_RETRY:
                                 self.intents.pop(sym, None)
                                 try:
-                                    self.notify.emit(
-                                        "gate_skip", f"📡 {sym} 의도 취소: 재시도 초과"
+                                    await self.notify.emit(
+                                        "intent_cancel", f"📡 {sym} 의도 취소: 재시도 초과", ttl_ms=120_000
                                     )
                                 except Exception:
                                     pass

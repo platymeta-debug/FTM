@@ -1,4 +1,13 @@
-# [ANCHOR:ANALYSIS_STICKY]
+import os
+from ftm2.notify.discord_bot import upsert
+
+# [ANALYSIS_STICKY_UPSERT]
+async def push_analysis(sym: str, txt: str, channel=None):
+    ch = channel or os.getenv("CHANNEL_ANALYSIS") or os.getenv("CHANNEL_SIGNALS") or "signals"
+    key = f"analysis::{sym}"
+    await upsert(ch, txt, sticky_key=key, dedupe_ms=2000, max_age_edit_s=3300)
+
+
 class AnalysisNotify:
     def __init__(self, cfg, views, notify):
         self.cfg = cfg

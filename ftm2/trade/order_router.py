@@ -57,7 +57,9 @@ class OrderRouter:
         # 0) 티켓 게이트
         tk = self.rt.active_ticket.get(sym)
         if not tk:
-            self.notify.emit("gate_skip", f"📡 {sym} 티켓없음 → 진입 금지")
+            await self.notify.emit(
+                "gate_skip", f"📡 {sym} 티켓없음 → 진입 금지", ttl_ms=120_000
+            )
             return False
 
         # 1) 사이징
