@@ -106,19 +106,47 @@ push_trade = notifier.push_trade
 push_log = notifier.push_log
 send_once = notifier.send_once
 
-# [ANCHOR:DISPATCHER_DC_ADAPTER]
-async def _send(channel_key: str, text: str):
-    notifier._send(channel_key, text)
+async def send(channel_key_or_name: str, text: str):
+    """Bridge to actual send implementation."""
+    notifier.dc.send(channel_key_or_name, text)
 
-async def _edit(message_id, text: str):
+async def edit(message_id, text: str):
     return None
 
-class _DCAdapter:
-    async def send(self, channel_key: str, text: str):
-        return await _send(channel_key, text)
+# [ANCHOR:DISPATCHER_HARDENED]
+import os
+CHANNELS = {
+    "signals": os.getenv("CHANNEL_SIGNALS","signals"),
+    "trades":  os.getenv("CHANNEL_TRADES","trades"),
+    "logs":    os.getenv("CHANNEL_LOGS","logs"),
+}
+def configure_channels(**kw):
+    CHANNELS.update({k:v for k,v in kw.items() if v})
+def _resolve_channel(s):
+    if not s: return CHANNELS.get("signals","signals")
+    k=str(s).strip()
+    if k in CHANNELS: return CHANNELS[k]
+    if k.startswith("#") or k.isdigit(): return k
+    for v in CHANNELS.values():
+        if v==k: return v
+    return CHANNELS.get("signals","signals")
 
-    async def edit(self, message_id, text: str):
-        return await _edit(message_id, text)
+async def _send_impl(key_or_name, text):
+    target=_resolve_channel(key_or_name)
+    if 'send' in globals(): return await send(target, text)
+    if 'emit' in globals(): emit("system", f"[DRY][send->{target}] {text}"); return None
+async def _edit_impl(mid, text):
+    if 'edit' in globals(): return await edit(mid, text)
+    if 'emit' in globals(): emit("system", f"[DRY][edit->{mid}] {text}"); return None
 
-dc = _DCAdapter()
+class _DCUseCtx:
+    def __init__(self, t): self.t=t
+    async def send(self, text): return await _send_impl(self.t, text)
+    async def edit(self, mid, text): return await _edit_impl(mid, text)
+class _DC:
+    def use(self, t): return _DCUseCtx(t)
+    async def send(self, t, text): return await _send_impl(t, text)
+    async def edit(self, mid, text): return await _edit_impl(mid, text)
+
+dc = _DC()  # 절대 None이 되지 않게
 

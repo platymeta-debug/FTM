@@ -49,6 +49,10 @@ class OrderRouter:
             setattr(self.sizer, "filters", self.filters)
 
     async def place_entry(self, sym: str):
+        # [ANCHOR:ANALYSIS_GATE_CHECK]
+        if hasattr(self.cfg, "ANALYSIS_READY") and not self.cfg.ANALYSIS_READY.is_set():
+            self.notify.emit("gate_skip", f"📡 {sym} 분석 준비 전 → 진입 금지")
+            return False
         # 0) 티켓 게이트
         tk = self.rt.active_ticket.get(sym)
         if not tk:
