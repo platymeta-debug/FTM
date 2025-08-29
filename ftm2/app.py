@@ -42,7 +42,7 @@ from ftm2.dashboard.render import render_ops_board
 from ftm2.dashboard.board import OpsBoard
 from ftm2.ops.sync_guard import SyncGuard
 from ftm2.recover.snapshot import load_state, dump_state
-from ftm2.notify import dispatcher as NOTIFY
+from ftm2.notify import dispatcher as notify
 
 
 # 전역 주입 포인트(간단)
@@ -56,6 +56,15 @@ from ftm2 import strategy as ST
 
 
 CFG = load_env_chain()
+# [ANCHOR:DISPATCHER_BOOTSTRAP]
+notify.ensure_dc()
+notify.configure_channels(
+    signals=os.getenv("CHANNEL_SIGNALS"),
+    trades=os.getenv("CHANNEL_TRADES"),
+    logs=os.getenv("CHANNEL_LOGS"),
+)
+
+object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
 
 BUFFERS: dict[str, pd.DataFrame] = {}
 ROUTER: OrderRouter | None = None
@@ -70,7 +79,7 @@ journal = Journal(CFG)
 RT.journal = journal
 if CFG.RECOVER_LAST_SNAPSHOT:
     load_state(RT, CFG)
-sync_guard = SyncGuard(CFG, None, NOTIFY)
+sync_guard = SyncGuard(CFG, None, notify)
 
 
 
@@ -251,11 +260,11 @@ async def main():
         from ftm2.trade import order_router as OR
         return await OR.close_position_all(sym)
 
-    INTQ = IntentQueue(CFG, div, ROUTER, CSV, NOTIFY)
-    ops_board = OpsBoard(CFG, NOTIFY, dash_collect, render_ops_board)
-    NOTIFY.emit("system", f"[NOTIFY_MAP] {NOTIFY.notifier.route}")
-    NOTIFY.emit("intent", "📡 [테스트] 신호 채널 확인")
-    NOTIFY.emit("fill", "💹 [테스트] 트레이드 채널 확인")
+    INTQ = IntentQueue(CFG, div, ROUTER, CSV, notify)
+    ops_board = OpsBoard(CFG, notify, dash_collect, render_ops_board)
+    notify.emit("system", f"[NOTIFY_MAP] {notify.notifier.route}")
+    notify.emit("intent", "📡 [테스트] 신호 채널 확인")
+    notify.emit("fill", "💹 [테스트] 트레이드 채널 확인")
 
     LC = LossCutController(CFG, LEDGER, tracker, router=type("R",(),{"close_all":_close_all}), notify=_notify, csv_logger=CSV)
 
@@ -266,21 +275,36 @@ async def main():
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
-    if CFG.WEB_ENABLE:
-        from ftm2.web.app import app as web_app, init as web_init
-        import uvicorn
-        broadcaster = web_init(web_app, CFG, RT, None, RT.bracket, NOTIFY)
-        config = uvicorn.Config(web_app, host=CFG.WEB_HOST, port=CFG.WEB_PORT, log_level="info")
-        server = uvicorn.Server(config)
-        tasks.append(asyncio.create_task(server.serve()))
-        tasks.append(asyncio.create_task(broadcaster()))
+    # [ANCHOR:WEB_BOOT_GUARDED]
+    import os
+    WEB_ENABLE = os.getenv("WEB_ENABLE","false").lower() in ("1","true","yes")
+    broadcaster = None
+    if WEB_ENABLE:
+        try:
+            from ftm2.web.app import app as web_app, init as web_init
+            broadcaster = web_init(web_app, CFG, RT, None, RT.bracket, notify)
+            async def web_task():
+                while True:
+                    try:
+                        await broadcaster()
+                    except Exception as e:
+                        notify.emit("error", f"[WEB] broadcast err: {type(e).__name__}: {e}")
+                    await asyncio.sleep(CFG.WEB_PUSH_INTERVAL_S)
+            tasks.append(asyncio.create_task(web_task()))
+            notify.emit("system","[WEB] enabled")
+        except ModuleNotFoundError as e:
+            notify.emit("system", f"[WEB_DISABLED] {e}. set WEB_ENABLE=false or pip install fastapi uvicorn")
+            WEB_ENABLE = False
+        except Exception as e:
+            notify.emit("error", f"[WEB_DISABLED] init failed: {type(e).__name__}: {e}")
+            WEB_ENABLE = False
     tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
     async def dashboard_task():
         while True:
             try:
                 await ops_board.tick(RT, None, RT.bracket, guard=None)
             except Exception as e:
-                NOTIFY.emit("error", f"dash tick err: {type(e).__name__}: {e}")
+                notify.emit("error", f"dash tick err: {type(e).__name__}: {e}")
             await asyncio.sleep(CFG.DASH_INTERVAL_S)
     tasks.append(asyncio.create_task(dashboard_task()))
 
@@ -293,7 +317,7 @@ async def main():
                     if pos and abs(getattr(pos, "qty", 0)) > 1e-12:
                         await sync_guard.verify_after_fill(sym, RT, RT.bracket, None)
             except Exception as e:
-                NOTIFY.emit("error", f"sync watchdog err: {e}")
+                notify.emit("error", f"sync watchdog err: {e}")
             await asyncio.sleep(CFG.SYNC_PERIODIC_SEC)
 
     tasks.append(asyncio.create_task(sync_watchdog()))
@@ -352,7 +376,7 @@ async def main():
             try:
                 dump_state(RT, CFG)
             except Exception as e:
-                NOTIFY.emit("error", f"snapshot err: {e}")
+                notify.emit("error", f"snapshot err: {e}")
             await asyncio.sleep(CFG.SNAPSHOT_INTERVAL_SEC)
 
     tasks.append(asyncio.create_task(snapshot_daemon()))
@@ -376,13 +400,26 @@ async def main():
             await asyncio.sleep(5)
     tasks.append(asyncio.create_task(ledger_guard_loop()))
     smoke = int(os.getenv("SMOKE_SECONDS", "0"))
-    if smoke > 0:
+    try:
+        if smoke > 0:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=smoke)
+            except asyncio.TimeoutError:
+                print("[SMOKE] timed out; exiting")
+        else:
+            await asyncio.gather(*tasks)
+    finally:
+        # WS/세션 정리
         try:
-            await asyncio.wait_for(asyncio.gather(*tasks), timeout=smoke)
-        except asyncio.TimeoutError:
-            print("[SMOKE] timed out; exiting")
-    else:
-        await asyncio.gather(*tasks)
+            if hasattr(bx, "ws_close_all"):
+                await bx.ws_close_all()
+        except Exception as e:
+            notify.emit("system", f"[SHUTDOWN] ws_close_all: {e}")
+        try:
+            if hasattr(bx, "aclose"):
+                await bx.aclose()
+        except Exception as e:
+            notify.emit("system", f"[SHUTDOWN] client close: {e}")
 
 
 

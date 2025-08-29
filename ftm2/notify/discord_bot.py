@@ -10,6 +10,7 @@ from ftm2.notify.analysis_views import build_analysis_embed
 from ftm2.storage.persistence import load_trade_cards, save_trade_cards
 from ftm2.storage.analysis_persistence import load_analysis_cards, save_analysis_cards
 from ftm2.trade.position_tracker import PositionTracker
+from ftm2.notify import dispatcher
 
 _send_queue: "asyncio.Queue[tuple[str,str]]" = asyncio.Queue()
 _cfg = None
@@ -52,6 +53,37 @@ def TRACKER_REF():
 def send_log(text: str, embed=None):    _send_queue.put_nowait(("logs", text, embed))
 def send_trade(text: str, embed=None):  _send_queue.put_nowait(("trades", text, embed))
 def send_signal(text: str, embed=None): _send_queue.put_nowait(("signals", text, embed))
+
+# [ANCHOR:UPSERT_MSG]
+_last_emit_cache = {}
+
+
+async def upsert(channel_key_or_name, text, *, dedupe_ms=3000, max_age_edit_s=3300):
+    now = time.time() * 1000
+    k = (channel_key_or_name, text)
+    if now - _last_emit_cache.get(k, 0) < dedupe_ms:
+        return None
+    _last_emit_cache[k] = now
+
+    mid_store = getattr(upsert, "_store", {})
+    store = mid_store.setdefault(channel_key_or_name, {"id": None, "ts": 0})
+    try:
+        if store["id"] and (time.time() - store["ts"] < max_age_edit_s):
+            return await dispatcher.dc.edit(store["id"], text)
+        else:
+            mid = await dispatcher.dc.send(channel_key_or_name, text)
+            store["id"], store["ts"] = mid, time.time()
+            return mid
+    except Exception as e:
+        try:
+            mid = await dispatcher.dc.send(channel_key_or_name, text)
+            store["id"], store["ts"] = mid, time.time()
+            return mid
+        except Exception:
+            await dispatcher.dc.send(
+                "logs", f"[UPSERT_FAIL->{channel_key_or_name}] {type(e).__name__}: {e}\n{text}"
+            )
+            return None
 
 
 async def send_signal_to_discord(sym: str, side: str, score: float, reasons: list[str], img_path: str | None = None):
