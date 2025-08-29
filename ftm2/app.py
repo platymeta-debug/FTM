@@ -42,7 +42,7 @@ from ftm2.dashboard.render import render_ops_board
 from ftm2.dashboard.board import OpsBoard
 from ftm2.ops.sync_guard import SyncGuard
 from ftm2.recover.snapshot import load_state, dump_state
-from ftm2.notify import dispatcher as NOTIFY
+from ftm2.notify import dispatcher as notify
 
 
 # 전역 주입 포인트(간단)
@@ -57,9 +57,10 @@ from ftm2 import strategy as ST
 
 CFG = load_env_chain()
 
-# 채널/어댑터 보증 (환경 변수 반영)
-NOTIFY.ensure_dc()
-NOTIFY.configure_channels(
+
+# 채널/어댑터 보증 (반드시 초기화 초반에)
+notify.ensure_dc()
+notify.configure_channels(
     signals=os.getenv("CHANNEL_SIGNALS"),
     trades=os.getenv("CHANNEL_TRADES"),
     logs=os.getenv("CHANNEL_LOGS"),
@@ -78,7 +79,7 @@ journal = Journal(CFG)
 RT.journal = journal
 if CFG.RECOVER_LAST_SNAPSHOT:
     load_state(RT, CFG)
-sync_guard = SyncGuard(CFG, None, NOTIFY)
+sync_guard = SyncGuard(CFG, None, notify)
 
 
 
@@ -259,11 +260,11 @@ async def main():
         from ftm2.trade import order_router as OR
         return await OR.close_position_all(sym)
 
-    INTQ = IntentQueue(CFG, div, ROUTER, CSV, NOTIFY)
-    ops_board = OpsBoard(CFG, NOTIFY, dash_collect, render_ops_board)
-    NOTIFY.emit("system", f"[NOTIFY_MAP] {NOTIFY.notifier.route}")
-    NOTIFY.emit("intent", "📡 [테스트] 신호 채널 확인")
-    NOTIFY.emit("fill", "💹 [테스트] 트레이드 채널 확인")
+    INTQ = IntentQueue(CFG, div, ROUTER, CSV, notify)
+    ops_board = OpsBoard(CFG, notify, dash_collect, render_ops_board)
+    notify.emit("system", f"[NOTIFY_MAP] {notify.notifier.route}")
+    notify.emit("intent", "📡 [테스트] 신호 채널 확인")
+    notify.emit("fill", "💹 [테스트] 트레이드 채널 확인")
 
     LC = LossCutController(CFG, LEDGER, tracker, router=type("R",(),{"close_all":_close_all}), notify=_notify, csv_logger=CSV)
 
@@ -277,7 +278,7 @@ async def main():
     if CFG.WEB_ENABLE:
         from ftm2.web.app import app as web_app, init as web_init
         import uvicorn
-        broadcaster = web_init(web_app, CFG, RT, None, RT.bracket, NOTIFY)
+        broadcaster = web_init(web_app, CFG, RT, None, RT.bracket, notify)
         config = uvicorn.Config(web_app, host=CFG.WEB_HOST, port=CFG.WEB_PORT, log_level="info")
         server = uvicorn.Server(config)
         tasks.append(asyncio.create_task(server.serve()))
@@ -288,7 +289,7 @@ async def main():
             try:
                 await ops_board.tick(RT, None, RT.bracket, guard=None)
             except Exception as e:
-                NOTIFY.emit("error", f"dash tick err: {type(e).__name__}: {e}")
+                notify.emit("error", f"dash tick err: {type(e).__name__}: {e}")
             await asyncio.sleep(CFG.DASH_INTERVAL_S)
     tasks.append(asyncio.create_task(dashboard_task()))
 
@@ -301,7 +302,7 @@ async def main():
                     if pos and abs(getattr(pos, "qty", 0)) > 1e-12:
                         await sync_guard.verify_after_fill(sym, RT, RT.bracket, None)
             except Exception as e:
-                NOTIFY.emit("error", f"sync watchdog err: {e}")
+                notify.emit("error", f"sync watchdog err: {e}")
             await asyncio.sleep(CFG.SYNC_PERIODIC_SEC)
 
     tasks.append(asyncio.create_task(sync_watchdog()))
@@ -360,7 +361,7 @@ async def main():
             try:
                 dump_state(RT, CFG)
             except Exception as e:
-                NOTIFY.emit("error", f"snapshot err: {e}")
+                notify.emit("error", f"snapshot err: {e}")
             await asyncio.sleep(CFG.SNAPSHOT_INTERVAL_SEC)
 
     tasks.append(asyncio.create_task(snapshot_daemon()))

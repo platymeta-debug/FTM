@@ -113,7 +113,6 @@ async def send(channel_key_or_name: str, text: str):
 async def edit(message_id, text: str):
     return None
 
-
 # ================== DISPATCHER DC ADAPTER (HARDENED) ==================
 import os, asyncio
 
@@ -138,12 +137,10 @@ def configure_channels(**kw):
 def _resolve_channel(key_or_name: str):
     """
     'signals'(별칭) / '#포지션신호'(이름) / '123456789...' (ID) 모두 허용.
-
     매칭 실패 시 'signals'로 폴백.
     """
     if not key_or_name:
         return CHANNELS.get("signals", "signals")
-
     k = str(key_or_name).strip()
     if k in CHANNELS:                # 별칭
         return CHANNELS[k]
@@ -170,7 +167,6 @@ async def _send_impl(channel_key_or_name: str, text: str):
 
 async def _edit_impl(message_id, text: str):
     if 'edit' in globals():
-
         return await edit(message_id, text)  # 실제 수정 함수명으로 연결
     if 'emit' in globals():
         try:
@@ -178,6 +174,7 @@ async def _edit_impl(message_id, text: str):
         except Exception:
             pass
     return None
+
 
 class _DCUseCtx:
     def __init__(self, channel_key_or_name):
