@@ -67,14 +67,19 @@ async def upsert(channel_key_or_name: str, text: str, *, dedupe_ms=3000, max_age
     ph = _payload_hash(text)
     key = sticky_key or f"{channel_key_or_name}::default"
 
-    # 동일 페이로드는 dedupe_ms 내 생략
-    last = _last_payload_hash.get(key, (0, None, 0))
-    last_ts, last_mid, last_hash = last
-    if ph == last_hash and now - last_ts < dedupe_ms:
-        return last_mid
 
+async def upsert(channel_key_or_name, text, *, sticky_key=None, dedupe_ms=3000, max_age_edit_s=3300):
+    now = time.time() * 1000
+    k = (channel_key_or_name, text)
+    if now - _last_emit_cache.get(k, 0) < dedupe_ms:
+        return None
+    _last_emit_cache[k] = now
 
-    # 55분 이내면 edit, 아니면 새로 post
+    key = sticky_key or channel_key_or_name
+    mid_store = getattr(upsert, "_store", {})
+    if not hasattr(upsert, "_store"):
+        upsert._store = mid_store
+    store = mid_store.setdefault(key, {"id": None, "ts": 0})
 
     try:
         if last_mid and (time.time() - (last_ts/1000.0) < max_age_edit_s):
