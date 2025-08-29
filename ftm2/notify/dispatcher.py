@@ -113,103 +113,43 @@ async def send(channel_key_or_name: str, text: str):
 async def edit(message_id, text: str):
     return None
 
-# ================== DISPATCHER DC ADAPTER (HARDENED) ==================
-import os, asyncio
-
-# 별칭 → 실제 대상(채널ID, '#이름', 별칭 그대로) 매핑
+# [ANCHOR:DISPATCHER_HARDENED]
+import os
 CHANNELS = {
-    "signals": os.getenv("CHANNEL_SIGNALS", "signals"),
-    "trades":  os.getenv("CHANNEL_TRADES",  "trades"),
-    "logs":    os.getenv("CHANNEL_LOGS",    "logs"),
+    "signals": os.getenv("CHANNEL_SIGNALS","signals"),
+    "trades":  os.getenv("CHANNEL_TRADES","trades"),
+    "logs":    os.getenv("CHANNEL_LOGS","logs"),
 }
-
 def configure_channels(**kw):
-    """런타임에서 채널 매핑 갱신"""
-    for k, v in kw.items():
-        if v:
-            CHANNELS[k] = v
-    if 'emit' in globals():
-        try:
-            emit("system", f"[NOTIFY_CHANNELS] {CHANNELS}")
-        except Exception:
-            pass
+    CHANNELS.update({k:v for k,v in kw.items() if v})
+def _resolve_channel(s):
+    if not s: return CHANNELS.get("signals","signals")
+    k=str(s).strip()
+    if k in CHANNELS: return CHANNELS[k]
+    if k.startswith("#") or k.isdigit(): return k
+    for v in CHANNELS.values():
+        if v==k: return v
+    return CHANNELS.get("signals","signals")
 
-def _resolve_channel(key_or_name: str):
-    """
-    'signals'(별칭) / '#포지션신호'(이름) / '123456789...' (ID) 모두 허용.
-    매칭 실패 시 'signals'로 폴백.
-    """
-    if not key_or_name:
-        return CHANNELS.get("signals", "signals")
-    k = str(key_or_name).strip()
-    if k in CHANNELS:                # 별칭
-        return CHANNELS[k]
-    if k.startswith("#"):            # 채널명
-        return k
-    if k.isdigit():                  # 채널ID
-        return k
-    for _, val in CHANNELS.items():  # 역탐색
-        if val == k:
-            return val
-    return CHANNELS.get("signals", "signals")
-
-async def _send_impl(channel_key_or_name: str, text: str):
-    target = _resolve_channel(channel_key_or_name)
-    if 'send' in globals():
-        return await send(target, text)   # 프로젝트 내 실제 전송 함수명으로 연결됨
-    # DRY/no-op fallback
-    if 'emit' in globals():
-        try:
-            emit("system", f"[DRY][send->{target}] {text}")
-        except Exception:
-            pass
-    return None
-
-async def _edit_impl(message_id, text: str):
-    if 'edit' in globals():
-        return await edit(message_id, text)  # 실제 수정 함수명으로 연결
-    if 'emit' in globals():
-        try:
-            emit("system", f"[DRY][edit->{message_id}] {text}")
-        except Exception:
-            pass
-    return None
-
+async def _send_impl(key_or_name, text):
+    target=_resolve_channel(key_or_name)
+    if 'send' in globals(): return await send(target, text)
+    if 'emit' in globals(): emit("system", f"[DRY][send->{target}] {text}"); return None
+async def _edit_impl(mid, text):
+    if 'edit' in globals(): return await edit(mid, text)
+    if 'emit' in globals(): emit("system", f"[DRY][edit->{mid}] {text}"); return None
 
 class _DCUseCtx:
-    def __init__(self, channel_key_or_name):
-        self.target = channel_key_or_name
-    async def send(self, text: str):
-        return await _send_impl(self.target, text)
-    async def edit(self, message_id, text: str):
-        return await _edit_impl(message_id, text)
+    def __init__(self, t): self.t=t
+    async def send(self, text): return await _send_impl(self.t, text)
+    async def edit(self, mid, text): return await _edit_impl(mid, text)
+class _DC:
+    def use(self, t): return _DCUseCtx(t)
+    async def send(self, t, text): return await _send_impl(t, text)
+    async def edit(self, mid, text): return await _edit_impl(mid, text)
 
-class _DCAdapter:
-    def use(self, channel_key_or_name: str):
-        return _DCUseCtx(channel_key_or_name)
-    async def send(self, channel_key_or_name: str, text: str):
-        return await _send_impl(channel_key_or_name, text)
-    async def edit(self, message_id, text: str):
-        return await _edit_impl(message_id, text)
+dc = _DC()  # 절대 None이 되지 않게
 
-
-class _NoopDC:
-    """최후방 안전망: dc가 None이어도 .use/.send/.edit가 존재하도록 보장"""
-    def use(self, channel_key_or_name: str):
-        return self
-    async def send(self, *_a, **_k):
-        if 'emit' in globals():
-            try: emit("system", f"[NOOP][send] {_a} {_k}")
-            except Exception: pass
-        return None
-    async def edit(self, *_a, **_k):
-        if 'emit' in globals():
-            try: emit("system", f"[NOOP][edit] {_a} {_k}")
-            except Exception: pass
-        return None
-
-# 전역 dc를 항상 객체로 보장
-dc = _DCAdapter()
 
 def ensure_dc():
     """외부에서 보증 호출 가능(이미 객체면 그대로 둠)"""

@@ -56,6 +56,15 @@ from ftm2 import strategy as ST
 
 
 CFG = load_env_chain()
+# [ANCHOR:DISPATCHER_BOOTSTRAP]
+from ftm2.notify import dispatcher as notify_dp
+notify_dp.configure_channels(
+    signals=os.getenv("CHANNEL_SIGNALS"),
+    trades=os.getenv("CHANNEL_TRADES"),
+    logs=os.getenv("CHANNEL_LOGS"),
+)
+
+CFG.ANALYSIS_READY = asyncio.Event()
 
 
 # 채널/어댑터 보증 (반드시 초기화 초반에)
@@ -275,14 +284,31 @@ async def main():
         asyncio.create_task(user_stream(bx, tracker, CFG)),
         asyncio.create_task(resync_loop(bx, tracker, CFG, CFG.SYMBOLS)),
     ]
-    if CFG.WEB_ENABLE:
-        from ftm2.web.app import app as web_app, init as web_init
-        import uvicorn
-        broadcaster = web_init(web_app, CFG, RT, None, RT.bracket, notify)
-        config = uvicorn.Config(web_app, host=CFG.WEB_HOST, port=CFG.WEB_PORT, log_level="info")
-        server = uvicorn.Server(config)
-        tasks.append(asyncio.create_task(server.serve()))
-        tasks.append(asyncio.create_task(broadcaster()))
+
+    # [ANCHOR:WEB_BOOT_GUARDED]
+    import os
+    WEB_ENABLE = os.getenv("WEB_ENABLE","false").lower() in ("1","true","yes")
+    broadcaster = None
+    if WEB_ENABLE:
+        try:
+            from ftm2.web.app import app as web_app, init as web_init
+            broadcaster = web_init(web_app, CFG, RT, None, RT.bracket, notify)
+            async def web_task():
+                while True:
+                    try:
+                        await broadcaster()
+                    except Exception as e:
+                        notify.emit("error", f"[WEB] broadcast err: {type(e).__name__}: {e}")
+                    await asyncio.sleep(CFG.WEB_PUSH_INTERVAL_S)
+            tasks.append(asyncio.create_task(web_task()))
+            notify.emit("system","[WEB] enabled")
+        except ModuleNotFoundError as e:
+            notify.emit("system", f"[WEB_DISABLED] {e}. set WEB_ENABLE=false or pip install fastapi uvicorn")
+            WEB_ENABLE = False
+        except Exception as e:
+            notify.emit("error", f"[WEB_DISABLED] init failed: {type(e).__name__}: {e}")
+            WEB_ENABLE = False
+
     tasks.append(asyncio.create_task(income_poll_loop(bx, LEDGER, CSV, CFG)))
     async def dashboard_task():
         while True:
@@ -385,13 +411,26 @@ async def main():
             await asyncio.sleep(5)
     tasks.append(asyncio.create_task(ledger_guard_loop()))
     smoke = int(os.getenv("SMOKE_SECONDS", "0"))
-    if smoke > 0:
+    try:
+        if smoke > 0:
+            try:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=smoke)
+            except asyncio.TimeoutError:
+                print("[SMOKE] timed out; exiting")
+        else:
+            await asyncio.gather(*tasks)
+    finally:
+        # WS/세션 정리
         try:
-            await asyncio.wait_for(asyncio.gather(*tasks), timeout=smoke)
-        except asyncio.TimeoutError:
-            print("[SMOKE] timed out; exiting")
-    else:
-        await asyncio.gather(*tasks)
+            if hasattr(bx, "ws_close_all"):
+                await bx.ws_close_all()
+        except Exception as e:
+            notify.emit("system", f"[SHUTDOWN] ws_close_all: {e}")
+        try:
+            if hasattr(bx, "aclose"):
+                await bx.aclose()
+        except Exception as e:
+            notify.emit("system", f"[SHUTDOWN] client close: {e}")
 
 
 
