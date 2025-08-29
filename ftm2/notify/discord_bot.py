@@ -54,8 +54,19 @@ def send_log(text: str, embed=None):    _send_queue.put_nowait(("logs", text, em
 def send_trade(text: str, embed=None):  _send_queue.put_nowait(("trades", text, embed))
 def send_signal(text: str, embed=None): _send_queue.put_nowait(("signals", text, embed))
 
-# [ANCHOR:UPSERT_MSG]
-_last_emit_cache = {}
+# [UPSERT_MSG]
+from ftm2.notify import dispatcher
+
+_last_payload_hash = {}
+
+def _payload_hash(txt: str) -> int:
+    return hash(txt.replace("\r\n", "\n").strip())
+
+async def upsert(channel_key_or_name: str, text: str, *, dedupe_ms=3000, max_age_edit_s=3300, sticky_key=None):
+    now = time.time()*1000
+    ph = _payload_hash(text)
+    key = sticky_key or f"{channel_key_or_name}::default"
+
 
 
 async def upsert(
@@ -67,12 +78,14 @@ async def upsert(
     max_age_edit_s: int = 3300,
 ):
     """Send or edit a single sticky message per channel."""
+
     now = time.time() * 1000
     h = hash(text)
     k = (channel_key_or_name, h)
     if now - _last_emit_cache.get(k, 0) < dedupe_ms:
         return None
     _last_emit_cache[k] = now
+
 
     store = getattr(upsert, "_store", {})
     s = store.setdefault(sticky_key, {"id": None, "ts": 0})
@@ -94,6 +107,7 @@ async def upsert(
             "logs", f"[UPSERT_FAIL->{channel_key_or_name}] {type(e).__name__}: {e}\n{text}"
         )
         return None
+
 
 
 async def send_signal_to_discord(sym: str, side: str, score: float, reasons: list[str], img_path: str | None = None):

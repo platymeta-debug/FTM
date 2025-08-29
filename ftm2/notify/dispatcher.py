@@ -1,3 +1,4 @@
+
 """Notification dispatcher with boot queue and rate limiting."""
 
 from __future__ import annotations
@@ -148,4 +149,88 @@ async def _emit(kind: str, text: str, route: str | None = None, ttl_ms: int = 0)
         return await _send_impl(target, text)
     except Exception as e:  # pragma: no cover - best effort logging
         print(f"[DISPATCHER][ERR] {kind} route={target} -> {e}", flush=True)
+
+
+# [NOTIFY_MAP]
+ROUTE_MAP = {
+    "intent": "logs",
+    "gate_skip": "logs",
+    "intent_cancel": "logs",
+    "order_submitted": "signals",
+    "order_failed": "logs",
+    "fill": "trades",
+    "close": "trades",
+    "pnl": "trades",
+    "system": "logs",
+    "error": "logs",
+    "chart": "logs",
+}
+
+# [ANCHOR:EMIT_RATE_LIMIT]
+EMIT_RATE_LIMIT = {
+    "intent": 60000,
+    "gate_skip": 60000,
+    "intent_cancel": 60000,
+    "chart": 30000,
+    "error": 5000,
+    "system": 5000,
+}
+
+_emit_history: dict[str, float] = {}
+_BOOT_QUEUE: list[tuple[str, str]] = []
+_ONCE_CACHE: dict[str, float] = {}
+
+
+def _should_emit(kind: str) -> bool:
+    ttl = EMIT_RATE_LIMIT.get(kind)
+    if not ttl:
+        return True
+    now = time.time() * 1000
+    last = _emit_history.get(kind, 0)
+    if now - last < ttl:
+        return False
+    _emit_history[kind] = now
+    return True
+
+
+def emit(kind: str, text: str, route: str | None = None) -> None:
+    if not _should_emit(kind):
+        return
+    ch = route or ROUTE_MAP.get(kind, "logs")
+    try:
+        loop = asyncio.get_event_loop()
+        if not loop.is_running():
+            _BOOT_QUEUE.append((ch, text))
+            return
+        loop.create_task(dc.send(ch, text))
+    except RuntimeError:
+        _BOOT_QUEUE.append((ch, text))
+
+
+def emit_once(key: str, kind: str, text: str, ttl_ms: int = 60000, route: str | None = None) -> None:
+    now = time.time() * 1000
+    exp = _ONCE_CACHE.get(key)
+    if exp and now < exp:
+        return
+    _ONCE_CACHE[key] = now + ttl_ms
+    emit(kind, text, route=route)
+
+
+def flush_boot_queue() -> None:
+    while _BOOT_QUEUE:
+        ch, text = _BOOT_QUEUE.pop(0)
+        try:
+            asyncio.get_event_loop().create_task(dc.send(ch, text))
+        except Exception:
+            pass
+
+
+# 외부에서 직접 호출 가능하도록 별도 함수 유지
+async def send(channel_key_or_name: str, text: str):
+    await dc.send(channel_key_or_name, text)
+
+
+async def edit(message_id, text: str):
+    return await dc.edit(message_id, text)
+
 

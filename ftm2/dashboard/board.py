@@ -1,5 +1,8 @@
 import time
+from ftm2.notify.discord_bot import upsert
 
+
+from ftm2.notify import discord_bot
 
 
 from ftm2.notify import discord_bot
@@ -34,9 +37,11 @@ class OpsBoard:
                 await self.notify.dc.send(
                     self.cfg.CHANNEL_LOGS,
                     f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
+                    sticky_key="ops_board_err",
                 )
             except Exception:
                 self.notify.emit(
                     "error", f"dash tick err(fallback): {type(e).__name__}: {e}"
                 )
+
 
