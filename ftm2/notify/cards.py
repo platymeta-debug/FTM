@@ -2,6 +2,14 @@ import time
 from dataclasses import dataclass
 from ftm2.runtime.positions import PosSnap
 
+# [ANCHOR:DISCORD_TRADE_CARD]
+def _safe_margin_mode(obj) -> str:
+    mm = getattr(obj, "margin_mode", None)
+    if mm:
+        return str(mm)
+    iso = getattr(obj, "isolated", None)
+    return "isolated" if iso is True else "cross"
+
 @dataclass
 class CardRef:
     message_id: int
@@ -26,16 +34,26 @@ class TradeCards:
         tps: list[tuple[float, float]],
         prev_qty: float | None,
     ):
-        side = "LONG" if snap.qty > 0 else "SHORT" if snap.qty < 0 else "FLAT"
-        qty = abs(snap.qty)
+        qty_val = getattr(snap, "qty", 0.0)
+        side = "LONG" if qty_val > 0 else "SHORT" if qty_val < 0 else "FLAT"
+        qty = abs(qty_val)
         delta = qty - (prev_qty or 0.0)
         tps_txt = " / ".join(f"{tp:.2f}×{q:.6f}" for tp, q in (tps or [])) if tps else "0.00"
         sl_txt = f"{sl:.2f}" if sl else "0.00"
+        mm = _safe_margin_mode(snap)
+        lev = getattr(snap, "leverage", 1)
+        mm_txt = "격리" if mm == "isolated" else "교차"
+        entry_price = getattr(snap, "entry_price", 0.0)
+        mark_price = getattr(snap, "mark_price", 0.0)
+        margin_used = getattr(snap, "margin_used", 0.0)
+        notional = getattr(snap, "notional", 0.0)
+        upnl = getattr(snap, "upnl", 0.0)
+        roe = getattr(snap, "roe", 0.0) * 100
         lines = [
-            f"**{sym} — ● {side} × {qty:.6f}** ({'격리' if snap.margin_mode=='isolated' else '교차'}x{snap.leverage})",
-            f"진입/마크 {snap.entry_price:.2f} / {snap.mark_price:.2f}",
-            f"실투/명목 {snap.margin_used:.2f} / {snap.notional:.2f} USDT",
-            f"UPNL/ROE {snap.upnl:.2f} / {snap.roe*100:.2f}%",
+            f"**{sym} — ● {side} × {qty:.6f}** ({mm_txt}x{lev})",
+            f"진입/마크 {entry_price:.2f} / {mark_price:.2f}",
+            f"실투/명목 {margin_used:.2f} / {notional:.2f} USDT",
+            f"UPNL/ROE {upnl:.2f} / {roe:.2f}%",
             f"SL/TP  {sl_txt} / {tps_txt}",
         ]
         if abs(delta) > 1e-12:
@@ -99,10 +117,12 @@ class TradeCards:
             )
             card = CardRef(message_id=mid, created_at=now, last_edit_at=now)
             self.cards[sym] = card
-        self.prev_qty[sym] = abs(snap.qty)
+        self.prev_qty[sym] = abs(getattr(snap, "qty", 0.0))
 
     async def maybe_update(self, sym: str, snap: PosSnap, sl: float | None, tps: list[tuple[float, float]]):
-        change = abs((snap.upnl - self.prev_upnl.get(sym, 0.0)) / (snap.margin_used or 1))
+        cur_upnl = getattr(snap, "upnl", 0.0)
+        margin_used = getattr(snap, "margin_used", 1) or 1
+        change = abs((cur_upnl - self.prev_upnl.get(sym, 0.0)) / margin_used)
         if change >= (self.cfg.PNL_CHANGE_BPS / 10000):
             await self.upsert_trade_card(sym, snap, sl, tps)
-        self.prev_upnl[sym] = snap.upnl
+        self.prev_upnl[sym] = cur_upnl
