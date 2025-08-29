@@ -55,6 +55,9 @@ from ftm2 import strategy as ST
 
 CFG = load_env_chain()
 
+# [ANCHOR:DISPATCHER_BOOTSTRAP]
+
+
 object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
 
 
@@ -207,6 +210,18 @@ async def main():
     await notify.flush_boot_queue()
     print(f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}")
     print(f"[FTM2] APIKEY={(CFG.BINANCE_API_KEY[:4] + '…') if CFG.BINANCE_API_KEY else 'EMPTY'}")
+    notify.configure_channels({
+        "signals": "signals",
+        "trades": "trades",
+        "logs": "logs",
+    })
+    fbq = getattr(notify, "flush_boot_queue", None)
+    if fbq:
+        if inspect.iscoroutinefunction(fbq):
+            await fbq()
+        else:
+            fbq()
+
     bx = BinanceClient()
     t = bx.server_time()
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
@@ -249,7 +264,12 @@ async def main():
     div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
     MS.DIVERGENCE = div
 
-    await enforce_leverage_and_margin(bx, CFG, CFG.SYMBOLS)
+    for sym in CFG.SYMBOLS:
+        mode = CFG.MARGIN_MODE_OVERRIDE.get(sym, CFG.MARGIN_MODE_DEFAULT).upper()
+        lev = int(CFG.LEVERAGE_OVERRIDE.get(sym, CFG.LEVERAGE_DEFAULT))
+        await enforce_leverage_and_margin(
+            bx, sym, leverage=lev, margin_type=mode, notify=notify
+        )
 
     def _notify(text):
         try:
