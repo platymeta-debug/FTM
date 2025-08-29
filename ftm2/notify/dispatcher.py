@@ -172,7 +172,7 @@ async def _edit_impl(message_id, text: str):
         emit("system", f"[DRY][edit->{message_id}] {text}")
     return None
 
-=
+
 class _DCUseCtx:
     def __init__(self, parent, channel_key_or_name):
         self.parent = parent
