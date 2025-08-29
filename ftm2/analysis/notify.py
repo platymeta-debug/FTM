@@ -3,6 +3,7 @@ import asyncio
 from ftm2.notify.discord_bot import upsert
 
 
+
 class AnalysisNotify:
     def __init__(self, cfg, views, notify):
         self.cfg = cfg

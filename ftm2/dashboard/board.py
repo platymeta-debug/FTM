@@ -35,3 +35,4 @@ class OpsBoard:
                     "error", f"dash tick err(fallback): {type(e).__name__}: {e}"
                 )
 
+
