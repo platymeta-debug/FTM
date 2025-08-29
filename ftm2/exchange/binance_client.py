@@ -47,7 +47,16 @@ class BinanceClient:
             CFG.BINANCE_API_SECRET.encode(), q.encode(), hashlib.sha256
         ).hexdigest()
         url = f"{path}?{q}&signature={sig}"
-        return self.session_trade.request(method, url)
+        # [ANCHOR:REST_BACKOFF]
+        backoff = 1
+        for attempt in range(CFG.RETRY_MAX):
+            r = self.session_trade.request(method, url)
+            if r.status_code in RETRYABLE_STATUS:
+                time.sleep(backoff / 1000)
+                backoff = min(backoff * 2, CFG.BACKOFF_NET_MS)
+                continue
+            return r
+        return r
 
     def market_rest(self, method: str, path: str, params: Dict[str, Any] | None = None):
         return self.session_market.request(method, path, params=params)

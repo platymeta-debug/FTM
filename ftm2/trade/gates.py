@@ -5,6 +5,13 @@ from typing import List, Tuple
 def pre_trade_gates(rt, cfg, market, sym: str, dec, reasons: List[Tuple[str, str]] | None = None):
     """Check startup and autotrade gates."""
     reasons = reasons or []
+    # [ANCHOR:ANALYSIS_READY_GATE]
+    if cfg.STARTUP_REQUIRE_ANALYSIS and not getattr(rt, "analysis_ready", False):
+        from ftm2.notify import dispatcher
+
+        dispatcher.emit("gate_skip", f"{sym} analysis not ready")
+        reasons.append(("gate", "analysis_not_ready"))
+        return False, reasons
     # [GATE_REQUIRE_TICKET]
     tk = rt.active_ticket.get(sym)
     if not tk:

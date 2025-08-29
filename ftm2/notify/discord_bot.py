@@ -54,36 +54,60 @@ def send_log(text: str, embed=None):    _send_queue.put_nowait(("logs", text, em
 def send_trade(text: str, embed=None):  _send_queue.put_nowait(("trades", text, embed))
 def send_signal(text: str, embed=None): _send_queue.put_nowait(("signals", text, embed))
 
-# [ANCHOR:UPSERT_MSG]
-_last_emit_cache = {}
+# [UPSERT_MSG]
+from ftm2.notify import dispatcher
+
+_last_payload_hash = {}
+
+def _payload_hash(txt: str) -> int:
+    return hash(txt.replace("\r\n", "\n").strip())
+
+async def upsert(channel_key_or_name: str, text: str, *, dedupe_ms=3000, max_age_edit_s=3300, sticky_key=None):
+    now = time.time()*1000
+    ph = _payload_hash(text)
+    key = sticky_key or f"{channel_key_or_name}::default"
 
 
-async def upsert(channel_key_or_name, text, *, dedupe_ms=3000, max_age_edit_s=3300):
+
+async def upsert(
+    channel_key_or_name,
+    text,
+    *,
+    sticky_key: str,
+    dedupe_ms: int = 2000,
+    max_age_edit_s: int = 3300,
+):
+    """Send or edit a single sticky message per channel."""
+
     now = time.time() * 1000
-    k = (channel_key_or_name, text)
+    h = hash(text)
+    k = (channel_key_or_name, h)
     if now - _last_emit_cache.get(k, 0) < dedupe_ms:
         return None
     _last_emit_cache[k] = now
 
-    mid_store = getattr(upsert, "_store", {})
-    store = mid_store.setdefault(channel_key_or_name, {"id": None, "ts": 0})
+
+    store = getattr(upsert, "_store", {})
+    s = store.setdefault(sticky_key, {"id": None, "ts": 0})
     try:
-        if store["id"] and (time.time() - store["ts"] < max_age_edit_s):
-            return await dispatcher.dc.edit(store["id"], text)
-        else:
-            mid = await dispatcher.dc.send(channel_key_or_name, text)
-            store["id"], store["ts"] = mid, time.time()
-            return mid
+        if s["id"] and (time.time() - s["ts"] < max_age_edit_s):
+            return await dispatcher.dc.edit(s["id"], text)
+        mid = await dispatcher.dc.send(channel_key_or_name, text)
+        s["id"], s["ts"] = mid, time.time()
+        return mid
     except Exception as e:
-        try:
-            mid = await dispatcher.dc.send(channel_key_or_name, text)
-            store["id"], store["ts"] = mid, time.time()
-            return mid
-        except Exception:
-            await dispatcher.dc.send(
-                "logs", f"[UPSERT_FAIL->{channel_key_or_name}] {type(e).__name__}: {e}\n{text}"
-            )
-            return None
+        if getattr(e, "code", None) == 30046:  # edit restriction
+            try:
+                mid = await dispatcher.dc.send(channel_key_or_name, text)
+                s["id"], s["ts"] = mid, time.time()
+                return mid
+            except Exception:
+                pass
+        await dispatcher.dc.send(
+            "logs", f"[UPSERT_FAIL->{channel_key_or_name}] {type(e).__name__}: {e}\n{text}"
+        )
+        return None
+
 
 
 async def send_signal_to_discord(sym: str, side: str, score: float, reasons: list[str], img_path: str | None = None):

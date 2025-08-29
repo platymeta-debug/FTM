@@ -158,18 +158,36 @@ class PositionSizer:
 
         return float(q)
 
-    # [ANCHOR:MIN_NOTIONAL_AUTOSCALE]
-    def autoscale_min(self, sym: str, px: float, qty: float):
-        """
-        거래소 필터(minNotional/stepSize 등)를 이용해 최소 명목/스텝을 만족하도록 수량을 자동 보정.
-        """
-        if not hasattr(self, "filters") or self.filters is None:
-            return getattr(self, "q_qty", lambda s, q: q)(sym, qty)
+    # [ANCHOR:AUTOSCALE_MIN]
+    def autoscale_min(self, sym: str, price: float, qty: float) -> float:
+        """Scale quantity up to satisfy exchange minNotional/lot filters."""
+        if not self.filters:
+            return float(qty)
         try:
-            if self.filters.min_ok(px, qty, symbol=sym):
+            self.filters.use(sym)
+            if self.filters.min_ok(price, qty):
                 return self.filters.q_qty(sym, qty)
-            qmin = self.filters.min_qty_for(px, symbol=sym)
+            qmin = self.filters.min_qty_for(price, symbol=sym)
             return self.filters.q_qty(sym, max(qmin, qty))
         except Exception:
-            return getattr(self, "q_qty", lambda s, q: q)(sym, qty)
+            return float(qty)
+
+    # [ANCHOR:RISK_SIZING]
+    def risk_sizing(
+        self,
+        sym: str,
+        price: float,
+        *,
+        balance_usdt: float,
+        leverage: int,
+    ) -> float:
+        risk_usdt = getattr(self.cfg, "RISK_USDT_PER_TRADE", None)
+        if risk_usdt is None:
+            bps = getattr(self.cfg, "RISK_BPS", None)
+            if bps is not None:
+                risk_usdt = balance_usdt * (bps / 10000)
+        if not risk_usdt:
+            return 0.0
+        qty = (risk_usdt * leverage) / price
+        return self.autoscale_min(sym, price, qty)
 
