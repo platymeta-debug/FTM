@@ -14,10 +14,25 @@ class OpsBoard:
         if now - self._last_edit < self.cfg.DASH_EDIT_MIN_MS / 1000:
             return
         ops = self.collect(rt, self.cfg, market, bracket, guard)
-        payload = self.render(ops)
-        if payload == getattr(self, "_last_payload", None):
-            return  # 내용 변동 없으면 전송 안 함
-        self._last_payload = payload
-        await upsert(self.cfg.CHANNEL_SIGNALS, payload, sticky_key="ops_board")
-        self._last_edit = now
+        text = self.render(ops)
+        try:
+            await upsert(
+                self.cfg.CHANNEL_SIGNALS,
+                text,
+                sticky_key="ops_board",
+                max_age_edit_s=self.cfg.DASH_LIFETIME_MIN * 60,
+            )
+            self._last_edit = now
+        except Exception as e:
+            try:
+                await upsert(
+                    self.cfg.CHANNEL_LOGS,
+                    f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
+                    sticky_key="ops_board_err",
+                )
+            except Exception:
+                self.notify.emit(
+                    "error", f"dash tick err(fallback): {type(e).__name__}: {e}"
+                )
+
 

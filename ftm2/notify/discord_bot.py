@@ -68,7 +68,8 @@ async def upsert(channel_key_or_name: str, text: str, *, dedupe_ms=3000, max_age
     key = sticky_key or f"{channel_key_or_name}::default"
 
 
-async def upsert(channel_key_or_name, text, *, sticky_key=None, dedupe_ms=3000, max_age_edit_s=3300):
+async def upsert(channel_key_or_name, text, *, sticky_key=None, dedupe_ms=2000, max_age_edit_s=3300):
+
     now = time.time() * 1000
     k = (channel_key_or_name, text)
     if now - _last_emit_cache.get(k, 0) < dedupe_ms:

@@ -31,6 +31,13 @@ class Notifier:
             "chart": "logs",
         }
 
+        # 이벤트별 스팸 억제 TTL(ms)
+        self.ttl_ms = {
+            "intent": 60000,
+            "gate_skip": 60000,
+            "intent_cancel": 60000,
+        }
+
     def _send(self, which: str, text: str):
         ch = {
             "signals": self.ch_signals,
@@ -53,6 +60,14 @@ class Notifier:
 
 
     def emit(self, event: str, text: str):
+        ttl = self.ttl_ms.get(event)
+        if ttl:
+            now = time.time() * 1000
+            key = f"{event}:{text}"
+            if now - self._throttle.get(key, 0) < ttl:
+                return
+            self._throttle[key] = now
+
         which = self.route.get(event, "logs")
         if self.cfg.NOTIFY_STRICT:
             if event in ("intent", "order_submitted", "order_failed", "gate_skip") and text.startswith("💹"):
