@@ -57,23 +57,18 @@ from ftm2 import strategy as ST
 
 CFG = load_env_chain()
 # [ANCHOR:DISPATCHER_BOOTSTRAP]
-from ftm2.notify import dispatcher as notify_dp
-notify_dp.configure_channels(
-    signals=os.getenv("CHANNEL_SIGNALS"),
-    trades=os.getenv("CHANNEL_TRADES"),
-    logs=os.getenv("CHANNEL_LOGS"),
-)
-
-CFG.ANALYSIS_READY = asyncio.Event()
 
 
-# 채널/어댑터 보증 (반드시 초기화 초반에)
 notify.ensure_dc()
 notify.configure_channels(
     signals=os.getenv("CHANNEL_SIGNALS"),
     trades=os.getenv("CHANNEL_TRADES"),
     logs=os.getenv("CHANNEL_LOGS"),
 )
+
+
+object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
+
 
 BUFFERS: dict[str, pd.DataFrame] = {}
 ROUTER: OrderRouter | None = None
