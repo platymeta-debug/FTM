@@ -8,6 +8,7 @@ from datetime import timezone
 import asyncio
 import pandas as pd
 import logging
+import inspect
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.binance_client import BinanceClient
@@ -220,6 +221,13 @@ async def main():
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
+
+    fbq = getattr(notify, "flush_boot_queue", None)
+    if fbq:
+        if inspect.iscoroutinefunction(fbq):
+            await fbq()
+        else:
+            fbq()
 
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ

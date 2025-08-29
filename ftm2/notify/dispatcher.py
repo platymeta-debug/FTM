@@ -1,5 +1,4 @@
 import os
-import time
 from ftm2.config.settings import load_env_chain
 from ftm2.notify import discord_bot
 
@@ -66,7 +65,7 @@ class Notifier:
         if now - last < ttl:
             return
         self._throttle[key] = now
-        self.emit(event, text)
+        emit(event, text)
 
 
     def send_once(self, key: str, text: str, to: str = "logs"):
@@ -99,7 +98,6 @@ class _DiscordAdapter:
 _cfg = load_env_chain()
 notifier = Notifier(_cfg, _DiscordAdapter(_cfg))
 
-emit = notifier.emit
 emit_once = notifier.emit_once
 push_signal = notifier.push_signal
 push_trade = notifier.push_trade
@@ -170,7 +168,6 @@ async def _edit_impl(message_id, text: str):
         emit("system", f"[DRY][edit->{message_id}] {text}")
     return None
 
-=
 class _DCUseCtx:
     def __init__(self, parent, channel_key_or_name):
         self.parent = parent
@@ -193,6 +190,46 @@ class _DCAdapter:
 
 # 항상 dc를 노출(초기화 실패/DRY 상황에서도 None이 되지 않게)
 dc = _DCAdapter()
+
+
+# ==== boot queue state (dispatcher.py) ====
+import asyncio, time
+from typing import Optional
+
+_BOOT_QUEUE: list[tuple[str, str, Optional[str], int]] = []  # (kind, text, route, ttl_ms)
+_BOOT_READY: bool = False
+
+async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
+    which = route or notifier.route.get(kind, "logs")
+    if notifier.cfg.NOTIFY_STRICT:
+        if kind in ("intent", "order_submitted", "order_failed", "gate_skip") and text.startswith("💹"):
+            text = text.replace("💹", "📡", 1)
+        if kind in ("fill", "close", "pnl") and text.startswith("📡"):
+            text = text.replace("📡", "💹", 1)
+    await _send_impl(which, text)
+
+def emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
+    """루프 전이면 큐에 저장, 준비되면 코루틴 태스크 생성"""
+    global _BOOT_READY
+    if not _BOOT_READY:
+        _BOOT_QUEUE.append((kind, text, route, ttl_ms))
+        return None
+    return asyncio.create_task(_emit(kind, text, route, ttl_ms=ttl_ms))
+
+async def flush_boot_queue():
+    """부팅 큐를 비우는 'async' 함수 — 반드시 await 가능해야 함"""
+    global _BOOT_READY
+    _BOOT_READY = True
+    while _BOOT_QUEUE:
+        kind, text, route, ttl_ms = _BOOT_QUEUE.pop(0)
+        await _emit(kind, text, route, ttl_ms=ttl_ms)
+
+# 모듈 export 고정 (다른 곳에서 실수로 덮어쓰지 않도록)
+__all__ = [
+    "emit", "emit_once", "flush_boot_queue",
+    "push_signal", "push_trade", "push_log", "send_once",
+    "send", "edit", "dc", "configure_channels", "ensure_dc",
+]
 
 
 def configure_channels(**kw):
