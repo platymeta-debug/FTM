@@ -1,49 +1,99 @@
-# ==== discord_bot.py: 최소 인터페이스 ====
-# 실제 라이브러리 호출 부분은 기존 구현을 사용하고, 이름만 맞게 래핑하세요.
+# ==== discord_bot.py: 어댑터 API 보장 ====
+"""Minimal Discord adapter.
+실제 Discord 연동은 외부에서 주입되며, 채널 바인딩 실패 시에도 예외를 발생시키지 않는다.
+"""
 
-# 이 모듈은 async이어야 합니다.
-# 채널 ID(int) 또는 이름(str)과 text(str)를 받아 디스코드로 보내는 역할.
+from __future__ import annotations
+import time
+from typing import Any, Dict, Optional
+from types import SimpleNamespace
 
-async def send(channel, text: str):
-    # TODO: 실제 Discord SDK/HTTP 호출로 교체
-    print(f"[DISCORD][send] {channel}: {text}")
-    return {"ok": True}
+# 메시지 ID 시뮬레이션용 카운터
+_LAST_MSG_ID = 0
 
-async def edit(message_or_channel, text: str):
-    # TODO: 실제 편집 구현
-    print(f"[DISCORD][edit] {message_or_channel}: {text}")
-    return {"ok": True}
+# sticky 메시지 캐시
+_STICKY: Dict[str, Dict[str, Any]] = {}
 
-_STICKY: dict[str, dict] = {}
+async def send(channel_key_or_name: int | str, text: str) -> int:
+    """Send a message to a Discord channel.
+    실제 전송 대신 콘솔에 [DRY] 로그를 남긴다.
+    Returns a pseudo message id.
+    """
+    global _LAST_MSG_ID
+    _LAST_MSG_ID += 1
+    print(f"[DISCORD][send][DRY] {channel_key_or_name}: {text}")
+    return _LAST_MSG_ID
 
-async def upsert(channel, text: str, *, sticky_key: str, dedupe_ms: int = 2000, max_age_edit_s: int = 3300):
-    import time
+async def edit(message_id: int, text: str) -> None:
+    """Edit a previously sent message."""
+    print(f"[DISCORD][edit][DRY] {message_id}: {text}")
+
+async def upsert(
+    channel_key_or_name: int | str,
+    text: str,
+    *,
+    dedupe_ms: int = 3000,
+    max_age_edit_s: int = 3300,
+    sticky_key: Optional[str] = None,
+):
+    """Dedupe/edit-or-send helper.
+    - If `sticky_key` is provided, we remember the last message per key and
+      edit it if possible within ``max_age_edit_s``.
+    - When text is unchanged within ``dedupe_ms`` the call is ignored.
+    """
     now = int(time.time() * 1000)
-    item = _STICKY.get(sticky_key)
-    if item:
-        # dedupe
-        if item.get("text") == text and (now - item.get("ts", 0) < dedupe_ms):
-            return {"ok": True, "deduped": True}
-        # 편집(실패시 새 메시지 발행)
+    key = sticky_key
+    if key:
+        item = _STICKY.get(key)
+        if item:
+            if item.get("text") == text and (now - item.get("ts", 0)) < dedupe_ms:
+                return {"ok": True, "deduped": True, "id": item.get("id")}
+            # 편집 가능 시간 체크
+            if (now - item.get("ts", 0)) < max_age_edit_s * 1000:
+                try:
+                    await edit(item["id"], text)
+                    item.update({"text": text, "ts": now})
+                    return {"ok": True, "edited": True, "id": item.get("id")}
+                except Exception as e:
+                    print("[DISCORD][edit][ERR]", e)
+        # 새 메시지 발송
+        mid = await send(channel_key_or_name, text)
+        _STICKY[key] = {"id": mid, "text": text, "ts": now}
+        return {"ok": True, "posted": True, "id": mid}
+    else:
+        # sticky key 없으면 단순 send
+        mid = await send(channel_key_or_name, text)
+        return {"ok": True, "posted": True, "id": mid}
 
-        try:
-            await edit(item["channel"], text)
-            item["text"] = text
-            item["ts"] = now
-            return {"ok": True, "edited": True}
-        except Exception:
-            pass
+async def edit_trade_card(symbol, tracker, cfg, force: bool = False):
+    """Proxy to TradeCards helper to keep card in sync."""
+    try:
+        from .cards import TradeCards
+    except Exception as e:
+        print(f"[DISCORD][trade_card][ERR] import cards failed: {e}")
+        return
+    global _TRADE_CARDS
+    try:
+        _TRADE_CARDS
+    except NameError:
+        _TRADE_CARDS = None
+    if _TRADE_CARDS is None:
+        _TRADE_CARDS = TradeCards(cfg, dc := SimpleNamespace(send=send, edit=edit))
+    snap = None
+    if tracker and hasattr(tracker, "get_symbol_view"):
+        snap = tracker.get_symbol_view(symbol)
+    if snap is None:
+        return
+    try:
+        await _TRADE_CARDS.upsert_trade_card(symbol, snap, None, [], force=force)
+    except Exception as e:
+        print(f"[DISCORD][trade_card][ERR] {e}")
 
-    # 신규 발행
-    await send(channel, text)
-    _STICKY[sticky_key] = {"channel": channel, "text": text, "ts": now}
-    return {"ok": True, "posted": True}
-
+# 과거 인터페이스 호환
 def use(*args, **kwargs):
-    # 필요 없으면 빈 함수로 두어도 됨(과거 인터페이스 호환용)
     return None
 
-# 추가 호환 함수들
+# 로그용 더미 함수들 (과거 코드 호환)
 def send_log(text: str, embed=None):
     print(f"[DISCORD][log] {text}")
 
@@ -56,7 +106,6 @@ def send_signal(text: str, embed=None):
 async def update_analysis(*args, **kwargs):
     return None
 
-# 기존 코드와의 호환을 위한 더미 함수들
 async def start_notifier(cfg):
     return None
 
@@ -65,3 +114,18 @@ def register_hooks(**kwargs):
 
 def register_tracker(tracker):
     return None
+
+__all__ = [
+    "send",
+    "edit",
+    "upsert",
+    "edit_trade_card",
+    "use",
+    "send_log",
+    "send_trade",
+    "send_signal",
+    "update_analysis",
+    "start_notifier",
+    "register_hooks",
+    "register_tracker",
+]
