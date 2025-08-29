@@ -1,13 +1,13 @@
 import time
 
 
+
 class OpsBoard:
     def __init__(self, cfg, notify, collector, renderer):
         self.cfg, self.notify = cfg, notify
         self.collect = collector
         self.render = renderer
         self._last_edit = 0
-        self._card = None
 
     async def tick(self, rt, market, bracket, guard=None):
         now = time.time()
@@ -20,6 +20,7 @@ class OpsBoard:
             card = getattr(self, "_card", None)
             if card and (now - card["created_at"] < self.cfg.DASH_LIFETIME_MIN * 60):
                 await self.notify.dc.edit(card["id"], text)
+
             else:
                 mid = await self.notify.dc.send(self.cfg.CHANNEL_SIGNALS, text)
                 self._card = {"id": mid, "created_at": now}
@@ -27,6 +28,7 @@ class OpsBoard:
         except Exception as e:
             try:
                 await self.notify.dc.send(
+
                     self.cfg.CHANNEL_LOGS,
                     f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
                 )
@@ -34,3 +36,4 @@ class OpsBoard:
                 self.notify.emit(
                     "error", f"dash tick err(fallback): {type(e).__name__}: {e}"
                 )
+
