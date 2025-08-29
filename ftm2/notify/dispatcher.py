@@ -1,7 +1,9 @@
+
 import os, re, time, asyncio
 from ftm2.notify import discord_bot
 
 # 별칭 → 실제 대상(채널ID, '#이름', 별칭 그대로)
+
 CHANNELS = {
     "signals": os.getenv("CHANNEL_SIGNALS", "signals"),
     "trades": os.getenv("CHANNEL_TRADES", "trades"),
@@ -28,6 +30,7 @@ def _resolve_channel(key_or_name: str):
         if v == k:
             return v
     return CHANNELS.get("signals", "signals")
+
 
 # ---------- 라우팅 맵(시그널 조용하게) ----------
 ROUTE_MAP = {
@@ -91,6 +94,7 @@ async def _send_impl(target_key_or_name: str, text: str):
             emit("system", f"[DRY][send->{target}] {text}", route="logs")
         except Exception:
             pass
+
     return None
 
 async def _edit_impl(message_id, text: str):
@@ -102,6 +106,7 @@ async def _edit_impl(message_id, text: str):
         except Exception:
             pass
     return None
+
 
 async def _emit(kind: str, text: str, route: str | None, *, ttl_ms: int | None):
     route = route or ROUTE_MAP.get(kind, "logs")
@@ -136,6 +141,7 @@ async def flush_boot_queue():
             pass
 
 # ---------- dc 어댑터(항상 객체 보장) ----------
+
 class _DCUseCtx:
     def __init__(self, target):
         self.target = target
@@ -157,3 +163,4 @@ class _DCAdapter:
         return await _edit_impl(message_id, text)
 
 dc = _DCAdapter()
+
