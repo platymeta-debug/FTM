@@ -1,24 +1,21 @@
-
-"""Notification dispatcher with boot queue and rate limiting."""
-
-from __future__ import annotations
-
+# --- dispatcher.py: discord_bot 바인딩(재귀 방지 + 폴백 포함) ---
 from types import SimpleNamespace
-import asyncio
-import time
-
 from ftm2.notify import discord_bot as _bot
 
+async def _missing(*args, **kwargs):
+    raise RuntimeError("discord_bot API(send/edit/upsert) 가 구현되어 있지 않습니다.")
 
-# ---------------------------------------------------------------------------
-# discord_bot binding
-# ---------------------------------------------------------------------------
-# Adapt to the actual Discord implementation and avoid self-recursion.
+def _noop_use(*args, **kwargs):
+    # 과거 코드 호환용: 외부에서 dispatcher.dc.use(...)를 부르는 경우가 있어도 NOP
+    return None
+
 dc = SimpleNamespace(
-    use=_bot.use,
-    send=_bot.send,
-    edit=_bot.edit,
-    upsert=_bot.upsert,
+    # discord_bot에 함수가 있으면 그것을, 없으면 폴백을 사용
+    send=getattr(_bot, "send", None) or _missing,
+    edit=getattr(_bot, "edit", None) or _missing,
+    upsert=getattr(_bot, "upsert", None) or _missing,
+    # 과거 인터페이스 호환(없어도 되지만 호출하는 코드가 있을 수 있어 NOP 제공)
+    use=getattr(_bot, "use", None) or _noop_use,
 )
 
 
