@@ -66,6 +66,8 @@ async def upsert(channel_key_or_name, text, *, dedupe_ms=3000, max_age_edit_s=33
     _last_emit_cache[k] = now
 
     mid_store = getattr(upsert, "_store", {})
+    if not hasattr(upsert, "_store"):
+        upsert._store = mid_store
     store = mid_store.setdefault(channel_key_or_name, {"id": None, "ts": 0})
     try:
         if store["id"] and (time.time() - store["ts"] < max_age_edit_s):
