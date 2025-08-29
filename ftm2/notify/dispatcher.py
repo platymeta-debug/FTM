@@ -108,7 +108,7 @@ send_once = notifier.send_once
 
 async def send(channel_key_or_name: str, text: str):
     """Bridge to actual send implementation."""
-    notifier.dc.send(channel_key_or_name, text)
+    return await dc.send(channel_key_or_name, text)
 
 async def edit(message_id, text: str):
     return None
@@ -155,9 +155,11 @@ async def _send_impl(channel_key_or_name: str, text: str):
     실제 전송 함수에 연결. DRY 모드면 콘솔/로그만.
     """
     target = _resolve_channel(channel_key_or_name)
-    if 'send' in globals():
-        # 프로젝트의 실제 전송 함수명으로 맞추세요.
-        return await send(target, text)
+    if hasattr(notifier, "dc") and hasattr(notifier.dc, "send"):
+        result = notifier.dc.send(target, text)
+        if asyncio.iscoroutine(result):
+            return await result
+        return result
     # DRY/no-op fallback
     if 'emit' in globals():
         emit("system", f"[DRY][send->{target}] {text}")
