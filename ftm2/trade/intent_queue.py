@@ -111,7 +111,7 @@ class IntentQueue:
                             continue
 
                     if it.autofire:
-                        ok = self.router.place_entry(sym, it.sizing, it.mark)
+                        ok = await self.router.place_entry(sym)
                         if ok:
                             self.intents.pop(sym, None)
                         else:
