@@ -250,6 +250,7 @@ async def main():
         f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}"
     )
 
+
     bx = BinanceClient()
     print(
         f"[FTM2] APIKEY={(bx.api_key[:4] + '…') if getattr(bx, 'api_key', None) else 'EMPTY'}"
