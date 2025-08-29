@@ -55,6 +55,30 @@ from ftm2 import strategy as ST
 
 CFG = load_env_chain()
 
+
+def _has_keys() -> bool:
+    return all(
+        [
+            any(
+                [
+                    getattr(CFG, "BINANCE_API_KEY", None),
+                    os.getenv("BINANCE_FAPI_KEY"),
+                    os.getenv("BINANCE_API_KEY"),
+                    os.getenv("APIKEY"),
+                ]
+            ),
+            any(
+                [
+                    getattr(CFG, "BINANCE_API_SECRET", None),
+                    os.getenv("BINANCE_FAPI_SECRET"),
+                    os.getenv("BINANCE_API_SECRET"),
+                    os.getenv("APISECRET"),
+                ]
+            ),
+        ]
+    )
+
+
 # [ANCHOR:DISPATCHER_BOOTSTRAP]
 
 
@@ -213,10 +237,24 @@ async def main():
         "logs": CFG.CHANNEL_LOGS,
     })
     await notify.flush_boot_queue()
-    print(f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}")
-    print(f"[FTM2] APIKEY={(CFG.BINANCE_API_KEY[:4] + '…') if CFG.BINANCE_API_KEY else 'EMPTY'}")
+    has_keys = _has_keys()
+    if not has_keys:
+        notify.emit_once(
+            "boot_no_keys",
+            "error",
+            "🚫 API 키가 없습니다. 분석/차트만 동작하고 주문/계정 기능은 꺼집니다.",
+            60_000,
+        )
+
+    print(
+        f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}"
+    )
+
 
     bx = BinanceClient()
+    print(
+        f"[FTM2] APIKEY={(bx.api_key[:4] + '…') if getattr(bx, 'api_key', None) else 'EMPTY'}"
+    )
     t = bx.server_time()
     print(f"[FTM2] serverTime={t.get('serverTime')} REST_BASE OK")
     info = bx.load_exchange_info()
@@ -258,12 +296,13 @@ async def main():
     div = DivergenceMonitor(CFG.MAX_DIVERGENCE_BPS)
     MS.DIVERGENCE = div
 
-    for sym in CFG.SYMBOLS:
-        mode = CFG.MARGIN_MODE_OVERRIDE.get(sym, CFG.MARGIN_MODE_DEFAULT).upper()
-        lev = int(CFG.LEVERAGE_OVERRIDE.get(sym, CFG.LEVERAGE_DEFAULT))
-        await enforce_leverage_and_margin(
-            bx, sym, leverage=lev, margin_type=mode, notify=notify
-        )
+    if has_keys:
+        for sym in CFG.SYMBOLS:
+            mode = CFG.MARGIN_MODE_OVERRIDE.get(sym, CFG.MARGIN_MODE_DEFAULT).upper()
+            lev = int(CFG.LEVERAGE_OVERRIDE.get(sym, CFG.LEVERAGE_DEFAULT))
+            await enforce_leverage_and_margin(
+                bx, sym, leverage=lev, margin_type=mode, notify=notify
+            )
 
     def _notify(text):
         try:
@@ -382,8 +421,13 @@ async def main():
             trend_state=snap.trend_state,
         )
 
-    tasks.append(asyncio.create_task(run_analysis_loop(CFG, CFG.SYMBOLS, market_cache, div, on_snapshot)))
-    tasks.append(asyncio.create_task(INTQ.run()))
+    tasks.append(
+        asyncio.create_task(
+            run_analysis_loop(CFG, CFG.SYMBOLS, market_cache, div, on_snapshot)
+        )
+    )
+    if has_keys:
+        tasks.append(asyncio.create_task(INTQ.run()))
     tasks.append(asyncio.create_task(run_chart_janitor(CFG)))
 
     async def snapshot_daemon():

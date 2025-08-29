@@ -1,18 +1,37 @@
 
 from __future__ import annotations
 import os, time, hmac, hashlib
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from urllib.parse import urlencode
 import httpx, websockets
 
 from ftm2.config.settings import load_env_chain
 from ftm2.exchange.quantize import ExchangeFilters
-from ftm2.notify import dispatcher
+from ftm2.notify import dispatcher as notify
 
 CFG = load_env_chain()
 
 
-HEADERS = {"X-MBX-APIKEY": CFG.BINANCE_API_KEY}
+def _api_key() -> Optional[str]:
+    return (
+        getattr(CFG, "BINANCE_API_KEY", None)
+        or os.getenv("BINANCE_FAPI_KEY")
+        or os.getenv("BINANCE_API_KEY")
+        or os.getenv("APIKEY")
+    )
+
+
+def _api_secret() -> Optional[str]:
+    return (
+        getattr(CFG, "BINANCE_API_SECRET", None)
+        or os.getenv("BINANCE_FAPI_SECRET")
+        or os.getenv("BINANCE_API_SECRET")
+        or os.getenv("APISECRET")
+    )
+
+
+def _build_headers(api_key: Optional[str]) -> dict:
+    return {"X-MBX-APIKEY": api_key} if api_key else {}
 
 FATAL_USER_ERRORS = {-1013, -1111, -1113, -4164, -2019}
 RETRYABLE_STATUS = {429, 418, 500, 502, 503, 504}
@@ -33,18 +52,47 @@ class BinanceClient:
         self.WS_USER_BASE = (
             "wss://fstream.binance.com/ws" if CFG.TRADE_MODE == "live" else "wss://fstream.binancefuture.com/ws"
         )
-        self.session_market = httpx.Client(base_url=self.REST_MARKET_BASE, timeout=CFG.HTTP_TIMEOUT_S)
-        self.session_trade = httpx.Client(base_url=self.REST_TRADE_BASE, timeout=CFG.HTTP_TIMEOUT_S, headers=HEADERS)
+
+        self.api_key = _api_key()
+        self.api_secret = _api_secret()
+
+        self.session_market = httpx.Client(
+            base_url=self.REST_MARKET_BASE, timeout=CFG.HTTP_TIMEOUT_S
+        )
+
+        headers = _build_headers(self.api_key)
+        self.session_trade = None
+        if self.api_key:
+            self.session_trade = httpx.Client(
+                base_url=self.REST_TRADE_BASE,
+                timeout=CFG.HTTP_TIMEOUT_S,
+                headers=headers,
+            )
+        else:
+            notify.emit_once(
+                "no_api_key",
+                "error",
+                "🔒 Binance API 키가 비어 있습니다. public 데이터만 동작하며 주문/계정 관련 기능은 비활성화됩니다.",
+                60_000,
+            )
+
         self.filters: ExchangeFilters | None = None
+
+    def _require_keys(self):
+        if not (self.api_key and self.api_secret and self.session_trade):
+            raise RuntimeError(
+                "Binance API 키/시크릿이 누락되어 private/trade API를 사용할 수 없습니다."
+            )
 
     # --- low-level helpers ---
     def trade_rest_signed(self, method: str, path: str, params: Dict[str, Any] | None = None):
+        self._require_keys()
         params = params or {}
         params["timestamp"] = int(time.time() * 1000)
         params["recvWindow"] = CFG.RECV_WINDOW_MS
         q = urlencode(params, doseq=True)
         sig = hmac.new(
-            CFG.BINANCE_API_SECRET.encode(), q.encode(), hashlib.sha256
+            self.api_secret.encode(), q.encode(), hashlib.sha256
         ).hexdigest()
         url = f"{path}?{q}&signature={sig}"
         # [ANCHOR:REST_BACKOFF]
@@ -82,6 +130,7 @@ class BinanceClient:
 
     # --- user data stream (listenKey) ---
     def create_listen_key(self) -> str:
+        self._require_keys()
         r = self.session_trade.post("/fapi/v1/listenKey")
         try:
             r.raise_for_status()
@@ -91,6 +140,7 @@ class BinanceClient:
         return r.json()["listenKey"]
 
     def keepalive_listen_key(self, listen_key: str):
+        self._require_keys()
         r = self.session_trade.put("/fapi/v1/listenKey", params={"listenKey": listen_key})
         try:
             r.raise_for_status()
@@ -98,6 +148,7 @@ class BinanceClient:
             return r
         return r
     def delete_listen_key(self, listen_key: str) -> None:
+        self._require_keys()
         r = self.session_trade.delete("/fapi/v1/listenKey", params={"listenKey": listen_key})
         r.raise_for_status()
 
@@ -126,7 +177,7 @@ class BinanceClient:
                 except Exception:
                     pass
                 symbol = kwargs.get("symbol")
-                dispatcher.emit(
+                notify.emit(
                     "order_failed",
                     f"📡 ❌ 진입 주문 실패: {symbol} status={r.status_code} code={code} msg={msg}",
                 )
