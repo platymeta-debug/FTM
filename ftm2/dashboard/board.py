@@ -1,5 +1,5 @@
 import time
-
+from ftm2.notify.discord_bot import upsert
 
 
 class OpsBoard:
@@ -14,26 +14,10 @@ class OpsBoard:
         if now - self._last_edit < self.cfg.DASH_EDIT_MIN_MS / 1000:
             return
         ops = self.collect(rt, self.cfg, market, bracket, guard)
-        text = self.render(ops)
-        # [ANCHOR:DASH_SAFE_SEND]
-        try:
-            card = getattr(self, "_card", None)
-            if card and (now - card["created_at"] < self.cfg.DASH_LIFETIME_MIN * 60):
-                await self.notify.dc.edit(card["id"], text)
-
-            else:
-                mid = await self.notify.dc.send(self.cfg.CHANNEL_SIGNALS, text)
-                self._card = {"id": mid, "created_at": now}
-            self._last_edit = now
-        except Exception as e:
-            try:
-                await self.notify.dc.send(
-
-                    self.cfg.CHANNEL_LOGS,
-                    f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
-                )
-            except Exception:
-                self.notify.emit(
-                    "error", f"dash tick err(fallback): {type(e).__name__}: {e}"
-                )
+        payload = self.render(ops)
+        if payload == getattr(self, "_last_payload", None):
+            return  # 내용 변동 없으면 전송 안 함
+        self._last_payload = payload
+        await upsert(self.cfg.CHANNEL_SIGNALS, payload, sticky_key="ops_board")
+        self._last_edit = now
 
