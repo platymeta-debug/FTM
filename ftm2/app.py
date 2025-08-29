@@ -54,13 +54,6 @@ from ftm2 import strategy as ST
 
 
 CFG = load_env_chain()
-# [ANCHOR:DISPATCHER_BOOTSTRAP]
-notify.ensure_dc()
-notify.configure_channels(
-    signals=os.getenv("CHANNEL_SIGNALS"),
-    trades=os.getenv("CHANNEL_TRADES"),
-    logs=os.getenv("CHANNEL_LOGS"),
-)
 
 object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
 
@@ -219,6 +212,14 @@ async def main():
     info = bx.load_exchange_info()
     print(f"[FTM2] exchangeInfo symbols={len(info.get('symbols', []))} FILTERS OK")
 
+    from ftm2.notify import dispatcher as notify_dp
+    notify_dp.configure_channels(
+        signals=os.getenv("CHANNEL_SIGNALS"),
+        trades=os.getenv("CHANNEL_TRADES"),
+        logs=os.getenv("CHANNEL_LOGS"),
+    )
+    await notify_dp.flush_boot_queue()
+
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ
     brkt = Bracket(CFG, bx, bx.filters)
@@ -260,7 +261,7 @@ async def main():
 
     INTQ = IntentQueue(CFG, div, ROUTER, CSV, notify)
     ops_board = OpsBoard(CFG, notify, dash_collect, render_ops_board)
-    notify.emit("system", f"[NOTIFY_MAP] {notify.notifier.route}")
+    notify.emit("system", f"[NOTIFY_MAP] {notify.ROUTE_MAP}")
     notify.emit("intent", "📡 [테스트] 신호 채널 확인")
     notify.emit("fill", "💹 [테스트] 트레이드 채널 확인")
 

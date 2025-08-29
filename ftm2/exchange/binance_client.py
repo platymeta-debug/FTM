@@ -155,7 +155,10 @@ class BinanceClient:
 
     async def aclose(self):
         try:
-            sess = getattr(self, "session", None)
+            sess = getattr(self, "session_market", None)
+            if sess and not getattr(sess, "closed", True):
+                await sess.close()
+            sess = getattr(self, "session_trade", None)
             if sess and not getattr(sess, "closed", True):
                 await sess.close()
         except Exception:

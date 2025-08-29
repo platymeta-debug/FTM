@@ -54,36 +54,48 @@ def send_log(text: str, embed=None):    _send_queue.put_nowait(("logs", text, em
 def send_trade(text: str, embed=None):  _send_queue.put_nowait(("trades", text, embed))
 def send_signal(text: str, embed=None): _send_queue.put_nowait(("signals", text, embed))
 
-# [ANCHOR:UPSERT_MSG]
-_last_emit_cache = {}
+# [UPSERT_MSG]
+from ftm2.notify import dispatcher
+
+_last_payload_hash = {}
+
+def _payload_hash(txt: str) -> int:
+    return hash(txt.replace("\r\n", "\n").strip())
+
+async def upsert(channel_key_or_name: str, text: str, *, dedupe_ms=3000, max_age_edit_s=3300, sticky_key=None):
+    now = time.time()*1000
+    ph = _payload_hash(text)
+    key = sticky_key or f"{channel_key_or_name}::default"
 
 
-async def upsert(channel_key_or_name, text, *, dedupe_ms=3000, max_age_edit_s=3300):
+async def upsert(channel_key_or_name, text, *, sticky_key=None, dedupe_ms=2000, max_age_edit_s=3300):
+
     now = time.time() * 1000
     k = (channel_key_or_name, text)
     if now - _last_emit_cache.get(k, 0) < dedupe_ms:
         return None
     _last_emit_cache[k] = now
 
+    key = sticky_key or channel_key_or_name
     mid_store = getattr(upsert, "_store", {})
-    store = mid_store.setdefault(channel_key_or_name, {"id": None, "ts": 0})
+    if not hasattr(upsert, "_store"):
+        upsert._store = mid_store
+    store = mid_store.setdefault(key, {"id": None, "ts": 0})
+
     try:
-        if store["id"] and (time.time() - store["ts"] < max_age_edit_s):
-            return await dispatcher.dc.edit(store["id"], text)
+        if last_mid and (time.time() - (last_ts/1000.0) < max_age_edit_s):
+            mid = await dispatcher.dc.edit(last_mid, text)
+            _last_payload_hash[key] = (now, last_mid, ph)
+            return mid
         else:
             mid = await dispatcher.dc.send(channel_key_or_name, text)
-            store["id"], store["ts"] = mid, time.time()
+            _last_payload_hash[key] = (now, mid, ph)
             return mid
-    except Exception as e:
-        try:
-            mid = await dispatcher.dc.send(channel_key_or_name, text)
-            store["id"], store["ts"] = mid, time.time()
-            return mid
-        except Exception:
-            await dispatcher.dc.send(
-                "logs", f"[UPSERT_FAIL->{channel_key_or_name}] {type(e).__name__}: {e}\n{text}"
-            )
-            return None
+    except Exception:
+        # 수정 실패(30046 등) -> 새로 보냄
+        mid = await dispatcher.dc.send(channel_key_or_name, text)
+        _last_payload_hash[key] = (now, mid, ph)
+        return mid
 
 
 async def send_signal_to_discord(sym: str, side: str, score: float, reasons: list[str], img_path: str | None = None):
