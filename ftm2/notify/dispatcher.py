@@ -140,6 +140,29 @@ async def flush_boot_queue():
         except Exception:
             pass
 
+_ONCE_LAST_TS = {}  # key -> last_ts(ms)
+
+def emit_once(key: str, kind: str, text: str, ttl_ms: int = 60000, route: str | None = None):
+    """
+    key     : 이벤트 식별자(예: 'ws_user_ok', 'ws_user_re', 'ws_mkt_ok' 등)
+    kind    : 'system' | 'error' | 'intent' ... (ROUTE_MAP에 따라 채널 자동 라우팅)
+    text    : 보낼 메시지
+    ttl_ms  : 같은 key로 중복 전송 억제 기간(ms)
+    route   : 강제 라우팅이 필요하면 지정(없으면 ROUTE_MAP 사용)
+    """
+    try:
+        now = int(time.time() * 1000)
+        last = _ONCE_LAST_TS.get(key, 0)
+        if ttl_ms and now - last < int(ttl_ms):
+            return None  # TTL 내면 무시(중복 방지)
+        _ONCE_LAST_TS[key] = now
+    except Exception:
+        # 시간/캐시 에러가 나더라도 전송은 시도
+        pass
+
+    # 실제 전송은 부팅-안전 emit()에 위임 (루프 전이면 부팅큐에 쌓임)
+    return emit(kind, text, route=route, ttl_ms=0)  # 이중 TTL 방지 위해 여기선 0
+
 # ---------- dc 어댑터(항상 객체 보장) ----------
 
 class _DCUseCtx:
