@@ -1,5 +1,6 @@
 import time
 from ftm2.notify import dispatcher
+from ftm2.notify.discord_bot import upsert
 from ftm2.journal.events import JEvent
 from ftm2.trade.order_fsm import OFSM, OState
 from ftm2.trade.cid import build_cid
@@ -93,7 +94,7 @@ class OrderRouter:
                 quantity=str(qty),
                 newClientOrderId=cid,
                 timestamp=tg.now_ms(),
-                recvWindow=self.cfg.ORDER_RECV_WINDOW_MS,
+                recvWindow=self.cfg.RECV_WINDOW_MS,
             )
 
         try:
@@ -173,11 +174,12 @@ class OrderRouter:
                 stop=sl,
                 tps=[px for px, _ in tps],
             )
-            self.notify._upsert_sticky(
+            await upsert(
                 self.cfg.CHANNEL_SIGNALS,
-                f"analysis_{sym}",
                 text,
-                lifetime_min=self.cfg.ANALYSIS_LIFETIME_MIN,
+                sticky_key=f"analysis::{sym}",
+                dedupe_ms=2000,
+                max_age_edit_s=3300,
             )
 
         # 8) 알림
