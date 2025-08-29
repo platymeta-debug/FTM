@@ -59,7 +59,7 @@ class OrderRouter:
             await self.notify.emit(
                 "gate_skip", f"📡 {sym} 티켓없음 → 진입 금지", ttl_ms=120_000
             )
-            return False
+            return False  # [ANCHOR:INTENT_GATE]
 
         # 1) 사이징
         qty = self.sizer.size_entry(sym, tk, account=self.account.snapshot())

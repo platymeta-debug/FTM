@@ -17,6 +17,12 @@ def _noop_use(*args, **kwargs):
     # 예전 코드 호환: dispatcher.dc.use(...) 호출이 남아있어도 무해하게 처리
     return None
 
+# [ANCHOR:NOTIFY_DISPATCH]
+async def maybe_await(x):
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
 dc = SimpleNamespace(
     send=(getattr(_bot, "send", None) or _missing),
     edit=(getattr(_bot, "edit", None) or _missing),
@@ -120,13 +126,13 @@ ROUTE_MAP = {
 # ==== 내부 전송(재귀 금지: 반드시 dc.send만 호출) ====
 async def _send_impl(target, text: str):
     chan = _resolve_channel(target)
-    return await dc.send(chan, text)
+    return await maybe_await(dc.send(chan, text))
 
 async def send(channel_key_or_name, text: str):
     return await _send_impl(channel_key_or_name, text)
 
 async def edit(message_id, text: str):
-    return await dc.edit(message_id, text)
+    return await maybe_await(dc.edit(message_id, text))
 
 
 async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
