@@ -11,6 +11,14 @@ def _safe_margin_mode(obj) -> str:
     iso = getattr(obj, "isolated", None)
     return "isolated" if iso is True else "cross"
 
+# [ANCHOR:DISCORD_TRADE_CARD]
+def _safe_margin_mode(obj) -> str:
+    mm = getattr(obj, "margin_mode", None)
+    if mm:
+        return str(mm)
+    iso = getattr(obj, "isolated", None)
+    return "isolated" if iso is True else "cross"
+
 @dataclass
 class CardRef:
     message_id: int

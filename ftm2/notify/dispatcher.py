@@ -25,10 +25,12 @@ DISCORD_ALLOW_COMPONENTS = os.getenv("DISCORD_ALLOW_COMPONENTS", "off").lower() 
 )
 
 # [ANCHOR:NOTIFY_DISPATCH]
+
 async def maybe_await(x):
     if inspect.isawaitable(x):
         return await x
     return x
+
 
 def _supports_kw(fn, name: str) -> bool:
     try:
@@ -109,6 +111,7 @@ async def discord_safe_send(target, **kwargs):
     except TypeError:
         minimal = {k: kwargs[k] for k in ("content", "embed", "embeds", "text") if k in kwargs}
         return await maybe_await(send_fn(**minimal))
+
 
 dc = SimpleNamespace(
     send=(getattr(_bot, "send", None) or _missing),
@@ -215,11 +218,13 @@ async def _send_impl(target, text: str):
     chan = _resolve_channel(target)
     return await discord_safe_send(dc.send, channel_key_or_name=chan, text=text)
 
+
 async def send(channel_key_or_name, text: str):
     return await _send_impl(channel_key_or_name, text)
 
 async def edit(message_id, text: str):
     return await discord_safe_send(dc.edit, message_id=message_id, text=text)
+
 
 
 async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
