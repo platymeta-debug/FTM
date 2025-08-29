@@ -57,15 +57,12 @@ from ftm2 import strategy as ST
 
 CFG = load_env_chain()
 # [ANCHOR:DISPATCHER_BOOTSTRAP]
-
-
 notify.ensure_dc()
 notify.configure_channels(
     signals=os.getenv("CHANNEL_SIGNALS"),
     trades=os.getenv("CHANNEL_TRADES"),
     logs=os.getenv("CHANNEL_LOGS"),
 )
-
 
 object.__setattr__(CFG, "ANALYSIS_READY", asyncio.Event())
 
@@ -227,7 +224,7 @@ async def main():
     # 라우터/가드/트래커 초기화
     global ROUTER, GUARD, BX, CSV, LEDGER, div, INTQ
     brkt = Bracket(CFG, bx, bx.filters)
-    ROUTER = OrderRouter(CFG, bx.filters, bracket=brkt, rt=RT, sync_guard=sync_guard)
+    ROUTER = OrderRouter(CFG, bx, bracket=brkt, rt=RT, sync_guard=sync_guard)
     GUARD = GuardRails(CFG)
     GUARD.rt = RT
     BX = bx

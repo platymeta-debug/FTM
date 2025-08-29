@@ -15,13 +15,12 @@ class OpsBoard:
             return
         ops = self.collect(rt, self.cfg, market, bracket, guard)
         text = self.render(ops)
-        
         # [ANCHOR:DASH_SAFE_SEND]
         try:
-            if self._card and (
-                now - self._card["created_at"] < self.cfg.DASH_LIFETIME_MIN * 60
-            ):
-                await self.notify.dc.edit(self._card["id"], text)
+            card = getattr(self, "_card", None)
+            if card and (now - card["created_at"] < self.cfg.DASH_LIFETIME_MIN * 60):
+                await self.notify.dc.edit(card["id"], text)
+
             else:
                 mid = await self.notify.dc.send(self.cfg.CHANNEL_SIGNALS, text)
                 self._card = {"id": mid, "created_at": now}
