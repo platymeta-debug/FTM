@@ -153,4 +153,12 @@ class BinanceClient:
         if startTime: params["startTime"] = startTime
         return self.trade_rest_signed("GET", "/fapi/v1/income", params=params).json()
 
+    async def aclose(self):
+        try:
+            sess = getattr(self, "session", None)
+            if sess and not getattr(sess, "closed", True):
+                await sess.close()
+        except Exception:
+            pass
+
 
