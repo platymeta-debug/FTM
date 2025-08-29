@@ -33,6 +33,7 @@ async def user_stream(bx: BinanceClient, tracker: PositionTracker, cfg):
 
     asyncio.create_task(keepalive())
 
+    # [ANCHOR:WS_BACKOFF]
     backoff = 1
     url = f"{bx.WS_USER_BASE}/{listen_key}"
     while True:
