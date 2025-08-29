@@ -25,6 +25,7 @@ async def upsert(channel, text: str, *, sticky_key: str, dedupe_ms: int = 2000, 
         if item.get("text") == text and (now - item.get("ts", 0) < dedupe_ms):
             return {"ok": True, "deduped": True}
         # 편집(실패시 새 메시지 발행)
+
         try:
             await edit(item["channel"], text)
             item["text"] = text

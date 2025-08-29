@@ -3,6 +3,24 @@ from pydantic import BaseModel, field_validator
 import os
 from pathlib import Path
 from dotenv import load_dotenv
+import json
+import logging
+
+# [ANCHOR:JSON_LIST_PARSER]
+log = logging.getLogger(__name__)
+
+
+def _json_list(key: str, default: list[str]) -> list[str]:
+    raw = os.getenv(key)
+    if not raw:
+        return default
+    try:
+        val = json.loads(raw)
+        if isinstance(val, list):
+            return val
+    except Exception:
+        log.warning("invalid JSON list for %s: %s", key, raw)
+    return default
 
 class Settings(BaseModel):
     MODE: str = os.getenv("MODE", "testnet")  # legacy field
@@ -14,6 +32,13 @@ class Settings(BaseModel):
     LIVE_GUARD_ENABLE: bool = os.getenv("LIVE_GUARD_ENABLE", "true").lower() == "true"
     LIVE_MIN_NOTIONAL_USDT: float = float(os.getenv("LIVE_MIN_NOTIONAL_USDT", "10"))
     ORDER_SCALE_TO_MIN: bool = os.getenv("ORDER_SCALE_TO_MIN", "true").lower() == "true"
+    ORDER_RECV_WINDOW_MS: int = int(os.getenv("ORDER_RECV_WINDOW_MS", os.getenv("RECV_WINDOW_MS", "5000")))
+    ORDER_AUTOSCALE_TO_MIN: bool = os.getenv(
+        "ORDER_AUTOSCALE_TO_MIN",
+        os.getenv("ORDER_SCALE_TO_MIN", "true"),
+    ).lower() == "true"
+    ORDER_RETRIES: int = int(os.getenv("ORDER_RETRIES", "3"))
+    ORDER_BACKOFF_MS: int = int(os.getenv("ORDER_BACKOFF_MS", "500"))
     INTENT_AUTOFIRE_SCALE_TO_MIN: bool = os.getenv("INTENT_AUTOFIRE_SCALE_TO_MIN", "true").lower() == "true"
     INTENT_BACKOFF_MS: int = int(os.getenv("INTENT_BACKOFF_MS", "1500"))
     INTENT_MAX_RETRY: int = int(os.getenv("INTENT_MAX_RETRY", "5"))
@@ -28,14 +53,30 @@ class Settings(BaseModel):
     NOTIFY_STRICT: bool = os.getenv("NOTIFY_STRICT", "true").lower() == "true"
     NOTIFY_THROTTLE_MS: int = int(os.getenv("NOTIFY_THROTTLE_MS", "60000"))
     ENTRY_TF: str = os.getenv("ENTRY_TF", "1m")
+    # [ANCHOR:ORDER_DEFAULTS]
+    ORDER_RECV_WINDOW_MS: int = int(
+        os.getenv("ORDER_RECV_WINDOW_MS", os.getenv("RECV_WINDOW_MS", "5000"))
+    )
+    ORDER_AUTOSCALE_TO_MIN: bool = (
+        os.getenv("ORDER_AUTOSCALE_TO_MIN", "true").lower() == "true"
+    )
+    ORDER_RETRIES: int = int(os.getenv("ORDER_RETRIES", "3"))
+    ORDER_BACKOFF_MS: int = int(os.getenv("ORDER_BACKOFF_MS", "500"))
     # [ANALYSIS/TICKET PARAMS]
-    SCORING_TFS: list[str] = ["1m","15m","1h","4h"]
+    SCORING_TFS: list[str] = _json_list(
+        "SCORING_TFS", ["1m", "15m", "1h", "4h"]
+    )
     LONG_MIN_SCORE: int = int(os.getenv("LONG_MIN_SCORE", "60"))
     SHORT_MIN_SCORE: int = int(os.getenv("SHORT_MIN_SCORE", "60"))
+    # [ANCHOR:STRATEGY_DEFAULTS]
+    ENTER_TH_LONG: int = int(os.getenv("ENTER_TH_LONG", "60"))
+    ENTER_TH_SHORT: int = int(os.getenv("ENTER_TH_SHORT", "60"))
+    SCORE_BUCKET: int = int(os.getenv("SCORE_BUCKET", "5"))
+    TICKET_COOLDOWN_SEC: int = int(os.getenv("TICKET_COOLDOWN_SEC", "60"))
+    MIN_RR: float = float(os.getenv("MIN_RR", "1.2"))
     STOP_ATR: float = float(os.getenv("STOP_ATR", "1.5"))
     TP1_ATR: float = float(os.getenv("TP1_ATR", "1.5"))
     TP2_ATR: float = float(os.getenv("TP2_ATR", "3.0"))
-    MIN_RR: float = float(os.getenv("MIN_RR", "1.2"))
     SETUP_TICKET_TTL_SEC: int = int(os.getenv("SETUP_TICKET_TTL_SEC", "300"))
     SETUP_INVALIDATION_BUFFER_PCT: float = float(os.getenv("SETUP_INVALIDATION_BUFFER_PCT", "0.05"))
     ANALYSIS_SCORE_DELTA_MIN: int = int(os.getenv("ANALYSIS_SCORE_DELTA_MIN", "8"))
@@ -108,7 +149,7 @@ class Settings(BaseModel):
     RECV_WINDOW_MS: int = int(os.getenv("RECV_WINDOW_MS", "5000"))
     HTTP_TIMEOUT_S: float = float(os.getenv("HTTP_TIMEOUT_S", "5"))
 
-    SYMBOLS: list[str] = os.getenv("SYMBOLS", "BTCUSDT,ETHUSDT").split(",")
+    SYMBOLS: list[str] = _json_list("SYMBOLS", ["BTCUSDT", "ETHUSDT"])
     INTERVAL: str = os.getenv("INTERVAL", "1m")
     LOOKBACK: int = int(os.getenv("LOOKBACK", "300"))
 

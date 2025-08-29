@@ -1,3 +1,4 @@
+
 # ==== dispatcher.py: 안정화 공통 import ====
 import asyncio, time, inspect
 from typing import Optional
@@ -54,12 +55,14 @@ _EMIT_TTL_MS = {
     "chart": 30_000,
     "system": 5_000,
     "error": 5_000,
+
 }
 _LAST_EMIT: dict[tuple[str, str], int] = {}   # (kind, normalized) -> ts
 _ONCE_LAST_TS: dict[str, int] = {}            # key -> ts
 
 def _norm(s: str) -> str:
     return " ".join(s.split())[:600]
+
 
 # ==== 퍼블릭 API: emit / emit_once / flush_boot_queue ====
 def emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
@@ -121,6 +124,7 @@ async def _send_impl(target, text: str):
 
 async def send(channel_key_or_name, text: str):
     return await _send_impl(channel_key_or_name, text)
+
 
 async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
     target = route or ROUTE_MAP.get(kind, "logs")

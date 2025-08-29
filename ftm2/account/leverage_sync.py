@@ -8,6 +8,7 @@ async def enforce_leverage_and_margin(
     margin_type: Literal["ISOLATED", "CROSSED"] = "ISOLATED",
     notify=None,
 ):
+
     _ensure = globals().get("ensure")
     if callable(_ensure):
         try:
@@ -35,4 +36,5 @@ async def enforce_leverage_and_margin(
                 f"레버리지/마진 동기화 실패: {sym} -> {e}",
                 60_000,
             )
+
         raise
