@@ -150,3 +150,13 @@ class _DC:
 
 dc = _DC()  # 절대 None이 되지 않게
 
+
+def ensure_dc():
+    """외부에서 보증 호출 가능(이미 객체면 그대로 둠)"""
+    global dc
+    if dc is None or not hasattr(dc, "send") or not hasattr(dc, "use"):
+        dc = _DCAdapter()
+    return dc
+# =====================================================================
+
+

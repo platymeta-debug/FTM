@@ -28,3 +28,4 @@ class OpsBoard:
                 self.notify.emit(
                     "error", f"dash tick err(fallback): {type(e).__name__}: {e}"
                 )
+
