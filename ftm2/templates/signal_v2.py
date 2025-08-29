@@ -1,13 +1,16 @@
+
 """Signal card templates (v2).
 
 These templates render position and analysis information.
 """
 
 
+
 def position_card(
     sym: str,
     side: str,
     qty: float,
+
     leverage: int,
     margin_mode: str,
     entry_px: float,

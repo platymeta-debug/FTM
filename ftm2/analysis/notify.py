@@ -1,4 +1,9 @@
 # [ANCHOR:ANALYSIS_STICKY]
+import asyncio
+from ftm2.notify.discord_bot import upsert
+
+
+
 class AnalysisNotify:
     def __init__(self, cfg, views, notify):
         self.cfg = cfg
@@ -11,6 +16,7 @@ class AnalysisNotify:
         if callable(fn):
             return fn(key, ms)
         return True
+
 
     async def _upsert_sticky(self, ch: str, key: str, text: str, lifetime_min: int):
         # [ANCHOR:ANALYSIS_STICKY_UPSERT]
@@ -27,6 +33,7 @@ class AnalysisNotify:
         confidence: float | None = None,
         regime: str | None = None,
     ):
+
 
         changed = (
             abs(score - self.prev.get(sym, {}).get("score", 0)) >= self.cfg.ANALYSIS_SCORE_DELTA_MIN

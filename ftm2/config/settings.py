@@ -32,6 +32,13 @@ class Settings(BaseModel):
     LIVE_GUARD_ENABLE: bool = os.getenv("LIVE_GUARD_ENABLE", "true").lower() == "true"
     LIVE_MIN_NOTIONAL_USDT: float = float(os.getenv("LIVE_MIN_NOTIONAL_USDT", "10"))
     ORDER_SCALE_TO_MIN: bool = os.getenv("ORDER_SCALE_TO_MIN", "true").lower() == "true"
+    ORDER_RECV_WINDOW_MS: int = int(os.getenv("ORDER_RECV_WINDOW_MS", os.getenv("RECV_WINDOW_MS", "5000")))
+    ORDER_AUTOSCALE_TO_MIN: bool = os.getenv(
+        "ORDER_AUTOSCALE_TO_MIN",
+        os.getenv("ORDER_SCALE_TO_MIN", "true"),
+    ).lower() == "true"
+    ORDER_RETRIES: int = int(os.getenv("ORDER_RETRIES", "3"))
+    ORDER_BACKOFF_MS: int = int(os.getenv("ORDER_BACKOFF_MS", "500"))
     INTENT_AUTOFIRE_SCALE_TO_MIN: bool = os.getenv("INTENT_AUTOFIRE_SCALE_TO_MIN", "true").lower() == "true"
     INTENT_BACKOFF_MS: int = int(os.getenv("INTENT_BACKOFF_MS", "1500"))
     INTENT_MAX_RETRY: int = int(os.getenv("INTENT_MAX_RETRY", "5"))

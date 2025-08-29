@@ -89,6 +89,12 @@ def init(app, cfg, rt, market, bracket, notify):
 
     return broadcaster
 
+def run(host="0.0.0.0", port=8088):
+    if uvicorn is None:
+        raise RuntimeError("uvicorn not installed; set WEB_ENABLE=false or pip install uvicorn")
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 def run_standalone(cfg, rt, market, bracket, notify):
     init(app, cfg, rt, market, bracket, notify)
     if uvicorn is None:
@@ -96,3 +102,4 @@ def run_standalone(cfg, rt, market, bracket, notify):
             "uvicorn not installed; set WEB_ENABLE=false or install uvicorn"
         )
     uvicorn.run(app, host=os.getenv("WEB_HOST","0.0.0.0"), port=int(os.getenv("WEB_PORT","8088")))
+
