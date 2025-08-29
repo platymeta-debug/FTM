@@ -1,9 +1,7 @@
-
 """Signal card templates (v2).
 
 These templates render position and analysis information.
 """
-
 
 
 def position_card(

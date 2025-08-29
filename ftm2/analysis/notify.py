@@ -17,10 +17,10 @@ class AnalysisNotify:
             return fn(key, ms)
         return True
 
-
     async def _upsert_sticky(self, ch: str, key: str, text: str, lifetime_min: int):
         # [ANCHOR:ANALYSIS_STICKY_UPSERT]
         from ftm2.notify import discord_bot
+
 
         await discord_bot.upsert(ch, text, sticky_key=key)
 

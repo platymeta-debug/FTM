@@ -204,6 +204,7 @@ async def on_market(msg):
 
 
 async def main():
+    await notify.flush_boot_queue()
     print(f"[FTM2][BOOT_ENV_SUMMARY] MODE={CFG.MODE}, SYMBOLS={CFG.SYMBOLS}, INTERVAL={CFG.INTERVAL}")
     print(f"[FTM2] APIKEY={(CFG.BINANCE_API_KEY[:4] + '…') if CFG.BINANCE_API_KEY else 'EMPTY'}")
     bx = BinanceClient()

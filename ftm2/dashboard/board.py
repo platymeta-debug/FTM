@@ -5,6 +5,9 @@ from ftm2.notify.discord_bot import upsert
 from ftm2.notify import discord_bot
 
 
+from ftm2.notify import discord_bot
+
+
 class OpsBoard:
     def __init__(self, cfg, notify, collector, renderer):
         self.cfg, self.notify = cfg, notify
@@ -32,7 +35,6 @@ class OpsBoard:
         except Exception as e:
             try:
                 await self.notify.dc.send(
-
                     self.cfg.CHANNEL_LOGS,
                     f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
                     sticky_key="ops_board_err",
