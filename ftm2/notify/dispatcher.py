@@ -175,6 +175,7 @@ async def _edit_impl(message_id, text: str):
             pass
     return None
 
+
 class _DCUseCtx:
     def __init__(self, channel_key_or_name):
         self.target = channel_key_or_name
@@ -190,6 +191,7 @@ class _DCAdapter:
         return await _send_impl(channel_key_or_name, text)
     async def edit(self, message_id, text: str):
         return await _edit_impl(message_id, text)
+
 
 class _NoopDC:
     """최후방 안전망: dc가 None이어도 .use/.send/.edit가 존재하도록 보장"""
@@ -216,4 +218,5 @@ def ensure_dc():
         dc = _DCAdapter()
     return dc
 # =====================================================================
+
 
