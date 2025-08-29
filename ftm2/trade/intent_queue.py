@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from ftm2.trade.position_sizer import SizingDecision
 from ftm2.notify import dispatcher
+from ftm2.notify.dispatcher import discord_safe_send
 
 
 @dataclass
@@ -120,8 +121,10 @@ class IntentQueue:
                             if it.attempts >= self.cfg.INTENT_MAX_RETRY:
                                 self.intents.pop(sym, None)
                                 try:
-                                    await self.notify.emit(
-                                        "intent_cancel", f"📡 {sym} 의도 취소: 재시도 초과", ttl_ms=120_000
+                                    await discord_safe_send(
+                                        self.notify.send,
+                                        channel_key_or_name=self.cfg.CHANNEL_LOGS,
+                                        text=f"📡 {sym} 의도 취소: 재시도 초과",
                                     )
                                 except Exception:
                                     pass

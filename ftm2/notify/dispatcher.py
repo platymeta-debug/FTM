@@ -1,6 +1,6 @@
 
 # ==== dispatcher.py: 안정화 공통 import ====
-import asyncio, time, inspect
+import asyncio, time, inspect, os
 from typing import Optional
 from types import SimpleNamespace
 
@@ -16,6 +16,99 @@ async def _missing(*args, **kwargs):
 def _noop_use(*args, **kwargs):
     # 예전 코드 호환: dispatcher.dc.use(...) 호출이 남아있어도 무해하게 처리
     return None
+
+# [ANCHOR:NOTIFY_DISPATCH]
+DISCORD_ALLOW_COMPONENTS = os.getenv("DISCORD_ALLOW_COMPONENTS", "off").lower() in (
+    "1",
+    "true",
+    "on",
+)
+
+# [ANCHOR:NOTIFY_DISPATCH]
+async def maybe_await(x):
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+def _supports_kw(fn, name: str) -> bool:
+    try:
+        return name in inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+def _to_view_from_components(components):
+    """
+    components(JSON 유사) → discord.ui.View 변환.
+    변환 실패 시 None 반환하여 조용히 드랍.
+    """
+    try:
+        import discord
+        from discord.ui import View, Button, Select
+
+        v = View()
+        for row in components or []:
+            for comp in row or []:
+                t = comp.get("type")
+                if t == "button":
+                    btn = Button(
+                        label=comp.get("label"),
+                        custom_id=comp.get("custom_id"),
+                        url=comp.get("url"),
+                        disabled=comp.get("disabled", False),
+                        style=getattr(
+                            discord.ButtonStyle,
+                            comp.get("style", "secondary"),
+                            discord.ButtonStyle.secondary,
+                        ),
+                        emoji=comp.get("emoji"),
+                    )
+                    v.add_item(btn)
+                elif t == "select":
+                    sel = Select(
+                        custom_id=comp.get("custom_id"),
+                        placeholder=comp.get("placeholder"),
+                        min_values=comp.get("min_values", 1),
+                        max_values=comp.get("max_values", 1),
+                        options=comp.get("options", []),
+                        disabled=comp.get("disabled", False),
+                    )
+                    v.add_item(sel)
+        return v
+    except Exception:
+        return None
+
+async def discord_safe_send(target, **kwargs):
+    """
+    target: Channel/Context/Webhook 등 .send 를 가진 객체
+    kwargs: content, embed/embeds, components, view, files 등
+    - discord.py: view= 사용, components 미지원
+    - disnake/py-cord: components= 가능
+    - webhook: 대부분 components/view 미지원
+    """
+    send_fn = getattr(target, "send", None) or target
+    if not callable(send_fn):
+        return None
+
+    comps = kwargs.pop("components", None)
+
+    if "embed" in kwargs and "embeds" not in kwargs:
+        pass
+    elif "embeds" in kwargs and "embed" in kwargs:
+        kwargs.pop("embed", None)
+
+    if comps and DISCORD_ALLOW_COMPONENTS:
+        if _supports_kw(send_fn, "components"):
+            kwargs["components"] = comps
+        elif _supports_kw(send_fn, "view"):
+            view = _to_view_from_components(comps)
+            if view is not None:
+                kwargs["view"] = view
+
+    try:
+        return await maybe_await(send_fn(**kwargs))
+    except TypeError:
+        minimal = {k: kwargs[k] for k in ("content", "embed", "embeds", "text") if k in kwargs}
+        return await maybe_await(send_fn(**minimal))
 
 dc = SimpleNamespace(
     send=(getattr(_bot, "send", None) or _missing),
@@ -120,13 +213,13 @@ ROUTE_MAP = {
 # ==== 내부 전송(재귀 금지: 반드시 dc.send만 호출) ====
 async def _send_impl(target, text: str):
     chan = _resolve_channel(target)
-    return await dc.send(chan, text)
+    return await discord_safe_send(dc.send, channel_key_or_name=chan, text=text)
 
 async def send(channel_key_or_name, text: str):
     return await _send_impl(channel_key_or_name, text)
 
 async def edit(message_id, text: str):
-    return await dc.edit(message_id, text)
+    return await discord_safe_send(dc.edit, message_id=message_id, text=text)
 
 
 async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
@@ -142,6 +235,7 @@ __all__ = [
     "flush_boot_queue",
     "send",
     "edit",
+    "discord_safe_send",
     "configure_channels",
     "dc",
 ]

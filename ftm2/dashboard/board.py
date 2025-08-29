@@ -1,11 +1,6 @@
 import time
-from ftm2.notify.discord_bot import upsert
-
-
 from ftm2.notify import discord_bot
-
-
-from ftm2.notify import discord_bot
+from ftm2.notify.dispatcher import discord_safe_send
 
 
 class OpsBoard:
@@ -34,9 +29,10 @@ class OpsBoard:
             self._last_edit = now
         except Exception as e:
             try:
-                await self.notify.dc.send(
-                    self.cfg.CHANNEL_LOGS,
-                    f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
+                await discord_safe_send(
+                    self.notify.dc.send,
+                    channel_key_or_name=self.cfg.CHANNEL_LOGS,
+                    text=f"[DASH_FALLBACK] {type(e).__name__}: {e}\n{text}",
                     sticky_key="ops_board_err",
                 )
             except Exception:

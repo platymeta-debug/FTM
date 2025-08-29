@@ -17,6 +17,8 @@ class PositionState:
     initial_margin: float = 0.0
     leverage: float = 1.0
     margin_type: str = "ISOLATED"
+    isolated: Optional[bool] = None
+    margin_mode: Optional[str] = None  # 'isolated' | 'cross' | None
     realized_pnl: float = 0.0
     fee_paid: float = 0.0
     adds: int = 0
@@ -26,6 +28,11 @@ class PositionState:
     last_fill_ts: float = 0.0
     last_mark_ts: float = 0.0
     last_update_ts: float = 0.0
+
+    # [ANCHOR:POSITION_STATE]
+    def ensure_margin_mode(self):
+        if not self.margin_mode:
+            self.margin_mode = "isolated" if self.isolated is True else "cross"
 
 @dataclass
 class AccountState:
@@ -54,8 +61,11 @@ class PositionTracker:
         ps = self.pos.get(k) or PositionState(symbol, side)
         ps.qty, ps.entry_price = qty, entry
         ps.leverage, ps.margin_type = lev or 1.0, margin_type
+        ps.isolated = margin_type.upper() == "ISOLATED" if margin_type else ps.isolated
+        ps.margin_mode = margin_type.lower() if margin_type else ps.margin_mode
         ps.liq_price = liq
         ps.last_update_ts = time()
+        ps.ensure_margin_mode()  # [ANCHOR:POSITION_HYDRATE]
         self.pos[k] = ps
 
     def apply_fill(self, symbol: str, side: str, price: float, qty_delta: float,
