@@ -10,7 +10,7 @@ try:
 except Exception as e:
     _bot = None
 
-async def _missing_async(*args, **kwargs):
+async def _missing(*args, **kwargs):
     raise RuntimeError("discord_bot API(send/edit/upsert)가 구현되어 있지 않습니다.")
 
 def _noop_use(*args, **kwargs):
@@ -18,9 +18,9 @@ def _noop_use(*args, **kwargs):
     return None
 
 dc = SimpleNamespace(
-    send=(getattr(_bot, "send", None) or _missing_async),
-    edit=(getattr(_bot, "edit", None) or _missing_async),
-    upsert=(getattr(_bot, "upsert", None) or _missing_async),
+    send=(getattr(_bot, "send", None) or _missing),
+    edit=(getattr(_bot, "edit", None) or _missing),
+    upsert=(getattr(_bot, "upsert", None) or _missing),
     use=(getattr(_bot, "use", None) or _noop_use),
 )
 
@@ -38,8 +38,8 @@ def _resolve_channel(key_or_name):
     if isinstance(k, str):
         if k in _CHANNELS:
             return _CHANNELS[k]
-        if k.startswith("#") and k in _CHANNELS:
-            return _CHANNELS[k]
+        if k.startswith("#") and k[1:] in _CHANNELS:
+            return _CHANNELS[k[1:]]
         if k.isdigit():
             return int(k)
     return k  # 마지막 방어
@@ -125,6 +125,9 @@ async def _send_impl(target, text: str):
 async def send(channel_key_or_name, text: str):
     return await _send_impl(channel_key_or_name, text)
 
+async def edit(message_id, text: str):
+    return await dc.edit(message_id, text)
+
 
 async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int = 0):
     target = route or ROUTE_MAP.get(kind, "logs")
@@ -133,4 +136,12 @@ async def _emit(kind: str, text: str, route: Optional[str] = None, ttl_ms: int =
     except Exception as e:
         print(f"[DISPATCHER][ERR] kind={kind} route={target} -> {e}", flush=True)
 
-__all__ = ["emit", "emit_once", "flush_boot_queue", "send", "configure_channels", "dc"]
+__all__ = [
+    "emit",
+    "emit_once",
+    "flush_boot_queue",
+    "send",
+    "edit",
+    "configure_channels",
+    "dc",
+]
